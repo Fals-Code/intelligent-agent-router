@@ -27,6 +27,7 @@ The runtime execution layer lives under `src/execution/` and turns a routing dec
 - `executor-registry.ts` resolves executors by skill ID.
 - `retry-policy.ts` centralizes retryability and backoff.
 - `in-memory-executor.ts` provides a deterministic test executor.
+- `../providers/` contains provider contracts, registry, model resolution, in-memory provider, OpenAI adapter, and the provider-backed skill executor.
 
 Trace IDs follow a single source-of-truth rule: if `RoutingDecision.traceId` is present and non-empty, the engine reuses it for the entire execution. If it is missing or blank, the engine calls the injected `createTraceId` generator once for the whole run, or falls back to `crypto.randomUUID()`. Step-level execution never creates a new trace ID.
 
@@ -59,6 +60,40 @@ Every skill declares its domain, input/output modalities, capabilities, authenti
 
 Every model declares capabilities, context window, modalities, tool support, reliability, cost, latency, privacy support, and configurable provider model ID.
 
+### Provider contract
+
+Providers are a separate contract from routing and execution. A provider declares its provider ID, whether it supports a given internal model or request, and how to generate a typed response for a typed request. Provider requests carry the internal model ID, resolved provider model ID, messages, optional system instruction, optional structured output schema, safe metadata, trace ID, step ID, skill ID, and abort signal.
+
+Provider responses carry the provider ID, internal model ID, actual provider model ID, output text or structured output, finish reason, optional usage, latency, request ID when available, and safe metadata. Raw provider responses are not stored by default.
+
+### Provider registry
+
+`ProviderRegistry` registers providers by provider ID, rejects duplicate registration, and resolves a provider for a specific request. It fails explicitly when the provider is missing or does not support the requested model.
+
+### Model resolution
+
+`RegistryModelResolver` treats `modelRegistry` as the source of truth for internal model IDs. It resolves the provider ID and actual provider model ID from environment configuration via `apiModelEnv`. Missing environment values, unknown models, and disabled models fail explicitly.
+
+### Error normalization
+
+Provider errors are normalized into a typed category space: authentication, authorization, rate limit, timeout, network, invalid request, model unavailable, content policy, provider error, aborted, and unknown. The execution engine still decides retry behavior, but provider retryability is preserved in the normalized error so the runtime can honor it without guessing.
+
+### OpenAI adapter boundary
+
+The OpenAI adapter uses native `fetch`, accepts the base URL and API key through constructor parameters, and does not read secrets from a domain object. It sends OpenAI Responses API requests, supports structured output, captures usage and request IDs when available, and sanitizes error text before returning it. This boundary is provider-specific; routing and execution code above it remain provider-agnostic.
+
+### Provider-backed skill executor
+
+`ProviderBackedSkillExecutor` is a thin bridge between the execution engine and a `ModelProvider`. It reads `context.currentModelId`, resolves the internal model to provider identity, builds a provider request, and returns a normalized execution result. It does not implement its own retry loop, timeout policy, or fallback policy.
+
+### Retry and fallback boundary
+
+The execution engine owns retries and model fallback ordering. Provider adapters only indicate whether a failure is retryable. Fallback model selection still comes from the routing decision, while model resolution turns the selected internal model into a provider model ID at the last responsible moment.
+
+### Observability
+
+The runtime records internal model IDs in traces and can expose provider model IDs through safe output metadata when a provider-backed executor chooses to include them. Raw provider responses and secrets are not persisted by default.
+
 ### RoutingDecision
 
 Contains the chosen model, fallbacks, selected skills, execution DAG, reasons, penalties, and trace ID.
@@ -73,3 +108,4 @@ Contains the chosen model, fallbacks, selected skills, execution DAG, reasons, p
 - Add model-specific token pricing from a versioned registry.
 - Add evaluation datasets for routing accuracy, task success, cost, latency, and unnecessary escalation.
 - Add circuit breakers and fallback providers.
+- Add streaming, tool calling, multimodal provider support, and production trace persistence when the execution contract needs them.
