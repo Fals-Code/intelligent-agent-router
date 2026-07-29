@@ -86,6 +86,9 @@ export interface RouteStep {
   dependsOn: string[];
   parallelGroup?: string;
   humanApprovalRequired: boolean;
+  timeoutMs?: number;
+  retryable?: boolean;
+  maxAttempts?: number;
   instructions: string;
 }
 
@@ -97,4 +100,8 @@ export interface RoutingDecision {
   plan: RouteStep[];
   explanation: string[];
   traceId: string;
+}
+
+export interface RouteStepExecutionMetadata {
+  [key: string]: string | number | boolean | null | undefined | RouteStepExecutionMetadata | Array<string | number | boolean | null>;
 }

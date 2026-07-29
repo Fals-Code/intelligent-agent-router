@@ -94,3 +94,43 @@ Final Response + Trace
 6. Record routing outcomes and tune weights using evals.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
+
+## Runtime execution
+
+The router now ships with a runtime execution engine that can run registered skill executors with dependency ordering, retries, timeout control, and approval gates.
+
+Example with an in-memory executor:
+
+```ts
+import {
+  ExecutionEngine,
+  ExecutorRegistry,
+  InMemorySkillExecutor,
+} from "./dist/index.js";
+
+const registry = new ExecutorRegistry().register(
+  new InMemorySkillExecutor("document-builder", async (step, context) => {
+    return {
+      output: {
+        stepId: step.id,
+        previousOutput: context.previousOutput ?? null,
+      },
+    };
+  }),
+);
+
+const engine = new ExecutionEngine({ registry });
+const result = await engine.run({
+  prompt: "Build the report",
+  decision: routingDecision,
+  approvedStepIds: ["write-report"],
+});
+
+console.log(result.status);
+console.log(result.trace[0].status);
+console.log(result.traceId);
+```
+
+If the routing decision has no usable `traceId`, the engine generates one once per execution. Fallback models are used on later attempts when a retryable failure occurs, and the trace records every attempt with the model ID that was actually used.
+
+The execution trace records step status, attempts, model IDs, duration, and normalized errors without storing raw secrets or credentials.
