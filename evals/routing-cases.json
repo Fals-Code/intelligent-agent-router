@@ -1,0 +1,44 @@
+[
+  {
+    "name": "simple-summary",
+    "prompt": "Ringkas paragraf ini menjadi tiga kalimat.",
+    "expectedModel": "openai-fast",
+    "expectedSkills": [],
+    "requiresVerification": false
+  },
+  {
+    "name": "fresh-public-research",
+    "prompt": "Cari berita teknologi terbaru hari ini dan berikan sumber.",
+    "expectedModel": "openai-balanced",
+    "expectedSkills": ["web-search"],
+    "requiresVerification": true
+  },
+  {
+    "name": "github-security-remediation",
+    "prompt": "Gunakan GitHub untuk audit auth bypass, perbaiki kode, jalankan test, dan buat pull request.",
+    "expectedModel": "openai-frontier",
+    "expectedSkills": ["github", "human-approval"],
+    "requiresVerification": true
+  },
+  {
+    "name": "spreadsheet-artifact",
+    "prompt": "Buat spreadsheet anggaran dengan rumus varians dan grafik bulanan.",
+    "expectedModel": "openai-balanced",
+    "expectedSkills": ["spreadsheet-builder"],
+    "requiresVerification": false
+  },
+  {
+    "name": "image-generation",
+    "prompt": "Buat poster promosi dari foto produk ini.",
+    "expectedModel": "openai-balanced",
+    "expectedSkills": ["image-generation"],
+    "requiresVerification": false
+  },
+  {
+    "name": "document-research",
+    "prompt": "Buat laporan akademik dari PDF ini dan cek sitasinya.",
+    "expectedModel": "openai-balanced",
+    "expectedSkills": ["document-builder"],
+    "requiresVerification": false
+  }
+]

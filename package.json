@@ -1,0 +1,21 @@
+{
+  "name": "intelligent-agent-router",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Capability-aware AI agent orchestrator that routes prompts to the right skills and models.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node --env-file-if-exists=.env dist/cli/index.js",
+    "dev": "npm run build --silent && node --env-file-if-exists=.env dist/cli/index.js",
+    "test": "npm run build --silent && node --test tests/router.test.mjs",
+    "eval": "npm run build --silent && node scripts/evaluate.mjs",
+    "check": "npm run build && node --test tests/router.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=20.6"
+  }
+}
