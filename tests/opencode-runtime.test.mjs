@@ -153,6 +153,7 @@ test("OpenCode adapter normalizes busy then completed status using status plus c
 });
 
 test("OpenCode adapter surfaces provider messages and pending permissions as normalized runtime events", async () => {
+  let permissionPending = true;
   const adapter = new OpenCodeRuntimeAdapter({
     now: () => "2026-08-16T00:00:10.000Z",
     createEventId: (() => {
@@ -169,9 +170,12 @@ test("OpenCode adapter surfaces provider messages and pending permissions as nor
         ]);
       }
       if (call.method === "GET" && call.url.pathname === "/permission") {
-        return jsonResponse([{ id: "per_1", sessionID: "ses_events", permission: "edit", patterns: ["*"] }]);
+        return jsonResponse(permissionPending ? [{ id: "per_1", sessionID: "ses_events", permission: "edit", patterns: ["*"] }] : []);
       }
-      if (call.method === "POST" && call.url.pathname === "/permission/per_1/reply") return jsonResponse(true);
+      if (call.method === "POST" && call.url.pathname === "/permission/per_1/reply") {
+        permissionPending = false;
+        return jsonResponse(true);
+      }
       throw new Error(`unexpected ${call.method} ${call.url.pathname}`);
     },
   });
@@ -183,8 +187,9 @@ test("OpenCode adapter surfaces provider messages and pending permissions as nor
   assert.equal(await adapter.getStatus(session.id), "waiting_approval");
 
   await adapter.respondToApproval(session.id, { approvalId: "per_1", decision: "approved", actor: "human:test" });
-  const tail = await adapter.getEvents(session.id, "opencode:permission:per_1");
-  assert.ok(tail.some((event) => event.type === "approval_responded"));
+  const refreshed = await adapter.getEvents(session.id);
+  assert.ok(refreshed.some((event) => event.type === "approval_responded"));
+  assert.ok(!refreshed.some((event) => event.id === "opencode:permission:per_1"));
 });
 
 test("OpenCode adapter falls back to legacy session permission response endpoint when current endpoint is unavailable", async () => {
