@@ -61,7 +61,7 @@ test("Git worktree manager creates an isolated mutation workspace under the mana
 
   assert.equal(lease.repositoryPath, "/repo");
   assert.equal(lease.worktreePath, "/tmp/9router-worktrees/run-123-lease-001");
-  assert.equal(lease.branchName, "9router/run-123-lease-0");
+  assert.equal(lease.branchName, "9router/run-123-lease-00");
   assert.equal(lease.state, "active");
   assert.equal(lease.dirty, false);
 
@@ -72,7 +72,7 @@ test("Git worktree manager creates an isolated mutation workspace under the mana
     "worktree",
     "add",
     "-b",
-    "9router/run-123-lease-0",
+    "9router/run-123-lease-00",
     "/tmp/9router-worktrees/run-123-lease-001",
     "main",
   ]);
