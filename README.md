@@ -95,6 +95,53 @@ Final Response + Trace
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 
+## Provider foundation
+
+The router now exports a provider-agnostic contract for runtime model calls:
+
+- `ProviderRegistry` to register and resolve providers by stable provider ID;
+- `RegistryModelResolver` to turn internal model IDs into provider model IDs via environment configuration;
+- `OpenAIModelProvider` as a native `fetch` adapter for the OpenAI Responses API;
+- `InMemoryModelProvider` for tests and documentation examples;
+- `ProviderBackedSkillExecutor` to connect the execution engine to a provider without changing retry or timeout policy.
+
+Example wiring with in-memory components:
+
+```ts
+import {
+  ExecutionEngine,
+  ExecutorRegistry,
+  InMemoryModelProvider,
+  InMemorySkillExecutor,
+  ProviderBackedSkillExecutor,
+  ProviderRegistry,
+  RegistryModelResolver,
+  modelRegistry,
+} from "./dist/index.js";
+
+const providers = new ProviderRegistry().register(
+  new InMemoryModelProvider("openai", async (request) => ({
+    providerId: "openai",
+    internalModelId: request.internalModelId,
+    providerModelId: request.providerModelId,
+    outputText: "ok",
+    latencyMs: 1,
+  })),
+);
+
+const resolver = new RegistryModelResolver(modelRegistry, {
+  get: (name) => process.env[name],
+});
+
+const registry = new ExecutorRegistry().register(
+  new ProviderBackedSkillExecutor("model-exec", providers, resolver),
+);
+
+const engine = new ExecutionEngine({ registry });
+```
+
+The execution engine still owns retry, fallback, timeout, and approval gates. Provider adapters only report whether an attempt is retryable.
+
 ## Runtime execution
 
 The router now ships with a runtime execution engine that can run registered skill executors with dependency ordering, retries, timeout control, and approval gates.
@@ -131,6 +178,21 @@ console.log(result.trace[0].status);
 console.log(result.traceId);
 ```
 
-If the routing decision has no usable `traceId`, the engine generates one once per execution. Fallback models are used on later attempts when a retryable failure occurs, and the trace records every attempt with the model ID that was actually used.
+If the routing decision has no usable `traceId`, the engine generates one once per execution. Fallback models are used on later attempts when a retryable failure occurs, and the trace records every attempt with the internal model ID that was actually used.
 
 The execution trace records step status, attempts, model IDs, duration, and normalized errors without storing raw secrets or credentials.
+
+### OpenAI setup
+
+The OpenAI adapter reads the internal model ID from the router and resolves the actual provider model ID from environment variables:
+
+```env
+OPENAI_API_KEY=
+OPENAI_ROUTER_MODEL_ID=
+OPENAI_FAST_MODEL_ID=
+OPENAI_BALANCED_MODEL_ID=
+OPENAI_FRONTIER_MODEL_ID=
+OPENAI_BASE_URL=
+```
+
+The API key is passed through the adapter constructor or factory. It is never read from a domain contract and is never printed in traces.

@@ -8,9 +8,9 @@
     "build": "tsc -p tsconfig.json",
     "start": "node --env-file-if-exists=.env dist/cli/index.js",
     "dev": "npm run build --silent && node --env-file-if-exists=.env dist/cli/index.js",
-    "test": "npm run build --silent && node --test tests/router.test.mjs",
+    "test": "npm run build --silent && node scripts/run-tests.mjs",
     "eval": "npm run build --silent && node scripts/evaluate.mjs",
-    "check": "npm run build && node --test tests/router.test.mjs"
+    "check": "npm run build && node scripts/run-tests.mjs"
   },
   "devDependencies": {
     "typescript": "^5.8.3"
