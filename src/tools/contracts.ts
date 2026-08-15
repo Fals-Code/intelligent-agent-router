@@ -131,6 +131,8 @@ export interface ToolSelectionResult {
   readonly rejections: readonly ToolSelectionRejection[];
   readonly discoveredToolCount: number;
   readonly exposedToolCount: number;
+  readonly uncoveredCapabilities: readonly string[];
+  readonly missingRequestedToolIds: readonly string[];
 }
 
 export interface ToolInvocationRequest {
