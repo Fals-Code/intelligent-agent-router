@@ -43,22 +43,32 @@ let sessionDestroyed = false;
 let runtimeDiff;
 let originalHead;
 let originalOriginMain;
+let originalTargetSnapshot = [];
 let finalStatus;
+let baseRef;
+let baseHead;
 
 try {
-  await assertCleanWorkingTree(projectDir, "target repository");
+  originalTargetSnapshot = await workingTreeSnapshot(projectDir);
   originalHead = await gitOutput(projectDir, ["rev-parse", "HEAD"]);
   originalOriginMain = await optionalGitOutput(projectDir, ["rev-parse", "refs/remotes/origin/main"]);
+
   if (originalOriginMain && originalOriginMain !== originalHead) {
     throw new Error(
       `Target HEAD is not synchronized with origin/main: HEAD=${originalHead}, origin/main=${originalOriginMain}`,
     );
   }
 
+  // A dirty primary workspace is allowed. The isolated reference slice is based
+  // only on a committed ref and the exact primary-workspace snapshot is checked
+  // again before PASS. Local WIP is neither copied nor modified.
+  baseRef = originalOriginMain ? "refs/remotes/origin/main" : "HEAD";
+  baseHead = originalOriginMain ?? originalHead;
+
   lease = await manager.create({
     runId: `release-evidence-${Date.now()}`,
     repositoryPath: projectDir,
-    baseRef: "HEAD",
+    baseRef,
     riskClass: "R2",
     mode: "mutate",
   });
@@ -69,8 +79,8 @@ try {
   }
 
   const worktreeHead = await gitOutput(lease.worktreePath, ["rev-parse", "HEAD"]);
-  if (worktreeHead !== originalHead) {
-    throw new Error(`Reference worktree HEAD mismatch: expected ${originalHead}, received ${worktreeHead}`);
+  if (worktreeHead !== baseHead) {
+    throw new Error(`Reference worktree HEAD mismatch: expected ${baseHead}, received ${worktreeHead}`);
   }
 
   const session = await runtime.createSession({
@@ -102,13 +112,13 @@ try {
   }
 
   runtimeDiff = await runtime.getDiff(session.id);
-  if (!runtimeDiff.filesChanged.includes(allowedFile)) {
+  const runtimeFiles = runtimeDiff.filesChanged.map(normalizeGitPath);
+  if (!runtimeFiles.includes(allowedFile)) {
     throw new Error(
-      `OpenCode diff evidence does not include the required file ${allowedFile}; files=${runtimeDiff.filesChanged.join(",") || "none"}`,
+      `OpenCode diff evidence does not include the required file ${allowedFile}; files=${runtimeFiles.join(",") || "none"}`,
     );
   }
-
-  const runtimeUnexpected = runtimeDiff.filesChanged.filter((file) => normalizeGitPath(file) !== allowedFile);
+  const runtimeUnexpected = runtimeFiles.filter((file) => file !== allowedFile);
   if (runtimeUnexpected.length > 0) {
     throw new Error(`OpenCode diff reports out-of-scope files: ${runtimeUnexpected.join(", ")}`);
   }
@@ -136,7 +146,8 @@ try {
   if (postHead !== originalHead) {
     throw new Error(`Target repository HEAD changed during isolated slice: ${originalHead} -> ${postHead}`);
   }
-  await assertCleanWorkingTree(projectDir, "target repository after slice");
+  const postTargetSnapshot = await workingTreeSnapshot(projectDir);
+  assertSnapshotUnchanged(originalTargetSnapshot, postTargetSnapshot);
 
   finalLease = await manager.inspect(lease);
   if (!finalLease.dirty) {
@@ -158,6 +169,8 @@ try {
         targetProject: projectDir,
         targetHead: originalHead,
         originMain: originalOriginMain ?? null,
+        baseRef,
+        baseHead,
         riskClass: "R2",
         runtime: {
           id: runtime.runtimeId,
@@ -167,7 +180,7 @@ try {
           allowedPermissions: ["read", "glob", "grep", "list", "edit", "todowrite"],
           bashAllowed: false,
           networkToolsAllowed: false,
-          diffFiles: runtimeDiff.filesChanged,
+          diffFiles: runtimeFiles,
         },
         evidence: {
           gitFilesChanged: allFiles,
@@ -175,7 +188,9 @@ try {
           requiredDocumentContract: "PASS",
           secretPatternScan: "PASS",
           targetHeadUnchanged: true,
-          targetWorkingTreeClean: true,
+          targetWorkingTreeUnchanged: true,
+          targetWorkingTreeInitiallyDirty: originalTargetSnapshot.length > 0,
+          targetDirtyEntryCount: originalTargetSnapshot.length,
         },
         isolatedWorktree: {
           root: worktreeRoot,
@@ -203,11 +218,17 @@ try {
       {
         overall: "FAIL",
         error: sanitize(error instanceof Error ? error.message : String(error)),
+        target: {
+          head: originalHead ?? null,
+          originMain: originalOriginMain ?? null,
+          initiallyDirty: originalTargetSnapshot.length > 0,
+          dirtyEntryCount: originalTargetSnapshot.length,
+        },
         runtime: {
           sessionCreated: Boolean(sessionId),
           sessionDestroyed,
           lastStatus: finalStatus ?? null,
-          diffFiles: runtimeDiff?.filesChanged ?? [],
+          diffFiles: runtimeDiff?.filesChanged?.map(normalizeGitPath) ?? [],
         },
         cleanup,
       },
@@ -349,11 +370,15 @@ function validateDocument(document) {
   }
 }
 
-async function assertCleanWorkingTree(cwd, label) {
-  const lines = await gitLines(cwd, ["status", "--porcelain", "--untracked-files=all"]);
-  if (lines.length > 0) {
-    throw new Error(`${label} must be clean before this gate; dirty entries=${lines.slice(0, 20).join(" | ")}`);
-  }
+async function workingTreeSnapshot(cwd) {
+  return (await gitLines(cwd, ["status", "--porcelain=v1", "--untracked-files=all"])).sort();
+}
+
+function assertSnapshotUnchanged(before, after) {
+  if (before.length === after.length && before.every((value, index) => value === after[index])) return;
+  throw new Error(
+    `Target working tree changed during isolated slice; before=${before.length} entries, after=${after.length} entries`,
+  );
 }
 
 async function gitOutput(cwd, args) {
