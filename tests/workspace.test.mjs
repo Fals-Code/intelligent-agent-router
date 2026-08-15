@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { join, resolve } from "node:path";
 import { GitWorktreeManager, NodeCommandRunner } from "../dist/index.js";
+
+const TEST_REPO_ROOT = resolve("/repo");
+const TEST_REPO_SUBDIR = resolve(TEST_REPO_ROOT, "subdir");
+const TEST_WORKTREE_ROOT = resolve("/tmp/9router-worktrees");
 
 class FakeRunner {
   constructor(handler) {
@@ -23,7 +28,7 @@ function managerWith(runner, overrides = {}) {
   return new GitWorktreeManager({
     runner,
     policy: {
-      rootDir: "/tmp/9router-worktrees",
+      rootDir: TEST_WORKTREE_ROOT,
       maxActiveWorktrees: 2,
       branchPrefix: "9router/",
       retainDirtyWorktrees: true,
@@ -34,9 +39,9 @@ function managerWith(runner, overrides = {}) {
   });
 }
 
-function createRunner({ worktreeList = "worktree /repo\n", status = "", addExit = 0 } = {}) {
+function createRunner({ worktreeList = `worktree ${TEST_REPO_ROOT}\n`, status = "", addExit = 0 } = {}) {
   return new FakeRunner(({ args }) => {
-    if (args.includes("--show-toplevel")) return ok("/repo\n");
+    if (args.includes("--show-toplevel")) return ok(`${TEST_REPO_ROOT}\n`);
     if (args.includes("--verify")) return ok("abc123\n");
     if (args.includes("list") && args.includes("--porcelain")) return ok(worktreeList);
     if (args.includes("check-ref-format")) return ok();
@@ -53,14 +58,15 @@ test("Git worktree manager creates an isolated mutation workspace under the mana
   const manager = managerWith(runner);
   const lease = await manager.create({
     runId: "run-123",
-    repositoryPath: "/repo/subdir",
+    repositoryPath: TEST_REPO_SUBDIR,
     baseRef: "main",
     riskClass: "R2",
     mode: "mutate",
   });
 
-  assert.equal(lease.repositoryPath, "/repo");
-  assert.equal(lease.worktreePath, "/tmp/9router-worktrees/run-123-lease-001");
+  const expectedWorktreePath = resolve(TEST_WORKTREE_ROOT, "run-123-lease-001");
+  assert.equal(lease.repositoryPath, TEST_REPO_ROOT);
+  assert.equal(lease.worktreePath, expectedWorktreePath);
   assert.equal(lease.branchName, "9router/run-123-lease-00");
   assert.equal(lease.state, "active");
   assert.equal(lease.dirty, false);
@@ -68,12 +74,12 @@ test("Git worktree manager creates an isolated mutation workspace under the mana
   const add = runner.calls.find((call) => call.args.includes("add"));
   assert.deepEqual(add.args, [
     "-C",
-    "/repo",
+    TEST_REPO_ROOT,
     "worktree",
     "add",
     "-b",
     "9router/run-123-lease-00",
-    "/tmp/9router-worktrees/run-123-lease-001",
+    expectedWorktreePath,
     "main",
   ]);
 });
@@ -85,7 +91,7 @@ test("R0 cannot request a mutation workspace", async () => {
     () =>
       manager.create({
         runId: "run-r0",
-        repositoryPath: "/repo",
+        repositoryPath: TEST_REPO_ROOT,
         baseRef: "main",
         riskClass: "R0",
         mode: "mutate",
@@ -97,14 +103,14 @@ test("R0 cannot request a mutation workspace", async () => {
 
 test("worktree manager enforces max managed worktrees before creating another one", async () => {
   const runner = createRunner({
-    worktreeList: "worktree /repo\n\nworktree /tmp/9router-worktrees/existing\n",
+    worktreeList: `worktree ${TEST_REPO_ROOT}\n\nworktree ${join(TEST_WORKTREE_ROOT, "existing")}\n`,
   });
   const manager = managerWith(runner, { policy: { maxActiveWorktrees: 1 } });
   await assert.rejects(
     () =>
       manager.create({
         runId: "run-limit",
-        repositoryPath: "/repo",
+        repositoryPath: TEST_REPO_ROOT,
         baseRef: "main",
         riskClass: "R2",
         mode: "mutate",
@@ -120,7 +126,7 @@ test("unsafe base refs and branch names are rejected instead of being treated as
     () =>
       manager.create({
         runId: "run-ref",
-        repositoryPath: "/repo",
+        repositoryPath: TEST_REPO_ROOT,
         baseRef: "--help",
         riskClass: "R2",
         mode: "mutate",
@@ -134,7 +140,7 @@ test("unsafe base refs and branch names are rejected instead of being treated as
     () =>
       manager2.create({
         runId: "run-branch",
-        repositoryPath: "/repo",
+        repositoryPath: TEST_REPO_ROOT,
         baseRef: "main",
         branchName: "-unsafe",
         riskClass: "R2",
@@ -150,7 +156,7 @@ test("clean worktree release removes the worktree and only uses safe branch dele
   const manager = managerWith(runner);
   const lease = await manager.create({
     runId: "run-clean",
-    repositoryPath: "/repo",
+    repositoryPath: TEST_REPO_ROOT,
     baseRef: "main",
     riskClass: "R2",
     mode: "mutate",
@@ -161,9 +167,9 @@ test("clean worktree release removes the worktree and only uses safe branch dele
   assert.equal(released.dirty, false);
   assert.ok(released.releasedAt);
   const remove = runner.calls.find((call) => call.args.includes("remove"));
-  assert.deepEqual(remove.args, ["-C", "/repo", "worktree", "remove", lease.worktreePath]);
+  assert.deepEqual(remove.args, ["-C", TEST_REPO_ROOT, "worktree", "remove", lease.worktreePath]);
   const branch = runner.calls.find((call) => call.args.includes("branch"));
-  assert.deepEqual(branch.args, ["-C", "/repo", "branch", "-d", lease.branchName]);
+  assert.deepEqual(branch.args, ["-C", TEST_REPO_ROOT, "branch", "-d", lease.branchName]);
   assert.equal(branch.args.includes("-D"), false);
 });
 
@@ -172,7 +178,7 @@ test("dirty worktrees are retained by default and never removed silently", async
   const manager = managerWith(runner);
   const lease = await manager.create({
     runId: "run-dirty",
-    repositoryPath: "/repo",
+    repositoryPath: TEST_REPO_ROOT,
     baseRef: "main",
     riskClass: "R3",
     mode: "mutate",
@@ -189,7 +195,7 @@ test("dirty removal requires both policy permission and explicit forceDirty", as
   const manager = managerWith(runner, { policy: { retainDirtyWorktrees: false } });
   const lease = await manager.create({
     runId: "run-force",
-    repositoryPath: "/repo",
+    repositoryPath: TEST_REPO_ROOT,
     baseRef: "main",
     riskClass: "R2",
     mode: "mutate",
@@ -202,7 +208,7 @@ test("dirty removal requires both policy permission and explicit forceDirty", as
   const released = await manager.release({ lease, forceDirty: true });
   assert.equal(released.state, "released");
   const remove = runner.calls.find((call) => call.args.includes("remove"));
-  assert.deepEqual(remove.args, ["-C", "/repo", "worktree", "remove", "--force", lease.worktreePath]);
+  assert.deepEqual(remove.args, ["-C", TEST_REPO_ROOT, "worktree", "remove", "--force", lease.worktreePath]);
 });
 
 test("retainDirtyWorktrees policy cannot be overridden by forceDirty", async () => {
@@ -210,7 +216,7 @@ test("retainDirtyWorktrees policy cannot be overridden by forceDirty", async () 
   const manager = managerWith(runner, { policy: { retainDirtyWorktrees: true } });
   const lease = await manager.create({
     runId: "run-policy-retain",
-    repositoryPath: "/repo",
+    repositoryPath: TEST_REPO_ROOT,
     baseRef: "main",
     riskClass: "R4",
     mode: "mutate",
@@ -227,7 +233,7 @@ test("git failures remain explicit and do not fabricate an active lease", async 
     () =>
       manager.create({
         runId: "run-fail",
-        repositoryPath: "/repo",
+        repositoryPath: TEST_REPO_ROOT,
         baseRef: "main",
         riskClass: "R2",
         mode: "mutate",
