@@ -62,6 +62,63 @@ function Get-BaseUrlPort {
     return $Uri.Port
 }
 
+function Start-TemporaryOpenCodeServer {
+    param([Parameter(Mandatory = $true)][int]$Port)
+
+    # npm-installed commands on Windows are commonly .ps1/.cmd shims. Starting
+    # the shim itself with Start-Process is not portable across Windows
+    # PowerShell installations, so launch a child PowerShell and let normal
+    # command resolution invoke `opencode` there.
+    $PowerShellExe = $null
+    try {
+        $PowerShellExe = (Get-Process -Id $PID -ErrorAction Stop).Path
+    }
+    catch {}
+
+    if (-not $PowerShellExe) {
+        $PowerShellCommand = Get-Command powershell.exe -ErrorAction Stop
+        $PowerShellExe = $PowerShellCommand.Source
+    }
+
+    if (-not $PowerShellExe -or -not (Test-Path -LiteralPath $PowerShellExe)) {
+        throw "Executable PowerShell untuk temporary OpenCode server tidak dapat di-resolve."
+    }
+
+    $ServeScript = @"
+`$ErrorActionPreference = 'Stop'
+& opencode serve --hostname 127.0.0.1 --port $Port
+if (`$LASTEXITCODE -is [int]) { exit `$LASTEXITCODE }
+"@
+    $EncodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($ServeScript))
+
+    return Start-Process -FilePath $PowerShellExe -ArgumentList @(
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy", "Bypass",
+        "-EncodedCommand", $EncodedCommand
+    ) -WindowStyle Hidden -PassThru
+}
+
+function Stop-TemporaryProcessTree {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process)
+
+    if ($Process.HasExited) {
+        return
+    }
+
+    $TaskKill = Get-Command taskkill.exe -ErrorAction SilentlyContinue
+    if ($TaskKill) {
+        & $TaskKill.Source /PID $Process.Id /T /F *> $null
+        if ($LASTEXITCODE -eq 0) {
+            try { $Process.WaitForExit(5000) } catch {}
+            return
+        }
+    }
+
+    Stop-Process -Id $Process.Id -Force -ErrorAction Stop
+    try { $Process.WaitForExit(5000) } catch {}
+}
+
 try {
     try {
         Start-Transcript -Path $LogFile -Force | Out-Null
@@ -89,10 +146,15 @@ try {
         Write-Host "PASS - $Tool tersedia." -ForegroundColor Green
     }
 
+    $OpenCodeResolved = Get-Command opencode -ErrorAction Stop
     Write-Host "NODE=$(& node --version)"
     Write-Host "NPM=$(& npm --version)"
     Write-Host "GIT=$(& git --version)"
     Write-Host "OPENCODE=$(& opencode --version)"
+    Write-Host "OPENCODE_COMMAND_TYPE=$($OpenCodeResolved.CommandType)"
+    if ($OpenCodeResolved.Path) {
+        Write-Host "OPENCODE_COMMAND_PATH=$($OpenCodeResolved.Path)"
+    }
 
     Set-Location -LiteralPath $Repo
 
@@ -168,19 +230,14 @@ try {
     }
     else {
         Write-Host "INFO - OpenCode server belum aktif. Starting temporary server on port $Port..." -ForegroundColor DarkCyan
-        $OpenCodeCommand = Get-Command opencode -ErrorAction Stop
-        $TempOpenCode = Start-Process -FilePath $OpenCodeCommand.Source -ArgumentList @(
-            "serve",
-            "--hostname", "127.0.0.1",
-            "--port", $Port.ToString()
-        ) -WindowStyle Hidden -PassThru
+        $TempOpenCode = Start-TemporaryOpenCodeServer -Port $Port
 
-        Write-Host "TEMP_OPENCODE_PID=$($TempOpenCode.Id)"
+        Write-Host "TEMP_OPENCODE_HOST_PID=$($TempOpenCode.Id)"
         $Ready = $false
         for ($Attempt = 1; $Attempt -le 40; $Attempt++) {
             Start-Sleep -Milliseconds 500
             if ($TempOpenCode.HasExited) {
-                throw "Temporary OpenCode server berhenti sebelum ready. ExitCode=$($TempOpenCode.ExitCode)"
+                throw "Temporary OpenCode host berhenti sebelum server ready. ExitCode=$($TempOpenCode.ExitCode)"
             }
             if (Test-LocalTcpPort -Port $Port) {
                 $Ready = $true
@@ -225,9 +282,8 @@ finally {
         try {
             if (-not $TempOpenCode.HasExited) {
                 Write-Host "`n=== CLEANUP TEMPORARY OPENCODE ===" -ForegroundColor DarkGray
-                Stop-Process -Id $TempOpenCode.Id -Force -ErrorAction Stop
-                $TempOpenCode.WaitForExit()
-                Write-Host "PASS - Temporary OpenCode server stopped." -ForegroundColor Green
+                Stop-TemporaryProcessTree -Process $TempOpenCode
+                Write-Host "PASS - Temporary OpenCode process tree stopped." -ForegroundColor Green
             }
         }
         catch {
