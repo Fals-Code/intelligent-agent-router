@@ -28,19 +28,34 @@ The first strategic target is **M4 (Measured)**. Broad provider rollout remains 
 - Evidence gate that prevents a successful outcome without required proof.
 - Append-only in-memory Run Ledger contract implementation for development and tests.
 
+### Project and context foundation
+
+- In-memory Project Graph contract that stores canonical references and relationships rather than copying provider-owned state.
+- Bounded Context Compiler that requires an explicit token budget.
+- Applicable project rules are mandatory and cannot be silently dropped to fit the budget.
+- Full skill disclosure is limited to selected skills; unselected tool definitions are excluded.
+- Design context is included only when design is in scope.
+- Compiled context records total token estimate, dropped items, source counts, and tool catalog size.
+
+### Runtime boundary
+
+- Provider-agnostic `AgentRuntimeAdapter` contract covering session creation, task delivery, interrupt/resume, status/events, diff retrieval, approval responses, abort, and destroy.
+- In-memory runtime adapter for deterministic lifecycle, approval, interruption, and recovery-oriented contract tests.
+- Provider wire schemas remain outside the core runtime contract.
+
 ## Not yet implemented
 
 The following remain explicit work items and must not be represented as production-complete:
 
-- Project Graph persistence and schema.
-- Context Compiler implementation and context-budget measurement.
-- MCP Tool Broker and tool catalog filtering.
+- Persistent Project Graph schema/backend and migration rules.
+- Real retrieval adapters feeding source-code, history, documentation, design, skill, and tool candidates into the Context Compiler.
+- MCP Tool Broker and tool catalog filtering from live MCP capability discovery.
 - Credential Broker, sandbox policy enforcement, and network egress policy.
-- Durable Workflow Engine persistence and restart recovery.
+- Durable Workflow Engine persistence and machine-restart recovery.
 - Persistent Run Ledger backend.
 - OpenTelemetry export and versioned internal telemetry schema.
 - Eval Plane golden-task storage, baselines, and statistical routing feedback.
-- AgentRuntimeAdapter implementations for OpenCode, OpenHands, and ACP.
+- OpenCode, OpenHands, and ACP wire adapters implementing `AgentRuntimeAdapter`.
 - Playwright evidence adapter.
 - GitHub publish adapter tied to evidence/approval gates.
 - Penpot/Excalidraw design adapters.
@@ -48,7 +63,7 @@ The following remain explicit work items and must not be represented as producti
 - Provider health/quota-aware route selection and circuit breaking.
 - Compatibility matrix, adapter quarantine, and capability downgrade behavior.
 - Fault injection and machine-restart recovery tests.
-- Reference Stok Reconciliation vertical slice.
+- Reference Stok Reconciliation vertical slice against real providers.
 
 ## Next implementation gate
 
@@ -68,5 +83,7 @@ Task + Project Graph
   -> GitHub PR
   -> Run Ledger + telemetry + eval result
 ```
+
+The immediate next adapter should be **OpenCode** because the frozen contract defines it as the initial PRIMARY provider for `code.interactive`. Its current server/API compatibility must be verified before implementing the wire adapter.
 
 No additional ecosystem provider should become part of the default production path before this slice demonstrates safe failure, recovery, evidence, and measurable value.
