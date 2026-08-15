@@ -57,6 +57,7 @@ The first strategic target is **M4 (Measured)**. Broad provider rollout remains 
 - Structured OpenCode file diffs are normalized into the runtime diff contract.
 - Interrupt maps to OpenCode abort; `resume()` makes the existing session reusable for task re-dispatch and does not falsely claim continuation of an aborted generation.
 - OpenCode capability health/version discovery uses `/global/health`.
+- Safe live-preflight harness validates health/version and project scoping from the target machine; temporary R0 session smoke is explicit opt-in and sends no coding prompt.
 
 ### Tool Broker foundation
 
@@ -70,7 +71,21 @@ The first strategic target is **M4 (Measured)**. Broad provider rollout remains 
 - Invocation re-checks source health/version, enforces timeout and attempt ceilings, normalizes errors, records attempts, and sanitizes sensitive error text.
 - Automatic retries are limited to explicitly retryable, idempotency-safe, non-destructive tools. Timeout retry requires explicit opt-in.
 - Rate-limit signals can carry normalized HTTP/retry-after metadata without leaking provider wire errors into core logic.
+- Parent workflow abort wins even when a source adapter ignores `AbortSignal`.
 - In-memory Tool Source adapter provides deterministic discovery and execution tests.
+
+### Isolated workspace foundation
+
+- Provider-neutral `WorkspaceManager` and Git worktree lease contracts represent workspace lifecycle explicitly.
+- `GitWorktreeManager` resolves the canonical Git root before creating an isolated worktree and validates the requested base ref as a commit.
+- R0 cannot request a mutation workspace.
+- Managed worktrees are constrained to a configured root and bounded by `maxActiveWorktrees`.
+- Generated paths are slugged and checked to remain below the managed root; unsafe base refs and branch names are rejected before Git execution.
+- Git commands are executed as argv with `shell: false`; no shell command concatenation is used.
+- Dirty worktrees are retained by default. Forced dirty removal requires both policy permission and an explicit `forceDirty` request.
+- A policy configured to retain dirty worktrees cannot be overridden by `forceDirty`.
+- Optional branch cleanup uses safe `git branch -d`, not unconditional `-D`.
+- Command output is bounded and sensitive key/value material is redacted before entering errors/evidence.
 
 ## OpenCode compatibility notes
 
@@ -91,12 +106,12 @@ The following remain explicit work items and must not be represented as producti
 - Real retrieval adapters feeding source-code, history, documentation, design, skill, and tool candidates into the Context Compiler.
 - Live MCP transport adapter implementing Tool Source discovery/execution against current MCP semantics.
 - Credential Broker, sandbox policy enforcement, and network egress policy.
-- Isolated Git worktree manager tied to risk/resource policy.
 - Durable Workflow Engine persistence and machine-restart recovery.
 - Persistent Run Ledger backend.
 - OpenTelemetry export and versioned internal telemetry schema.
 - Eval Plane golden-task storage, baselines, and statistical routing feedback.
 - Live OpenCode adapter validation against the target 9Router/OpenCode installation.
+- Live isolated-worktree validation on the target Windows/Git environment.
 - OpenHands and ACP wire adapters implementing `AgentRuntimeAdapter`.
 - Playwright evidence adapter.
 - GitHub publish adapter tied to evidence/approval gates.
@@ -127,6 +142,6 @@ Task + Project Graph
   -> Run Ledger + telemetry + eval result
 ```
 
-The next step is to add the isolated worktree boundary and live MCP transport adapter, then validate the OpenCode + Tool Broker path against the target local installation before wiring publish/evidence providers.
+The immediate environment gate is to validate both the OpenCode adapter and isolated-worktree behavior on the target Windows machine. In parallel, the next source-side P0 items are the live MCP transport adapter and durable workflow/evidence persistence needed before a real prompt-driven vertical-slice run.
 
 No additional ecosystem provider should become part of the default production path before this slice demonstrates safe failure, recovery, evidence, and measurable value.
