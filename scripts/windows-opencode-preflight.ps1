@@ -2,7 +2,8 @@ param(
     [string]$TargetProject = "D:\proyek\sistem_rekonsiliasi_stok",
     [string]$OpenCodeBaseUrl = "http://127.0.0.1:4096",
     [switch]$SkipInstall,
-    [switch]$SkipSourceValidation
+    [switch]$SkipSourceValidation,
+    [switch]$SessionWorktreeSmoke
 )
 
 $ErrorActionPreference = "Stop"
@@ -135,6 +136,7 @@ try {
     Write-Host "ROUTER_REPO=$Repo"
     Write-Host "TARGET_PROJECT=$TargetProject"
     Write-Host "OPENCODE_BASE_URL=$OpenCodeBaseUrl"
+    Write-Host "SESSION_WORKTREE_SMOKE=$([bool]$SessionWorktreeSmoke)"
     Write-Host "LOG=$LogFile" -ForegroundColor DarkGray
 
     Write-Host "`n=== 1. TOOLCHAIN GUARD ===" -ForegroundColor Yellow
@@ -254,15 +256,34 @@ try {
     Invoke-CheckedCommand -Command "npm" -Arguments @("run", "validate:opencode-live")
     Write-Host "PASS - OpenCode live adapter preflight." -ForegroundColor Green
 
+    if ($SessionWorktreeSmoke) {
+        Write-Host "`n=== 9. LIVE R0 SESSION + ISOLATED WORKTREE SMOKE ===" -ForegroundColor Yellow
+        Invoke-CheckedCommand -Command "npm" -Arguments @("run", "validate:live-session-worktree")
+        Write-Host "PASS - R0 session lifecycle and isolated worktree lifecycle." -ForegroundColor Green
+    }
+
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Green
-    Write-Host "  9ROUTER LIVE PREFLIGHT : PASS" -ForegroundColor Green
+    if ($SessionWorktreeSmoke) {
+        Write-Host "  9ROUTER LIVE SESSION + WORKTREE : PASS" -ForegroundColor Green
+    }
+    else {
+        Write-Host "  9ROUTER LIVE PREFLIGHT : PASS" -ForegroundColor Green
+    }
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host "PASS - Router source validation." -ForegroundColor Green
     Write-Host "PASS - Target repository validation." -ForegroundColor Green
     Write-Host "PASS - OpenCode localhost reachability." -ForegroundColor Green
     Write-Host "PASS - OpenCode live read-only adapter gate." -ForegroundColor Green
-    Write-Host "NEXT_GATE=LIVE_SESSION_AND_ISOLATED_WORKTREE_SMOKE" -ForegroundColor Cyan
+    if ($SessionWorktreeSmoke) {
+        Write-Host "PASS - OpenCode R0 session create/destroy gate." -ForegroundColor Green
+        Write-Host "PASS - Isolated Git worktree create/inspect/release gate." -ForegroundColor Green
+        Write-Host "PASS - Smoke branch cleanup gate." -ForegroundColor Green
+        Write-Host "NEXT_GATE=PROMPT_DRIVEN_REFERENCE_VERTICAL_SLICE" -ForegroundColor Cyan
+    }
+    else {
+        Write-Host "NEXT_GATE=LIVE_SESSION_AND_ISOLATED_WORKTREE_SMOKE" -ForegroundColor Cyan
+    }
     [Environment]::ExitCode = 0
 }
 catch {
