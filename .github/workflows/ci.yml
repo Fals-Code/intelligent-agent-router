@@ -21,6 +21,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Validate Windows preflight PowerShell syntax
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $null = [ScriptBlock]::Create((Get-Content -Raw "scripts/windows-opencode-preflight.ps1"))
+          Write-Host "PowerShell syntax PASS"
       - run: npm install
       - run: npm run check
       - run: npm run eval
