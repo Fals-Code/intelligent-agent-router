@@ -47,6 +47,7 @@ export interface WorktreeLease {
 export interface ReleaseWorktreeRequest {
   readonly lease: WorktreeLease;
   readonly deleteBranch?: boolean;
+  readonly forceDirty?: boolean;
 }
 
 export interface WorkspaceManager {
