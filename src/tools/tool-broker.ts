@@ -255,11 +255,12 @@ export class ToolBroker {
 
       const startedAt = Date.now();
       const startedIso = new Date(startedAt).toISOString();
-      const timeout = createTimeoutSignal(timeoutMs, request.signal);
+      const boundary = createInvocationBoundary(timeoutMs, request.signal);
       let outcome:
         | { kind: "result"; result: ToolSourceExecutionResult }
         | { kind: "error"; error: unknown }
-        | { kind: "timeout" };
+        | { kind: "timeout" }
+        | { kind: "aborted" };
       try {
         const execution = source
           .execute({
@@ -268,19 +269,25 @@ export class ToolBroker {
             traceId: request.traceId,
             runId: request.runId,
             timeoutMs,
-            signal: timeout.signal,
+            signal: boundary.signal,
             metadata: request.metadata,
           })
           .then((result) => ({ kind: "result" as const, result }))
           .catch((error) => ({ kind: "error" as const, error }));
-        outcome = await Promise.race([execution, timeout.promise]);
+        outcome = await Promise.race([execution, boundary.promise]);
       } finally {
-        timeout.cleanup();
+        boundary.cleanup();
       }
 
       const finishedAt = Date.now();
       const finishedIso = new Date(finishedAt).toISOString();
       const durationMs = Math.max(0, finishedAt - startedAt);
+
+      if (outcome.kind === "aborted") {
+        const error = this.abortedError(request.grant.tool, source.sourceId);
+        attempts.push({ attempt, status: "aborted", startedAt: startedIso, finishedAt: finishedIso, durationMs, error });
+        return this.finalResult(request, "aborted", attempts, error);
+      }
 
       if (outcome.kind === "timeout") {
         const error: NormalizedToolError = {
@@ -301,14 +308,10 @@ export class ToolBroker {
       }
 
       if (outcome.kind === "error") {
-        const aborted = timeout.signal.aborted && request.signal?.aborted;
-        const error = aborted
-          ? this.abortedError(request.grant.tool, source.sourceId)
-          : this.normalizeThrownError(outcome.error, request.grant.tool, source.sourceId);
-        const status = error.category === "aborted" ? "aborted" : error.category === "timeout" ? "timed_out" : "failed";
+        const error = this.normalizeThrownError(outcome.error, request.grant.tool, source.sourceId);
+        const status = error.category === "timeout" ? "timed_out" : "failed";
         attempts.push({ attempt, status, startedAt: startedIso, finishedAt: finishedIso, durationMs, error });
         lastError = error;
-        if (status === "aborted") return this.finalResult(request, "aborted", attempts, error);
         if (!this.shouldRetry(error, request.grant.tool, attempt, maxAttempts, request.retryOnTimeout === true)) {
           return this.finalResult(request, status, attempts, error);
         }
@@ -382,14 +385,15 @@ export class ToolBroker {
         discoveredAt: this.now(),
       });
     } catch (error) {
+      const discoveryHealth: ProviderHealth = {
+        status: "unhealthy",
+        checkedAt: this.now(),
+        reason: `Tool discovery failed: ${sanitize(error instanceof Error ? error.message : String(error))}`,
+      };
       return Object.freeze({
         sourceId: source.sourceId,
         transport: source.transport,
-        health: {
-          status: "unhealthy",
-          checkedAt: this.now(),
-          reason: `Tool discovery failed: ${sanitize(error instanceof Error ? error.message : String(error))}`,
-        },
+        health: discoveryHealth,
         version,
         tools: Object.freeze([]),
         discoveredAt: this.now(),
@@ -534,23 +538,30 @@ function sanitize(value: string): string {
     .slice(0, 2_000);
 }
 
-function createTimeoutSignal(
+type InvocationBoundaryOutcome = { kind: "timeout" } | { kind: "aborted" };
+
+function createInvocationBoundary(
   timeoutMs: number,
   parent?: AbortSignal,
-): { signal: AbortSignal; promise: Promise<{ kind: "timeout" }>; cleanup: () => void } {
+): { signal: AbortSignal; promise: Promise<InvocationBoundaryOutcome>; cleanup: () => void } {
   const controller = new AbortController();
-  const onAbort = () => controller.abort(parent?.reason);
-  if (parent) {
-    if (parent.aborted) controller.abort(parent.reason);
-    else parent.addEventListener("abort", onAbort, { once: true });
-  }
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const promise = new Promise<{ kind: "timeout" }>((resolve) => {
+  let resolveBoundary: ((value: InvocationBoundaryOutcome) => void) | undefined;
+  const promise = new Promise<InvocationBoundaryOutcome>((resolve) => {
+    resolveBoundary = resolve;
     timer = setTimeout(() => {
       controller.abort(new Error("Tool invocation timed out"));
       resolve({ kind: "timeout" });
     }, timeoutMs);
   });
+  const onAbort = () => {
+    controller.abort(parent?.reason);
+    resolveBoundary?.({ kind: "aborted" });
+  };
+  if (parent) {
+    if (parent.aborted) onAbort();
+    else parent.addEventListener("abort", onAbort, { once: true });
+  }
   return {
     signal: controller.signal,
     promise,
