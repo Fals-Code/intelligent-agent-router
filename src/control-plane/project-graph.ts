@@ -74,7 +74,9 @@ export class InMemoryProjectGraph {
           (relation === undefined || edge.relation === relation),
       )
       .map((edge) => (edge.from === id ? edge.to : edge.from));
-    return relatedIds.map((nodeId) => this.nodes.get(nodeId)).filter(Boolean);
+    return relatedIds
+      .map((nodeId) => this.nodes.get(nodeId))
+      .filter((node): node is ProjectGraphNode => node !== undefined);
   }
 
   snapshot(): ProjectGraphSnapshot {
