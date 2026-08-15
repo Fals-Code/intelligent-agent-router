@@ -58,6 +58,20 @@ The first strategic target is **M4 (Measured)**. Broad provider rollout remains 
 - Interrupt maps to OpenCode abort; `resume()` makes the existing session reusable for task re-dispatch and does not falsely claim continuation of an aborted generation.
 - OpenCode capability health/version discovery uses `/global/health`.
 
+### Tool Broker foundation
+
+- Protocol-neutral `ToolSourceAdapter` contract keeps MCP/native wire schemas outside the core broker.
+- Normalized tool descriptors declare capabilities, read/write/execute mode, side-effect class, risk ceiling, policy permissions, provider permission names, idempotency, timeout, and source identity.
+- Discovery is health/version gated; unhealthy or incompatible sources fail closed and do not expose tools.
+- Selection is capability/request driven and uses a bounded `maxTools` catalog instead of loading every discovered tool.
+- R0 never receives mutation tools; R3/R4 mutations require explicit approval; destructive tools always require approval.
+- Required policy permissions are hard filters and are translated into provider-specific permission grants.
+- Duplicate logical tool IDs across sources are quarantined rather than selected arbitrarily.
+- Invocation re-checks source health/version, enforces timeout and attempt ceilings, normalizes errors, records attempts, and sanitizes sensitive error text.
+- Automatic retries are limited to explicitly retryable, idempotency-safe, non-destructive tools. Timeout retry requires explicit opt-in.
+- Rate-limit signals can carry normalized HTTP/retry-after metadata without leaking provider wire errors into core logic.
+- In-memory Tool Source adapter provides deterministic discovery and execution tests.
+
 ## OpenCode compatibility notes
 
 The adapter intentionally avoids importing OpenCode SDK types into 9Router core. Current compatibility was checked against the upstream server/source contract at implementation time, but real-machine validation and a versioned compatibility matrix are still required before claiming M2 integration.
@@ -67,7 +81,7 @@ Known deliberate limitations of this first adapter:
 - `getEvents()` currently polls normalized messages and permission requests instead of maintaining a long-lived SSE subscription.
 - An interrupted OpenCode generation cannot be resumed mid-turn by the current server API; recovery must re-dispatch from durable workflow state.
 - Provider health currently validates the health/version endpoint but does not yet apply a release compatibility matrix or quarantine policy.
-- Tool IDs must come from the future MCP Tool Broker/discovery layer; this adapter enforces the selected permission set but does not own tool discovery.
+- OpenCode receives only the provider permission names granted by the Tool Broker; live MCP discovery still requires a dedicated adapter.
 
 ## Not yet implemented
 
@@ -75,8 +89,9 @@ The following remain explicit work items and must not be represented as producti
 
 - Persistent Project Graph schema/backend and migration rules.
 - Real retrieval adapters feeding source-code, history, documentation, design, skill, and tool candidates into the Context Compiler.
-- MCP Tool Broker and live tool catalog filtering/discovery.
+- Live MCP transport adapter implementing Tool Source discovery/execution against current MCP semantics.
 - Credential Broker, sandbox policy enforcement, and network egress policy.
+- Isolated Git worktree manager tied to risk/resource policy.
 - Durable Workflow Engine persistence and machine-restart recovery.
 - Persistent Run Ledger backend.
 - OpenTelemetry export and versioned internal telemetry schema.
@@ -87,7 +102,7 @@ The following remain explicit work items and must not be represented as producti
 - GitHub publish adapter tied to evidence/approval gates.
 - Penpot/Excalidraw design adapters.
 - Hermes/OpenClaw/n8n/AppFlowy/Baserow/Teable/Appsmith/Cal.diy provider adapters.
-- Provider health/quota-aware route selection and circuit breaking.
+- Provider health/quota-aware route selection and circuit breaking beyond the current tool/provider contracts.
 - Compatibility matrix, adapter quarantine, and capability downgrade behavior.
 - Fault injection and machine-restart recovery tests.
 - Reference Stok Reconciliation vertical slice against real providers.
@@ -100,6 +115,7 @@ The next coherent milestone is the first reference vertical slice:
 Task + Project Graph
   -> Task Classifier / Risk Engine
   -> Context Compiler
+  -> Tool Broker
   -> OpenCode Runtime Adapter
   -> isolated Git worktree
   -> implementation
@@ -111,6 +127,6 @@ Task + Project Graph
   -> Run Ledger + telemetry + eval result
 ```
 
-The next step is to validate the OpenCode adapter against the target local OpenCode server, then wire the MCP Tool Broker and isolated worktree policy needed for a safe real vertical-slice run.
+The next step is to add the isolated worktree boundary and live MCP transport adapter, then validate the OpenCode + Tool Broker path against the target local installation before wiring publish/evidence providers.
 
 No additional ecosystem provider should become part of the default production path before this slice demonstrates safe failure, recovery, evidence, and measurable value.
