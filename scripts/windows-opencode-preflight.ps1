@@ -3,7 +3,8 @@ param(
     [string]$OpenCodeBaseUrl = "http://127.0.0.1:4096",
     [switch]$SkipInstall,
     [switch]$SkipSourceValidation,
-    [switch]$SessionWorktreeSmoke
+    [switch]$SessionWorktreeSmoke,
+    [switch]$ReferenceReleaseEvidenceSlice
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,10 +67,6 @@ function Get-BaseUrlPort {
 function Start-TemporaryOpenCodeServer {
     param([Parameter(Mandatory = $true)][int]$Port)
 
-    # npm-installed commands on Windows are commonly .ps1/.cmd shims. Starting
-    # the shim itself with Start-Process is not portable across Windows
-    # PowerShell installations, so launch a child PowerShell and let normal
-    # command resolution invoke `opencode` there.
     $PowerShellExe = $null
     try {
         $PowerShellExe = (Get-Process -Id $PID -ErrorAction Stop).Path
@@ -137,6 +134,7 @@ try {
     Write-Host "TARGET_PROJECT=$TargetProject"
     Write-Host "OPENCODE_BASE_URL=$OpenCodeBaseUrl"
     Write-Host "SESSION_WORKTREE_SMOKE=$([bool]$SessionWorktreeSmoke)"
+    Write-Host "REFERENCE_RELEASE_EVIDENCE_SLICE=$([bool]$ReferenceReleaseEvidenceSlice)"
     Write-Host "LOG=$LogFile" -ForegroundColor DarkGray
 
     Write-Host "`n=== 1. TOOLCHAIN GUARD ===" -ForegroundColor Yellow
@@ -262,9 +260,20 @@ try {
         Write-Host "PASS - R0 session lifecycle and isolated worktree lifecycle." -ForegroundColor Green
     }
 
+    if ($ReferenceReleaseEvidenceSlice) {
+        Write-Host "`n=== 10. PROMPT-DRIVEN REFERENCE RELEASE-EVIDENCE SLICE ===" -ForegroundColor Yellow
+        Write-Host "INFO - This gate may create one documentation file in an isolated retained worktree." -ForegroundColor DarkCyan
+        Write-Host "INFO - It does not commit, push, deploy, or modify target main." -ForegroundColor DarkCyan
+        Invoke-CheckedCommand -Command "npm" -Arguments @("run", "run:reference-release-evidence")
+        Write-Host "PASS - Prompt-driven reference release-evidence slice." -ForegroundColor Green
+    }
+
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Green
-    if ($SessionWorktreeSmoke) {
+    if ($ReferenceReleaseEvidenceSlice) {
+        Write-Host "  9ROUTER REFERENCE VERTICAL SLICE : PASS" -ForegroundColor Green
+    }
+    elseif ($SessionWorktreeSmoke) {
         Write-Host "  9ROUTER LIVE SESSION + WORKTREE : PASS" -ForegroundColor Green
     }
     else {
@@ -279,6 +288,15 @@ try {
         Write-Host "PASS - OpenCode R0 session create/destroy gate." -ForegroundColor Green
         Write-Host "PASS - Isolated Git worktree create/inspect/release gate." -ForegroundColor Green
         Write-Host "PASS - Smoke branch cleanup gate." -ForegroundColor Green
+    }
+    if ($ReferenceReleaseEvidenceSlice) {
+        Write-Host "PASS - Prompt-driven R2 isolated edit gate." -ForegroundColor Green
+        Write-Host "PASS - Runtime diff + Git scope evidence gate." -ForegroundColor Green
+        Write-Host "PASS - Release-evidence document contract + secret scan." -ForegroundColor Green
+        Write-Host "PASS - Target main remained unchanged." -ForegroundColor Green
+        Write-Host "NEXT_GATE=INDEPENDENT_REVIEW_AND_PUBLISH" -ForegroundColor Cyan
+    }
+    elseif ($SessionWorktreeSmoke) {
         Write-Host "NEXT_GATE=PROMPT_DRIVEN_REFERENCE_VERTICAL_SLICE" -ForegroundColor Cyan
     }
     else {

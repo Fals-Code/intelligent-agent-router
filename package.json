@@ -12,7 +12,8 @@
     "eval": "npm run build --silent && node scripts/evaluate.mjs",
     "check": "npm run build && node scripts/run-tests.mjs",
     "validate:opencode-live": "npm run build --silent && node --env-file-if-exists=.env scripts/validate-opencode-live.mjs",
-    "validate:live-session-worktree": "npm run build --silent && node --env-file-if-exists=.env scripts/validate-live-session-worktree.mjs"
+    "validate:live-session-worktree": "npm run build --silent && node --env-file-if-exists=.env scripts/validate-live-session-worktree.mjs",
+    "run:reference-release-evidence": "npm run build --silent && node --env-file-if-exists=.env scripts/run-reference-release-evidence-slice.mjs"
   },
   "devDependencies": {
     "typescript": "^5.8.3"

@@ -23,6 +23,8 @@ jobs:
           cache: npm
       - name: Validate live smoke script syntax
         run: node --check scripts/validate-live-session-worktree.mjs
+      - name: Validate reference slice script syntax
+        run: node --check scripts/run-reference-release-evidence-slice.mjs
       - name: Validate Windows preflight PowerShell syntax
         if: runner.os == 'Windows'
         shell: powershell
