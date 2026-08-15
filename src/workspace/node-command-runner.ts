@@ -3,7 +3,7 @@ import type { CommandResult, CommandRunner } from "./contracts.js";
 
 export interface NodeCommandRunnerOptions {
   readonly maxOutputBytes?: number;
-  readonly env?: NodeJS.ProcessEnv;
+  readonly env?: Record<string, string | undefined>;
 }
 
 export class NodeCommandRunner implements CommandRunner {
@@ -25,25 +25,26 @@ export class NodeCommandRunner implements CommandRunner {
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
-      const stdout: Buffer[] = [];
-      const stderr: Buffer[] = [];
+      const decoder = new TextDecoder();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
       let stdoutBytes = 0;
       let stderrBytes = 0;
 
-      child.stdout.on("data", (chunk: Buffer) => {
-        stdoutBytes += chunk.length;
-        if (stdoutBytes <= this.maxOutputBytes) stdout.push(chunk);
+      child.stdout.on("data", (chunk) => {
+        stdoutBytes += chunk.byteLength;
+        if (stdoutBytes <= this.maxOutputBytes) stdout.push(decoder.decode(chunk));
       });
-      child.stderr.on("data", (chunk: Buffer) => {
-        stderrBytes += chunk.length;
-        if (stderrBytes <= this.maxOutputBytes) stderr.push(chunk);
+      child.stderr.on("data", (chunk) => {
+        stderrBytes += chunk.byteLength;
+        if (stderrBytes <= this.maxOutputBytes) stderr.push(decoder.decode(chunk));
       });
       child.once("error", reject);
       child.once("close", (code) => {
         resolve({
           exitCode: code ?? 1,
-          stdout: sanitize(Buffer.concat(stdout).toString("utf8"), stdoutBytes > this.maxOutputBytes),
-          stderr: sanitize(Buffer.concat(stderr).toString("utf8"), stderrBytes > this.maxOutputBytes),
+          stdout: sanitize(stdout.join(""), stdoutBytes > this.maxOutputBytes),
+          stderr: sanitize(stderr.join(""), stderrBytes > this.maxOutputBytes),
         });
       });
     });
