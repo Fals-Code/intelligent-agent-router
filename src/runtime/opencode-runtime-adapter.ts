@@ -55,6 +55,9 @@ interface OpenCodeSessionState {
   readonly localEvents: RuntimeEvent[];
   localStatus: RuntimeStatus;
   lastTaskId?: string;
+  taskBaselineMessageIds?: ReadonlySet<string>;
+  terminalAssistantObserved?: boolean;
+  busyObservedSinceTask?: boolean;
 }
 
 export interface OpenCodeRuntimeAdapterOptions extends OpenCodeHttpClientOptions {
@@ -138,6 +141,13 @@ export class OpenCodeRuntimeAdapter implements AgentRuntimeAdapter {
     if (!task.taskId.trim()) throw new Error("OpenCode runtime taskId must not be empty");
     if (!task.prompt.trim()) throw new Error("OpenCode runtime prompt must not be empty");
 
+    const priorMessages = state.lastTaskId ? await this.getMessages(state) : [];
+    const baselineMessageIds = new Set(
+      priorMessages
+        .map((message) => stringValue(message.info?.id))
+        .filter((id): id is string => Boolean(id)),
+    );
+
     await this.applyToolPolicy(state, task.toolIds);
     const body = {
       ...(this.options.agent ? { agent: this.options.agent } : {}),
@@ -162,6 +172,9 @@ export class OpenCodeRuntimeAdapter implements AgentRuntimeAdapter {
     }
 
     state.lastTaskId = task.taskId;
+    state.taskBaselineMessageIds = baselineMessageIds;
+    state.terminalAssistantObserved = false;
+    state.busyObservedSinceTask = false;
     state.localStatus = "running";
     state.session = this.withStatus(state.session, "running");
     this.pushLocalEvent(state, "task_started", task.taskId, { taskId: task.taskId });
@@ -210,16 +223,30 @@ export class OpenCodeRuntimeAdapter implements AgentRuntimeAdapter {
     });
     const upstream = statuses?.[sessionId];
     const type = stringValue(upstream?.type) ?? "idle";
+    if (!["idle", "busy", "retry"].includes(type)) {
+      throw new OpenCodeHttpError(`OpenCode returned unknown session status: ${type}`);
+    }
+
+    let terminalAssistantObserved = state.terminalAssistantObserved === true;
+    if (state.lastTaskId && !terminalAssistantObserved) {
+      const messages = await this.getMessages(state);
+      terminalAssistantObserved = this.hasTerminalAssistantMessageForCurrentTask(state, messages);
+      if (terminalAssistantObserved) state.terminalAssistantObserved = true;
+    }
+
     if (type === "busy" || type === "retry") {
+      if (terminalAssistantObserved && state.busyObservedSinceTask === true) {
+        state.localStatus = "completed";
+        state.session = this.withStatus(state.session, "completed");
+        return "completed";
+      }
+      state.busyObservedSinceTask = true;
       state.localStatus = "running";
       state.session = this.withStatus(state.session, "running");
       return "running";
     }
-    if (type !== "idle") {
-      throw new OpenCodeHttpError(`OpenCode returned unknown session status: ${type}`);
-    }
 
-    if (state.lastTaskId && (await this.hasCompletedAssistantMessage(state))) {
+    if (terminalAssistantObserved) {
       state.localStatus = "completed";
       state.session = this.withStatus(state.session, "completed");
       return "completed";
@@ -235,6 +262,9 @@ export class OpenCodeRuntimeAdapter implements AgentRuntimeAdapter {
       this.getMessages(state),
       this.listPendingPermissions(state).catch(() => []),
     ]);
+    if (state.lastTaskId && this.hasTerminalAssistantMessageForCurrentTask(state, messages)) {
+      state.terminalAssistantObserved = true;
+    }
     const providerEvents = this.messageEvents(state, messages);
     const approvalEvents = this.permissionEvents(state, permissions);
     if (approvalEvents.length > 0 && state.localStatus !== "destroyed" && state.localStatus !== "aborted") {
@@ -360,12 +390,25 @@ export class OpenCodeRuntimeAdapter implements AgentRuntimeAdapter {
       : [];
   }
 
-  private async hasCompletedAssistantMessage(state: OpenCodeSessionState): Promise<boolean> {
-    const messages = await this.getMessages(state);
-    return messages.some((message) => {
-      if (stringValue(message.info?.role) !== "assistant") return false;
-      return message.info?.time?.completed !== undefined || Boolean(stringValue(message.info?.finish));
-    });
+  private hasTerminalAssistantMessageForCurrentTask(
+    state: OpenCodeSessionState,
+    messages: readonly OpenCodeMessage[],
+  ): boolean {
+    const baseline = state.taskBaselineMessageIds ?? new Set<string>();
+    let currentTaskUserSeen = false;
+    for (const message of messages) {
+      const id = stringValue(message.info?.id);
+      if (!id || baseline.has(id)) continue;
+      const role = stringValue(message.info?.role);
+      if (role === "user") {
+        currentTaskUserSeen = true;
+        continue;
+      }
+      if (role === "assistant" && currentTaskUserSeen && isTerminalAssistantFinish(message.info?.finish)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private messageEvents(state: OpenCodeSessionState, messages: readonly OpenCodeMessage[]): RuntimeEvent[] {
@@ -387,7 +430,7 @@ export class OpenCodeRuntimeAdapter implements AgentRuntimeAdapter {
         );
         continue;
       }
-      if (role === "assistant" && (message.info?.time?.completed !== undefined || stringValue(message.info?.finish))) {
+      if (role === "assistant" && isTerminalAssistantFinish(message.info?.finish)) {
         events.push(
           Object.freeze({
             id: `opencode:message:${id}:assistant`,
@@ -467,6 +510,11 @@ export class OpenCodeRuntimeAdapter implements AgentRuntimeAdapter {
       }),
     );
   }
+}
+
+function isTerminalAssistantFinish(value: unknown): boolean {
+  const finish = stringValue(value);
+  return Boolean(finish && !["tool-calls", "unknown"].includes(finish));
 }
 
 function stringValue(value: unknown): string | undefined {
