@@ -6,6 +6,7 @@ import {
   NodeCommandRunner,
   OpenCodeRuntimeAdapter,
 } from "../dist/index.js";
+import { validateReferenceEvidenceScope } from "./reference-evidence-scope.mjs";
 
 const projectDir = process.env.OPENCODE_PROJECT_DIR?.trim();
 if (!projectDir) {
@@ -59,9 +60,9 @@ try {
     );
   }
 
-  // A dirty primary workspace is allowed. The isolated reference slice is based
-  // only on a committed ref and the exact primary-workspace snapshot is checked
-  // again before PASS. Local WIP is neither copied nor modified.
+  // The primary workspace may contain local WIP. The mutation surface is always
+  // an isolated worktree created from a committed ref, and the exact primary
+  // workspace snapshot must remain unchanged before PASS.
   baseRef = originalOriginMain ? "refs/remotes/origin/main" : "HEAD";
   baseHead = originalOriginMain ?? originalHead;
 
@@ -111,27 +112,23 @@ try {
     throw new Error(`Reference task did not complete successfully: ${finalStatus}`);
   }
 
+  // OpenCode's session diff endpoint is advisory. Some upstream implementations
+  // return an empty diff, and newly-created untracked files may not appear there.
+  // Any out-of-scope runtime diff still fails closed, while the isolated Git
+  // worktree is the canonical filesystem-mutation evidence.
   runtimeDiff = await runtime.getDiff(session.id);
   const runtimeFiles = runtimeDiff.filesChanged.map(normalizeGitPath);
-  if (!runtimeFiles.includes(allowedFile)) {
-    throw new Error(
-      `OpenCode diff evidence does not include the required file ${allowedFile}; files=${runtimeFiles.join(",") || "none"}`,
-    );
-  }
-  const runtimeUnexpected = runtimeFiles.filter((file) => file !== allowedFile);
-  if (runtimeUnexpected.length > 0) {
-    throw new Error(`OpenCode diff reports out-of-scope files: ${runtimeUnexpected.join(", ")}`);
-  }
 
-  const gitFiles = await gitLines(lease.worktreePath, ["diff", "--name-only", "--"]);
+  const trackedFiles = (await gitLines(lease.worktreePath, ["diff", "--name-only", "--"]))
+    .map(normalizeGitPath);
   const untrackedFiles = (await gitLines(lease.worktreePath, ["ls-files", "--others", "--exclude-standard"]))
     .map(normalizeGitPath);
-  const allFiles = [...new Set([...gitFiles.map(normalizeGitPath), ...untrackedFiles])].sort();
-  if (allFiles.length !== 1 || allFiles[0] !== allowedFile) {
-    throw new Error(
-      `Git scope gate requires exactly ${allowedFile}; observed=${allFiles.join(",") || "none"}`,
-    );
-  }
+  const allFiles = [...new Set([...trackedFiles, ...untrackedFiles])].sort();
+  const scopeEvidence = validateReferenceEvidenceScope({
+    runtimeFiles,
+    gitFiles: allFiles,
+    allowedFile,
+  });
 
   const diffCheck = await runner.run("git", ["-C", lease.worktreePath, "diff", "--check"]);
   if (diffCheck.exitCode !== 0) {
@@ -180,10 +177,13 @@ try {
           allowedPermissions: ["read", "glob", "grep", "list", "edit", "todowrite"],
           bashAllowed: false,
           networkToolsAllowed: false,
-          diffFiles: runtimeFiles,
+          diffFiles: scopeEvidence.runtimeFiles,
+          diffEvidence: scopeEvidence.runtimeDiffObservation,
+          diffRequiredForSuccess: false,
         },
         evidence: {
-          gitFilesChanged: allFiles,
+          canonicalMutationEvidence: scopeEvidence.canonicalMutationEvidence,
+          gitFilesChanged: scopeEvidence.gitFiles,
           diffCheck: "PASS",
           requiredDocumentContract: "PASS",
           secretPatternScan: "PASS",
