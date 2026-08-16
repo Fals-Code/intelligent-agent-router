@@ -3,6 +3,7 @@ export interface OpenCodeHttpClientOptions {
   readonly username?: string;
   readonly password?: string;
   readonly fetchImpl?: typeof fetch;
+  readonly requestTimeoutMs?: number;
 }
 
 export interface OpenCodeRequestOptions {
@@ -10,6 +11,7 @@ export interface OpenCodeRequestOptions {
   readonly path: string;
   readonly directory?: string;
   readonly body?: unknown;
+  readonly timeoutMs?: number;
 }
 
 export class OpenCodeHttpError extends Error {
@@ -26,10 +28,12 @@ export class OpenCodeHttpError extends Error {
 export class OpenCodeHttpClient {
   readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly requestTimeoutMs: number;
 
   constructor(private readonly options: OpenCodeHttpClientOptions = {}) {
     this.baseUrl = normalizeBaseUrl(options.baseUrl ?? "http://127.0.0.1:4096");
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.requestTimeoutMs = normalizeTimeout(options.requestTimeoutMs ?? 30_000, "requestTimeoutMs");
   }
 
   async request<T = unknown>(options: OpenCodeRequestOptions): Promise<T> {
@@ -52,15 +56,25 @@ export class OpenCodeHttpClient {
       body = JSON.stringify(options.body);
     }
 
+    const timeoutMs = normalizeTimeout(options.timeoutMs ?? this.requestTimeoutMs, "timeoutMs");
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+
     let response: Response;
     try {
       response = await this.fetchImpl(url.toString(), {
         method: options.method,
         headers,
         body,
+        signal: controller.signal,
       });
     } catch (error) {
+      if (controller.signal.aborted) {
+        throw new OpenCodeHttpError(`OpenCode request timed out after ${timeoutMs}ms`);
+      }
       throw new OpenCodeHttpError(`OpenCode request failed: ${safeMessage(error)}`);
+    } finally {
+      globalThis.clearTimeout(timeout);
     }
 
     const contentType = response.headers.get("content-type") ?? "";
@@ -103,6 +117,13 @@ function normalizeBaseUrl(value: string): string {
   const parsed = new URL(value);
   parsed.pathname = parsed.pathname.endsWith("/") ? parsed.pathname : `${parsed.pathname}/`;
   return parsed.toString();
+}
+
+function normalizeTimeout(value: number, label: string): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new OpenCodeHttpError(`OpenCode ${label} must be a positive finite number`);
+  }
+  return Math.max(1, Math.floor(value));
 }
 
 function safeMessage(error: unknown): string {
