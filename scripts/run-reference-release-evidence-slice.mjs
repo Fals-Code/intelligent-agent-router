@@ -6,7 +6,10 @@ import {
   NodeCommandRunner,
   OpenCodeRuntimeAdapter,
 } from "../dist/index.js";
-import { validateReferenceEvidenceScope } from "./reference-evidence-scope.mjs";
+import {
+  validateReferenceEvidenceScope,
+  validateReferenceSchedulerContract,
+} from "./reference-evidence-scope.mjs";
 
 const projectDir = process.env.OPENCODE_PROJECT_DIR?.trim();
 if (!projectDir) {
@@ -138,6 +141,7 @@ try {
   const documentPath = resolve(lease.worktreePath, allowedFile);
   const document = await readFile(documentPath, "utf8");
   validateDocument(document);
+  const schedulerEvidence = validateReferenceSchedulerContract(document);
 
   const postHead = await gitOutput(projectDir, ["rev-parse", "HEAD"]);
   if (postHead !== originalHead) {
@@ -186,6 +190,9 @@ try {
           gitFilesChanged: scopeEvidence.gitFiles,
           diffCheck: "PASS",
           requiredDocumentContract: "PASS",
+          schedulerContract: "PASS",
+          schedulerJobCount: schedulerEvidence.jobCount,
+          schedulerJobs: schedulerEvidence.jobs.map((job) => job.code),
           secretPatternScan: "PASS",
           targetHeadUnchanged: true,
           targetWorkingTreeUnchanged: true,
@@ -276,7 +283,7 @@ function buildPrompt() {
 
 This is the first prompt-driven 9Router reference slice for the Stok Reconciliation project. The change must be useful to the current release-readiness work while remaining completely non-runtime and non-production.
 
-Before writing, read the existing deployment/release conventions from docs/16-deployment-guide.md and README.md. You may inspect CHANGELOG.md only if useful. Treat all existing files as read-only context.
+Before writing, read the existing deployment/release conventions from docs/16-deployment-guide.md and README.md. Also read supabase/tests/073_production_scheduler_contract.test.sql specifically to ground the current production scheduler contract. You may inspect CHANGELOG.md only if useful. Treat all existing files as read-only context.
 
 Create ${allowedFile} in Indonesian with this exact purpose: a reusable TEMPLATE for recording production release evidence. It must not claim that production deployment has happened or that any check passed. Use obvious placeholders instead of real environment values.
 
@@ -300,7 +307,7 @@ Required content under those headings:
 - A validation-gates table that can record command/gate, result, timestamp, and evidence reference without inventing results.
 - Supabase migration-state evidence fields without credentials or secret values.
 - Separate liveness and readiness evidence for /api/health/live and /api/health/ready.
-- Scheduler/job evidence including configured jobs, last success/failure, and evidence reference; do not invent job results.
+- Under Scheduler / Job Health, include exactly one Markdown table with exactly four data rows, no more and no fewer. Each row must contain the authoritative job code and cron name from the current Phase 2 scheduler contract: NOTIFICATION_OUTBOX / phase2-notification-outbox; CLAIM_DEADLINE / phase2-claim-deadline; EXPIRY_DAILY / phase2-expiry-daily; RECONCILIATION_DAILY / phase2-reconciliation-daily. Include fields for configured state, last success/failure, result, and evidence reference. Do not add stocktake, return-inspection, marketplace, generic job-health, or any other speculative scheduler row. Do not invent job results.
 - Backup/PITR prerequisite and verification evidence fields.
 - Production smoke/golden-smoke evidence fields.
 - Rollback/recovery decision, trigger, target application version/commit, and forward-fix database note.
