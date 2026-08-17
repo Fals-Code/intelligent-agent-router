@@ -1,37 +1,48 @@
 import fs from "node:fs/promises";
-import { IntelligentAgentRouter } from "../dist/orchestrator/agent-router.js";
+import {
+  IntelligentAgentRouter,
+  RoutingEvalPlane,
+  prepareEvalBaseline,
+  prepareGoldenTaskSuite,
+} from "../dist/index.js";
 
-const cases = JSON.parse(await fs.readFile(new URL("../evals/routing-cases.json", import.meta.url), "utf8"));
+const suiteDefinition = JSON.parse(await fs.readFile(new URL("../evals/golden-routing-v1.json", import.meta.url), "utf8"));
+const baselineDefinition = JSON.parse(await fs.readFile(new URL("../evals/baselines/routing-m4-v1.json", import.meta.url), "utf8"));
+
+const suite = await prepareGoldenTaskSuite(suiteDefinition, {
+  maxTasks: 64,
+  maxAssertionsPerTask: 16,
+  maxPromptBytes: 16 * 1024,
+  maxStringBytes: 2048,
+  maxSuiteBytes: 256 * 1024,
+});
+const baseline = prepareEvalBaseline(baselineDefinition, 2048);
 const router = new IntelligentAgentRouter();
-let passed = 0;
-const failures = [];
+const plane = new RoutingEvalPlane({ maxReportBytes: 512 * 1024, maxSubjectIdBytes: 2048 });
+const report = await plane.evaluate(suite, {
+  id: "intelligent-agent-router",
+  route: (prompt) => router.route(prompt),
+});
+const comparison = await plane.compare(report, baseline);
 
-for (const item of cases) {
-  const result = await router.route(item.prompt);
-  const selectedSkills = result.selectedSkills.map((entry) => entry.candidate.id);
-  const modelMatches = result.primaryModel.candidate.id === item.expectedModel;
-  const skillsMatch = item.expectedSkills.every((skill) => selectedSkills.includes(skill));
-  const verificationMatches = result.analysis.requiresVerification === item.requiresVerification;
+const failedTasks = report.payload.tasks
+  .filter((task) => !task.passed)
+  .map((task) => ({
+    taskId: task.taskId,
+    score: task.score,
+    critical: task.critical,
+    failedAssertions: task.assertions.filter((assertion) => !assertion.passed),
+  }));
 
-  if (modelMatches && skillsMatch && verificationMatches) {
-    passed += 1;
-  } else {
-    failures.push({
-      name: item.name,
-      expected: {
-        model: item.expectedModel,
-        skills: item.expectedSkills,
-        requiresVerification: item.requiresVerification,
-      },
-      actual: {
-        model: result.primaryModel.candidate.id,
-        skills: selectedSkills,
-        requiresVerification: result.analysis.requiresVerification,
-      },
-    });
-  }
-}
+console.log(JSON.stringify({
+  suiteId: suite.suiteId,
+  suiteSha256: suite.suiteSha256,
+  reportId: report.reportId,
+  reportSha256: report.reportSha256,
+  subjectId: report.payload.subjectId,
+  metrics: report.payload.metrics,
+  baseline: comparison,
+  failedTasks,
+}, null, 2));
 
-const score = passed / cases.length;
-console.log(JSON.stringify({ passed, total: cases.length, score, failures }, null, 2));
-if (failures.length > 0) process.exit(1);
+if (!comparison.passed) process.exit(1);
