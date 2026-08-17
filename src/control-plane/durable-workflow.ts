@@ -436,14 +436,16 @@ function assertCheckpointTransition(previous: WorkflowRun, next: WorkflowRun): v
     next.approvalIds.length === previous.approvalIds.length + 1 &&
     isPrefix(previous.approvalIds, next.approvalIds)
   ) {
-    collect(() => machine.approve(previous, next.approvalIds[previous.approvalIds.length], next.updatedAt));
+    const approvalId = next.approvalIds[previous.approvalIds.length];
+    if (approvalId) collect(() => machine.approve(previous, approvalId, next.updatedAt));
   }
   collect(() => machine.skipApproval(previous, next.updatedAt));
   collect(() => machine.pause(previous, next.updatedAt));
   collect(() => machine.resume(previous, next.updatedAt));
   collect(() => machine.retry(previous, next.updatedAt));
   collect(() => machine.recover(previous, next.updatedAt));
-  if (next.failureReason) collect(() => machine.fail(previous, next.failureReason, next.updatedAt));
+  const failureReason = next.failureReason;
+  if (failureReason) collect(() => machine.fail(previous, failureReason, next.updatedAt));
   collect(() => machine.cancel(previous, next.updatedAt));
   collect(() => machine.succeed(previous, true, next.updatedAt));
 
