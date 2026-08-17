@@ -383,6 +383,12 @@ export class ExecutionIntegrityCoordinator {
       if (!isTerminal(workflow)) {
         return report(runId, "manual_intervention", "Run Ledger contains a terminal record for a non-terminal canonical workflow.", workflow, binding, verification, ledgerRecord, journalStages);
       }
+      if (!runtimeMilestone) {
+        return report(runId, "record_runtime_binding_milestone", "Run Ledger and runtime binding are durable, but the earliest current-attempt integrity milestone is missing.", workflow, binding, verification, ledgerRecord, journalStages);
+      }
+      if (workflow.status === "succeeded" && !verification?.passed) {
+        return report(runId, "manual_intervention", "Successful Run Ledger state exists without durable passed verification in the integrity journal; do not reconstruct verifier evidence implicitly.", workflow, binding, verification, ledgerRecord, journalStages);
+      }
       if (!terminalMilestone) {
         return report(runId, "record_terminal_milestone", "Workflow and Run Ledger are terminal but the integrity terminal milestone is missing.", workflow, binding, verification, ledgerRecord, journalStages);
       }
