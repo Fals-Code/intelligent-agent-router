@@ -31,7 +31,7 @@ export class ObservabilityProjector {
       attributes["router.runtime.status"] = report.observation.status;
       attributes["router.runtime.event_count"] = report.observation.events.count;
       attributes["router.runtime.files_changed_count"] = report.observation.diff.filesChanged.length;
-      attributes["router.runtime.patch_observed"] = report.observation.diff.patchObserved;
+      attributes["router.runtime.diff_observed"] = report.observation.diff.patchObserved;
     }
     return this.builder.create({
       name: "9router.runtime.reconciled",
