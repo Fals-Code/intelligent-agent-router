@@ -113,6 +113,10 @@ export interface DeterministicRuntimeVerifier {
   verify(input: DeterministicRuntimeVerificationInput): Promise<DeterministicRuntimeVerificationResult>;
 }
 
+export interface RuntimeVerificationCoordinatorOptions {
+  readonly now?: () => string;
+}
+
 export interface RuntimeVerificationOutcome {
   readonly workflowRunId: string;
   readonly runtimeId: string;
@@ -128,6 +132,12 @@ export interface RuntimeVerificationOutcome {
  * mandatory and its result becomes a deterministic_check EvidenceRecord.
  */
 export class RuntimeVerificationCoordinator {
+  private readonly now: () => string;
+
+  constructor(options: RuntimeVerificationCoordinatorOptions = {}) {
+    this.now = options.now ?? (() => new Date().toISOString());
+  }
+
   async verify(
     run: WorkflowRun,
     report: RuntimeReconciliationReport,
@@ -163,7 +173,7 @@ export class RuntimeVerificationCoordinator {
         status: "failed",
         reference: `verifier:${verifier.id}:execution-error`,
         producer: verifier.id,
-        collectedAt: new Date().toISOString(),
+        collectedAt: this.now(),
         metadata: Object.freeze({ error: safeErrorMessage(error) }),
       });
       return Object.freeze({
@@ -244,10 +254,15 @@ export class RuntimeRunLedgerFinalizer {
     const verificationEvidence = input.verification?.evidence ?? [];
     if (
       input.run.status === "succeeded" &&
-      !verificationEvidence.some((item) => item.kind === "deterministic_check" && item.status === "passed")
+      !verificationEvidence.some(
+        (item) =>
+          item.kind === "deterministic_check" &&
+          item.status === "passed" &&
+          item.producer === input.verification?.verifierId,
+      )
     ) {
       throw new Error(
-        `Successful runtime-backed workflow ${input.run.id} is missing passed deterministic_check evidence`,
+        `Successful runtime-backed workflow ${input.run.id} is missing verifier-owned passed deterministic_check evidence`,
       );
     }
 
@@ -292,8 +307,10 @@ function assertExecutableWorkflow(run: WorkflowRun): void {
   }
 }
 
-function assertTerminalWorkflow(run: WorkflowRun): void {
-  if (!(["failed", "cancelled", "succeeded"] as const).includes(run.status as "failed" | "cancelled" | "succeeded")) {
+function assertTerminalWorkflow(
+  run: WorkflowRun,
+): asserts run is WorkflowRun & { readonly status: "failed" | "cancelled" | "succeeded" } {
+  if (run.status !== "failed" && run.status !== "cancelled" && run.status !== "succeeded") {
     throw new Error(`Run ledger finalization requires terminal workflow; ${run.id} is ${run.status}`);
   }
   if (run.status === "succeeded" && run.phase !== "publish") {
@@ -338,6 +355,9 @@ function assertObservationMatchesBinding(observation: RuntimeObservation, bindin
   }
   if (observation.sessionId !== binding.sessionId) {
     throw new Error(`Runtime observation sessionId mismatch: expected=${binding.sessionId} actual=${observation.sessionId}`);
+  }
+  if (!Number.isFinite(Date.parse(observation.observedAt))) {
+    throw new Error("Runtime observation observedAt must be a valid timestamp");
   }
 }
 
