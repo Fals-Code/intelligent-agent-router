@@ -30,12 +30,17 @@ jobs:
           node --check scripts/run-reference-source-runtime-slice.mjs
           node --check scripts/source-runtime-slice-policy.mjs
           node --check scripts/verify-reference-source-runtime-slice.mjs
+      - name: Validate restart/recovery reference script syntax
+        run: |
+          node --check scripts/run-reference-restart-recovery-slice.mjs
+          node --check scripts/restart-recovery-slice-policy.mjs
       - name: Validate Windows preflight PowerShell syntax
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           $null = [ScriptBlock]::Create((Get-Content -Raw "scripts/windows-opencode-preflight.ps1"))
           $null = [ScriptBlock]::Create((Get-Content -Raw "scripts/windows-reference-source-runtime-slice.ps1"))
+          $null = [ScriptBlock]::Create((Get-Content -Raw "scripts/windows-reference-restart-recovery-slice.ps1"))
           Write-Host "PowerShell syntax PASS"
       - run: npm install
       - run: npm run check
