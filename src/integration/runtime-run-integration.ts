@@ -156,6 +156,11 @@ export class RuntimeVerificationCoordinator {
     }
     assertBindingMatchesWorkflow(report.binding, run);
     assertObservationMatchesBinding(report.observation, report.binding);
+    if (report.observation.status !== "completed") {
+      throw new Error(
+        `Workflow ${run.id} verification requires completed runtime observation; received ${report.observation.status}`,
+      );
+    }
     if (!verifier.id.trim()) throw new Error("Deterministic runtime verifier id must not be empty");
 
     const runtimeEvidence = runtimeObservationEvidence(report.observation);
@@ -193,9 +198,9 @@ export class RuntimeVerificationCoordinator {
       producer: verifier.id,
       collectedAt: result.collectedAt,
       metadata: sanitizeEvidenceMetadata({
+        ...(result.metadata ?? {}),
         runtimeId: report.binding.runtimeId,
         sessionId: report.binding.sessionId,
-        ...(result.metadata ?? {}),
       }),
     });
 
@@ -244,7 +249,10 @@ export class RuntimeRunLedgerFinalizer {
     if (!input.contextCompilerVersion.trim()) throw new Error("Run ledger contextCompilerVersion must not be empty");
     if (!input.traceId.trim()) throw new Error("Run ledger traceId must not be empty");
 
-    if (input.verification) assertVerificationMatchesBinding(input.verification, input.run, input.binding);
+    if (input.verification) {
+      assertVerificationMatchesBinding(input.verification, input.run, input.binding);
+      if (!input.verification.verifierId.trim()) throw new Error("Runtime verification verifierId must not be empty");
+    }
     if (input.run.status === "succeeded" && input.verification?.passed !== true) {
       throw new Error(
         `Successful runtime-backed workflow ${input.run.id} requires deterministic runtime verification PASS`,
@@ -263,6 +271,20 @@ export class RuntimeRunLedgerFinalizer {
     ) {
       throw new Error(
         `Successful runtime-backed workflow ${input.run.id} is missing verifier-owned passed deterministic_check evidence`,
+      );
+    }
+    if (
+      input.run.status === "succeeded" &&
+      !verificationEvidence.some(
+        (item) =>
+          item.kind === "other" &&
+          item.status === "passed" &&
+          item.producer === `runtime-reconciliation:${input.binding.runtimeId}` &&
+          item.reference === `runtime:${input.binding.runtimeId}:${input.binding.sessionId}`,
+      )
+    ) {
+      throw new Error(
+        `Successful runtime-backed workflow ${input.run.id} is missing matching runtime reconciliation evidence`,
       );
     }
 
