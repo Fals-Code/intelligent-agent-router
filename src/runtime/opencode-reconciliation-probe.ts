@@ -106,8 +106,9 @@ export class OpenCodeRuntimeReconciliationProbe implements RuntimeReconciliation
       throw new OpenCodeHttpError(`OpenCode returned unknown session status: ${statusType}`);
     }
 
+    const observedAt = this.now();
     const status = deriveStatus(statusType, safeMessages, safePermissions);
-    const events = summarizeEvents(binding.sessionId, safeMessages, safePermissions);
+    const events = summarizeEvents(binding.sessionId, safeMessages, safePermissions, observedAt);
     const filesChanged = [
       ...new Set(
         safeDiff
@@ -121,7 +122,7 @@ export class OpenCodeRuntimeReconciliationProbe implements RuntimeReconciliation
       runtimeId: this.runtimeId,
       sessionId: binding.sessionId,
       status,
-      observedAt: this.now(),
+      observedAt,
       events: Object.freeze({
         count: events.length,
         types: Object.freeze([...new Set(events.map((event) => event.type))].sort()),
@@ -165,13 +166,14 @@ function summarizeEvents(
   sessionId: string,
   messages: readonly OpenCodeMessage[],
   permissions: readonly OpenCodePermissionRequest[],
+  observedAt: string,
 ): readonly { id: string; type: string; timestamp: string }[] {
   const events: { id: string; type: string; timestamp: string }[] = [];
   for (const message of messages) {
     const id = stringValue(message.info?.id);
     const role = stringValue(message.info?.role);
     if (!id || !role) continue;
-    const createdAt = timestamp(message.info?.time?.created) ?? "1970-01-01T00:00:00.000Z";
+    const createdAt = timestamp(message.info?.time?.created) ?? observedAt;
     if (role === "user") {
       events.push({ id: `opencode:message:${id}:user`, type: "task_started", timestamp: createdAt });
     } else if (role === "assistant" && isTerminalAssistantFinish(message.info?.finish)) {
@@ -188,7 +190,7 @@ function summarizeEvents(
     events.push({
       id: `opencode:permission:${sessionId}:${id}`,
       type: "approval_requested",
-      timestamp: "9999-12-31T23:59:59.999Z",
+      timestamp: observedAt,
     });
   }
   return events.sort((a, b) =>
