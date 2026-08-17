@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
 import {
   DurableWorkflowStateMachine,
   ExecutionIntegrityCoordinator,
@@ -24,22 +23,26 @@ import { validatePrepareProof, validateRecoveryProof } from "./restart-recovery-
 const execFile = promisify(execFileCallback);
 const phase = process.argv[2];
 const projectDir = resolve(process.env.ROUTER_RESTART_RECOVERY_PROJECT_DIR?.trim() || process.cwd());
-const stateRoot = resolve(
-  process.env.ROUTER_RESTART_RECOVERY_STATE_ROOT?.trim() || join(tmpdir(), "9router-restart-recovery-reference"),
-);
+const stateRootInput = process.env.ROUTER_RESTART_RECOVERY_STATE_ROOT?.trim();
 const baseUrl = process.env.OPENCODE_BASE_URL?.trim() || "http://127.0.0.1:4096";
 const username = process.env.OPENCODE_SERVER_USERNAME?.trim() || "opencode";
 const password = process.env.OPENCODE_SERVER_PASSWORD;
-const manifestPath = join(stateRoot, "manifest.json");
 const STORE_LIMITS = Object.freeze({ maxFileBytes: 2 * 1024 * 1024, maxRecordBytes: 256 * 1024 });
 
 if (phase !== "prepare" && phase !== "recover") {
   console.error("Usage: node scripts/run-reference-restart-recovery-slice.mjs <prepare|recover>");
   process.exit(2);
 }
+if (!stateRootInput) {
+  console.error("ROUTER_RESTART_RECOVERY_STATE_ROOT is required and must identify one dedicated proof directory");
+  process.exit(2);
+}
+
+const stateRoot = resolve(stateRootInput);
+const manifestPath = join(stateRoot, "manifest.json");
 
 try {
-  await mkdir(stateRoot, { recursive: true });
+  if (phase === "prepare") await mkdir(stateRoot, { recursive: true });
   if (phase === "prepare") await prepare();
   else await recover();
 } catch (error) {
@@ -54,6 +57,11 @@ try {
 
 async function prepare() {
   await assertRouterRepository();
+  const existingStateEntries = await readdir(stateRoot);
+  if (existingStateEntries.length > 0) {
+    throw new Error(`Restart/recovery state root must be empty before prepare: ${stateRoot}`);
+  }
+
   const originalHead = await gitOutput(["rev-parse", "HEAD"]);
   const originMain = await gitOutput(["rev-parse", "refs/remotes/origin/main"]);
   if (originalHead !== originMain) {
@@ -65,10 +73,6 @@ async function prepare() {
   }
 
   const stores = openStores();
-  if (stores.workflowStore.list().length > 0 || stores.ledger.list().length > 0 || stores.journal.list().length > 0) {
-    throw new Error(`Restart/recovery state root is not empty: ${stateRoot}`);
-  }
-
   const runId = `restart-recovery-${Date.now()}`;
   const projectId = "9router-reference-restart-recovery";
   const machine = new DurableWorkflowStateMachine(stores.workflowStore);
@@ -454,7 +458,7 @@ function sameArray(left, right) {
 function assertManifest(value) {
   if (!value || typeof value !== "object") throw new Error("Restart/recovery manifest must be an object");
   if (value.schemaVersion !== 1) throw new Error(`Unsupported restart/recovery manifest schema: ${String(value.schemaVersion)}`);
-  for (const field of ["runId", "sessionId", "projectDir", "originalHead"] ) {
+  for (const field of ["runId", "sessionId", "projectDir", "originalHead"]) {
     if (typeof value[field] !== "string" || !value[field].trim()) throw new Error(`Restart/recovery manifest.${field} must not be empty`);
   }
   if (!Number.isInteger(value.prepareProcessId) || value.prepareProcessId <= 0) throw new Error("Restart/recovery manifest.prepareProcessId must be a positive integer");
