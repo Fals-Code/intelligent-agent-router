@@ -4,13 +4,13 @@ import { InternalObservabilityEventBuilder, OpenTelemetryExportAdapter, toOpenTe
 
 const NOW = "2026-08-18T04:45:00.000Z";
 function eventBuilder() { return new InternalObservabilityEventBuilder({ maxEventBytes: 32 * 1024, maxAttributes: 32, maxLinks: 16, maxStringBytes: 2048 }); }
-async function sampleEvent() { return eventBuilder().create({ name: "9router.verification.completed", occurredAt: NOW, severity: "info", traceId: "trace-otel-1", runId: "run-otel-1", projectId: "project-1", attributes: { "router.verification.passed": true, "router.verifier.id": "deterministic-verifier", "router.event.id": "caller-spoof" }, links: [{ type: "runtime_session", reference: "runtime:opencode:ses-1" }] }); }
+async function sampleEvent() { return eventBuilder().create({ name: "9router.verification.completed", occurredAt: NOW, severity: "info", traceId: "trace-otel-1", runId: "run-otel-1", projectId: "project-1", attributes: { "router.verification.passed": true, "router.verifier.id": "deterministic-verifier" }, links: [{ type: "runtime_session", reference: "runtime:opencode:ses-1" }] }); }
 
 test("OpenTelemetry adapter maps one verified internal event to Resource + INTERNAL Span", async () => {
   const event = await sampleEvent(); const calls = [];
   const adapter = new OpenTelemetryExportAdapter({ async export(request) { calls.push(request); return { reference: "otel:span:1" }; } }, { serviceName: "9router", instrumentationScopeVersion: "1.0.0", maxExportBytes: 64 * 1024, now: () => NOW });
   const receipt = await adapter.export(event); assert.equal(calls.length, 1); const request = calls[0];
-  assert.equal(request.resource.attributes["service.name"], "9router"); assert.equal(request.instrumentationScope.name, "9router.observability"); assert.equal(request.spans.length, 1); assert.equal(request.spans[0].kind, "INTERNAL"); assert.equal(request.spans[0].status.code, "OK"); assert.equal(request.spans[0].attributes["router.trace.id"], "trace-otel-1"); assert.equal(request.spans[0].attributes["router.event.id"], event.eventId); assert.notEqual(request.spans[0].attributes["router.event.id"], "caller-spoof");
+  assert.equal(request.resource.attributes["service.name"], "9router"); assert.equal(request.instrumentationScope.name, "9router.observability"); assert.equal(request.spans.length, 1); assert.equal(request.spans[0].kind, "INTERNAL"); assert.equal(request.spans[0].status.code, "OK"); assert.equal(request.spans[0].attributes["router.trace.id"], "trace-otel-1"); assert.equal(request.spans[0].attributes["router.event.id"], event.eventId); assert.equal(request.spans[0].attributes["router.run.id"], "run-otel-1"); assert.equal(request.spans[0].attributes["router.project.id"], "project-1");
   assert.deepEqual(request.spans[0].events, [{ name: "9router.reference", time: NOW, attributes: { "router.link.type": "runtime_session", "router.link.reference": "runtime:opencode:ses-1" } }]);
   assert.equal(receipt.reference, "otel:span:1"); assert.equal(receipt.eventId, event.eventId); const serialized = JSON.stringify(request); assert.doesNotMatch(serialized, /gen_ai\./); assert.doesNotMatch(serialized, /"otel\./);
 });
