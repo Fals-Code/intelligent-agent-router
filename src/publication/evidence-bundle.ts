@@ -1,5 +1,5 @@
 import type { EvidenceRecord, RunLedgerRecord, WorkflowRun } from "../control-plane/contracts.js";
-import { EvidenceGate } from "../control-plane/run-ledger.js";
+import { EvidenceGate, InMemoryRunLedger } from "../control-plane/run-ledger.js";
 
 export const EVIDENCE_BUNDLE_SCHEMA_VERSION = 1 as const;
 
@@ -103,7 +103,6 @@ export interface EvidenceBundleBuilderOptions {
 /**
  * Builds a content-addressed publication candidate during workflow publish and
  * later seals the same bundle identity with a terminal Run Ledger digest.
- *
  * Raw task text, workspace paths and source patches are deliberately excluded.
  */
 export class EvidenceBundleBuilder {
@@ -130,13 +129,7 @@ export class EvidenceBundleBuilder {
 
     const evidence = prepareEvidence(input.evidence);
     const gate = this.evidenceGate.evaluate(input.run.riskClass, evidence);
-    if (!gate.passed) {
-      const details = [
-        gate.missing.length > 0 ? `missing=${gate.missing.join(",")}` : "",
-        gate.failed.length > 0 ? `failed=${gate.failed.join(",")}` : "",
-      ].filter(Boolean).join(" ");
-      throw new Error(`Evidence bundle candidate rejected by evidence gate for ${input.run.id}: ${details}`);
-    }
+    if (!gate.passed) throw evidenceGateError(input.run.id, gate.missing, gate.failed);
     if ((input.run.riskClass === "R3" || input.run.riskClass === "R4") && input.run.approvalIds.length === 0) {
       throw new Error(`Evidence bundle candidate for ${input.run.riskClass} requires durable workflow approval`);
     }
@@ -144,17 +137,14 @@ export class EvidenceBundleBuilder {
     const source = input.source ? prepareSource(input.source, this.options.maxChangedFiles) : undefined;
     const ci = prepareCi(input.ci ?? [], this.options.maxCiRecords, source);
     const artifacts = prepareArtifacts(input.artifacts ?? [], this.options.maxArtifactDigests);
-    const taskSha256 = await sha256Text(input.task);
-    const workspaceSha256 = await sha256Text(input.workspace);
-    const traceId = safeReference(input.traceId, "Evidence bundle traceId");
     const payload: EvidenceBundlePayload = deepFreeze({
       stage: "candidate",
       runId: safeReference(input.run.id, "Evidence bundle runId"),
       projectId: safeReference(input.run.projectId, "Evidence bundle projectId"),
       riskClass: input.run.riskClass,
       workflowAttempt: input.run.attempt,
-      taskSha256,
-      workspaceSha256,
+      taskSha256: await sha256Text(input.task),
+      workspaceSha256: await sha256Text(input.workspace),
       runtimeId: safeReference(input.runtimeId, "Evidence bundle runtimeId"),
       modelRoute: normalizeReferences(input.modelRoute, "Evidence bundle modelRoute"),
       contextCompilerVersion: safeReference(input.contextCompilerVersion, "Evidence bundle contextCompilerVersion"),
@@ -165,12 +155,11 @@ export class EvidenceBundleBuilder {
       changeReferences: normalizeReferences(input.changeReferences, "Evidence bundle changeReferences"),
       evidence,
       resourceMetrics: prepareMetrics(input.resourceMetrics),
-      traceId,
+      traceId: safeReference(input.traceId, "Evidence bundle traceId"),
       source,
       ci,
       artifacts,
     });
-
     return this.wrap(payload);
   }
 
@@ -179,8 +168,9 @@ export class EvidenceBundleBuilder {
     if (input.candidate.payload.stage !== "candidate") {
       throw new Error("Only an evidence bundle candidate can be terminally sealed");
     }
-    await assertLedgerMatchesCandidate(input.runLedger, input.candidate.payload);
 
+    const canonicalLedger = validateCanonicalRunLedger(input.runLedger);
+    await assertLedgerMatchesCandidate(canonicalLedger, input.candidate.payload);
     const source = input.candidate.payload.source;
     const ci = mergeCi(
       input.candidate.payload.ci,
@@ -192,28 +182,24 @@ export class EvidenceBundleBuilder {
       prepareArtifacts(input.artifacts ?? [], this.options.maxArtifactDigests),
       this.options.maxArtifactDigests,
     );
-    if (input.runLedger.outcome === "succeeded" && ci.some((item) => item.conclusion !== "success")) {
+    if (canonicalLedger.outcome === "succeeded" && ci.some((item) => item.conclusion !== "success")) {
       throw new Error("Succeeded terminal bundle cannot attach non-success CI evidence");
     }
 
-    const runLedgerSha256 = await sha256Canonical(input.runLedger);
-    const failureReasonSha256 = input.runLedger.failureReason
-      ? await sha256Text(input.runLedger.failureReason)
-      : undefined;
     const payload: EvidenceBundlePayload = deepFreeze({
       ...clonePayload(input.candidate.payload),
       stage: "sealed_terminal",
       ci,
       artifacts,
       candidateDigest: input.candidate.bundleSha256,
-      runLedgerSha256,
-      outcome: input.runLedger.outcome,
-      failureReasonSha256,
+      runLedgerSha256: await sha256Canonical(canonicalLedger),
+      outcome: canonicalLedger.outcome,
+      failureReasonSha256: canonicalLedger.failureReason
+        ? await sha256Text(canonicalLedger.failureReason)
+        : undefined,
     });
     const sealed = await this.wrap(payload, input.candidate.bundleId);
-    if (sealed.bundleId !== input.candidate.bundleId) {
-      throw new Error("Terminal seal changed evidence bundle identity");
-    }
+    if (sealed.bundleId !== input.candidate.bundleId) throw new Error("Terminal seal changed evidence bundle identity");
     return sealed;
   }
 
@@ -229,9 +215,7 @@ export class EvidenceBundleBuilder {
     });
     const bytes = utf8ByteLength(stableStringify(bundle));
     if (bytes > this.options.maxBundleBytes) {
-      throw new Error(
-        `Evidence bundle exceeds maxBundleBytes: runId=${payload.runId} bytes=${bytes} max=${this.options.maxBundleBytes}`,
-      );
+      throw new Error(`Evidence bundle exceeds maxBundleBytes: runId=${payload.runId} bytes=${bytes} max=${this.options.maxBundleBytes}`);
     }
     return bundle;
   }
@@ -243,6 +227,13 @@ export async function verifyEvidenceBundle(bundle: EvidenceBundle, maxBundleByte
   }
   if (bundle.algorithm !== "sha256") throw new Error("Evidence bundle algorithm must be sha256");
   assertBundlePayload(bundle.payload);
+
+  const gate = new EvidenceGate().evaluate(bundle.payload.riskClass, bundle.payload.evidence);
+  if (!gate.passed) throw evidenceGateError(bundle.payload.runId, gate.missing, gate.failed);
+  if ((bundle.payload.riskClass === "R3" || bundle.payload.riskClass === "R4") && bundle.payload.approvalIds.length === 0) {
+    throw new Error(`Evidence bundle for ${bundle.payload.riskClass} requires durable approval IDs`);
+  }
+
   const expectedId = await bundleIdentity(bundle.payload.runId, bundle.payload.projectId, bundle.payload.traceId);
   if (bundle.bundleId !== expectedId) throw new Error("Evidence bundle identity does not match canonical payload identity");
   const expectedDigest = await sha256Canonical(bundle.payload);
@@ -252,6 +243,14 @@ export async function verifyEvidenceBundle(bundle: EvidenceBundle, maxBundleByte
     const bytes = utf8ByteLength(stableStringify(bundle));
     if (bytes > maxBundleBytes) throw new Error(`Evidence bundle exceeds verification byte bound: ${bytes} > ${maxBundleBytes}`);
   }
+}
+
+function validateCanonicalRunLedger(record: RunLedgerRecord): RunLedgerRecord {
+  const ledger = new InMemoryRunLedger();
+  ledger.append(record);
+  const canonical = ledger.get(record.runId);
+  if (!canonical) throw new Error(`Evidence bundle could not validate Run Ledger record ${record.runId}`);
+  return canonical;
 }
 
 function assertPublishWorkflow(run: WorkflowRun): void {
@@ -271,14 +270,10 @@ async function assertLedgerMatchesCandidate(record: RunLedgerRecord, payload: Ev
   if (record.projectId !== payload.projectId) throw new Error("Run Ledger projectId does not match evidence candidate");
   if (record.riskClass !== payload.riskClass) throw new Error("Run Ledger riskClass does not match evidence candidate");
   if (record.runtimeId !== payload.runtimeId) throw new Error("Run Ledger runtimeId does not match evidence candidate");
-  if (record.contextCompilerVersion !== payload.contextCompilerVersion) {
-    throw new Error("Run Ledger contextCompilerVersion does not match evidence candidate");
-  }
+  if (record.contextCompilerVersion !== payload.contextCompilerVersion) throw new Error("Run Ledger contextCompilerVersion does not match evidence candidate");
   if (record.traceId !== payload.traceId) throw new Error("Run Ledger traceId does not match evidence candidate");
   if (await sha256Text(record.task) !== payload.taskSha256) throw new Error("Run Ledger task digest does not match evidence candidate");
-  if (await sha256Text(record.workspace) !== payload.workspaceSha256) {
-    throw new Error("Run Ledger workspace digest does not match evidence candidate");
-  }
+  if (await sha256Text(record.workspace) !== payload.workspaceSha256) throw new Error("Run Ledger workspace digest does not match evidence candidate");
 
   const arrays: readonly [string, readonly string[], readonly string[]][] = [
     ["modelRoute", normalizeReferences(record.modelRoute, "Run Ledger modelRoute"), payload.modelRoute],
@@ -294,7 +289,6 @@ async function assertLedgerMatchesCandidate(record: RunLedgerRecord, payload: Ev
   if (stableStringify(prepareMetrics(record.resourceMetrics)) !== stableStringify(payload.resourceMetrics)) {
     throw new Error("Run Ledger resourceMetrics do not match evidence candidate");
   }
-
   const ledgerEvidence = prepareEvidence(record.evidence).map(stableStringify);
   for (const item of payload.evidence) {
     if (!ledgerEvidence.includes(stableStringify(item))) {
@@ -304,15 +298,13 @@ async function assertLedgerMatchesCandidate(record: RunLedgerRecord, payload: Ev
 }
 
 function assertBundlePayload(payload: EvidenceBundlePayload): void {
-  if (payload.stage !== "candidate" && payload.stage !== "sealed_terminal") {
-    throw new Error("Evidence bundle stage is invalid");
-  }
-  if (payload.riskClass === "R0" || payload.riskClass === "R1") {
-    throw new Error("Evidence bundle publication riskClass must be R2-R4");
-  }
-  if (!Number.isInteger(payload.workflowAttempt) || payload.workflowAttempt < 1) {
-    throw new Error("Evidence bundle workflowAttempt must be >= 1");
-  }
+  if (payload.stage !== "candidate" && payload.stage !== "sealed_terminal") throw new Error("Evidence bundle stage is invalid");
+  if (payload.riskClass === "R0" || payload.riskClass === "R1") throw new Error("Evidence bundle publication riskClass must be R2-R4");
+  if (!Number.isInteger(payload.workflowAttempt) || payload.workflowAttempt < 1) throw new Error("Evidence bundle workflowAttempt must be >= 1");
+  assertNonEmptyString(payload.runId, "Evidence bundle runId");
+  assertNonEmptyString(payload.projectId, "Evidence bundle projectId");
+  assertNonEmptyString(payload.runtimeId, "Evidence bundle runtimeId");
+  assertNonEmptyString(payload.traceId, "Evidence bundle traceId");
   assertSha256(payload.taskSha256, "Evidence bundle taskSha256");
   assertSha256(payload.workspaceSha256, "Evidence bundle workspaceSha256");
   if (payload.stage === "candidate") {
@@ -322,7 +314,9 @@ function assertBundlePayload(payload: EvidenceBundlePayload): void {
   } else {
     assertSha256(payload.candidateDigest ?? "", "Evidence bundle candidateDigest");
     assertSha256(payload.runLedgerSha256 ?? "", "Evidence bundle runLedgerSha256");
-    if (!payload.outcome) throw new Error("Sealed terminal evidence bundle requires outcome");
+    if (!payload.outcome || !["failed", "cancelled", "succeeded"].includes(payload.outcome)) {
+      throw new Error("Sealed terminal evidence bundle requires valid outcome");
+    }
     if (payload.failureReasonSha256) assertSha256(payload.failureReasonSha256, "Evidence bundle failureReasonSha256");
   }
 }
@@ -331,16 +325,12 @@ function prepareSource(source: SourceDiffEvidence, maxChangedFiles: number): Sou
   const repository = safeReference(source.repository, "Evidence source repository");
   assertGitSha(source.baseSha, "Evidence source baseSha");
   assertGitSha(source.headSha, "Evidence source headSha");
-  if (source.baseSha.toLowerCase() === source.headSha.toLowerCase()) {
-    throw new Error("Evidence source baseSha and headSha must differ");
-  }
+  if (source.baseSha.toLowerCase() === source.headSha.toLowerCase()) throw new Error("Evidence source baseSha and headSha must differ");
   assertSha256(source.diffSha256, "Evidence source diffSha256");
   assertNonNegativeInteger(source.diffBytes, "Evidence source diffBytes");
   const changedFiles = [...new Set(source.changedFiles.map(normalizeGitPath))].sort();
   if (changedFiles.length === 0) throw new Error("Evidence source changedFiles must not be empty");
-  if (changedFiles.length > maxChangedFiles) {
-    throw new Error(`Evidence source changedFiles exceeds maxChangedFiles: count=${changedFiles.length} max=${maxChangedFiles}`);
-  }
+  if (changedFiles.length > maxChangedFiles) throw new Error(`Evidence source changedFiles exceeds maxChangedFiles: count=${changedFiles.length} max=${maxChangedFiles}`);
   return deepFreeze({
     repository,
     baseSha: source.baseSha.toLowerCase(),
@@ -353,19 +343,13 @@ function prepareSource(source: SourceDiffEvidence, maxChangedFiles: number): Sou
 }
 
 function prepareCi(records: readonly CiEvidence[], maxCiRecords: number, source?: SourceDiffEvidence): readonly CiEvidence[] {
-  if (records.length > maxCiRecords) {
-    throw new Error(`Evidence CI records exceed maxCiRecords: count=${records.length} max=${maxCiRecords}`);
-  }
+  if (records.length > maxCiRecords) throw new Error(`Evidence CI records exceed maxCiRecords: count=${records.length} max=${maxCiRecords}`);
   const seen = new Set<string>();
   const result = records.map((record, index) => {
     if (record.provider !== "github") throw new Error(`Evidence CI[${index}].provider must be github`);
     assertGitSha(record.commitSha, `Evidence CI[${index}].commitSha`);
-    if (!["success", "failure", "cancelled", "skipped"].includes(record.conclusion)) {
-      throw new Error(`Evidence CI[${index}].conclusion is invalid`);
-    }
-    if (source && record.commitSha.toLowerCase() !== source.headSha.toLowerCase()) {
-      throw new Error(`Evidence CI[${index}] commitSha does not match source headSha`);
-    }
+    if (!["success", "failure", "cancelled", "skipped"].includes(record.conclusion)) throw new Error(`Evidence CI[${index}].conclusion is invalid`);
+    if (source && record.commitSha.toLowerCase() !== source.headSha.toLowerCase()) throw new Error(`Evidence CI[${index}] commitSha does not match source headSha`);
     const prepared: CiEvidence = {
       provider: "github",
       workflow: sanitizePublishText(record.workflow),
@@ -465,9 +449,7 @@ function normalizeReferences(values: readonly string[], label: string): readonly
 function safeReference(value: string, label: string): string {
   assertNonEmptyString(value, label);
   const trimmed = value.trim();
-  if (sanitizePublishText(trimmed) !== trimmed) {
-    throw new Error(`${label} contains secret-like material and cannot be published as an identity reference`);
-  }
+  if (sanitizePublishText(trimmed) !== trimmed) throw new Error(`${label} contains secret-like material and cannot be published as an identity reference`);
   return trimmed;
 }
 
@@ -536,6 +518,14 @@ function clonePayload(payload: EvidenceBundlePayload): EvidenceBundlePayload {
     ci: payload.ci.map((item) => ({ ...item })),
     artifacts: payload.artifacts.map((item) => ({ ...item })),
   };
+}
+
+function evidenceGateError(runId: string, missing: readonly string[], failed: readonly string[]): Error {
+  const details = [
+    missing.length > 0 ? `missing=${missing.join(",")}` : "",
+    failed.length > 0 ? `failed=${failed.join(",")}` : "",
+  ].filter(Boolean).join(" ");
+  return new Error(`Evidence bundle candidate rejected by evidence gate for ${runId}: ${details}`);
 }
 
 function sameArray(left: readonly string[], right: readonly string[]): boolean {
