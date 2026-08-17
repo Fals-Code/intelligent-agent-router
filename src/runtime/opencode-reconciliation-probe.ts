@@ -37,11 +37,6 @@ export interface OpenCodeReconciliationProbeOptions extends OpenCodeHttpClientOp
   readonly now?: () => string;
 }
 
-/**
- * Read-only OpenCode probe for process-restart reconciliation.
- * It does not register the session in OpenCodeRuntimeAdapter and never calls a
- * mutating OpenCode endpoint.
- */
 export class OpenCodeRuntimeReconciliationProbe implements RuntimeReconciliationProbe {
   readonly runtimeId = "opencode";
   private readonly client: OpenCodeHttpClient;
@@ -53,9 +48,7 @@ export class OpenCodeRuntimeReconciliationProbe implements RuntimeReconciliation
   }
 
   async inspect(binding: RuntimeBinding): Promise<RuntimeObservation> {
-    if (binding.runtimeId !== this.runtimeId) {
-      throw new Error(`OpenCode probe cannot inspect runtime ${binding.runtimeId}`);
-    }
+    if (binding.runtimeId !== this.runtimeId) throw new Error(`OpenCode probe cannot inspect runtime ${binding.runtimeId}`);
 
     const session = await this.client.request<OpenCodeSessionInfo>({
       method: "GET",
@@ -64,9 +57,7 @@ export class OpenCodeRuntimeReconciliationProbe implements RuntimeReconciliation
     });
     const upstreamId = stringValue(session?.id);
     if (!upstreamId || upstreamId !== binding.sessionId) {
-      throw new OpenCodeHttpError(
-        `OpenCode session identity mismatch: expected=${binding.sessionId} actual=${upstreamId ?? "missing"}`,
-      );
+      throw new OpenCodeHttpError(`OpenCode session identity mismatch: expected=${binding.sessionId} actual=${upstreamId ?? "missing"}`);
     }
     const upstreamDirectory = stringValue(session?.directory);
     if (upstreamDirectory && normalizePath(upstreamDirectory) !== normalizePath(binding.workspace)) {
@@ -74,48 +65,22 @@ export class OpenCodeRuntimeReconciliationProbe implements RuntimeReconciliation
     }
 
     const [statuses, messages, permissions, rawDiff] = await Promise.all([
-      this.client.request<Record<string, OpenCodeStatusInfo>>({
-        method: "GET",
-        path: "/session/status",
-        directory: binding.workspace,
-      }),
-      this.client.request<readonly OpenCodeMessage[]>({
-        method: "GET",
-        path: `/session/${encodeURIComponent(binding.sessionId)}/message`,
-        directory: binding.workspace,
-      }),
-      this.client.request<readonly OpenCodePermissionRequest[]>({
-        method: "GET",
-        path: "/permission",
-        directory: binding.workspace,
-      }),
-      this.client.request<readonly OpenCodeFileDiff[]>({
-        method: "GET",
-        path: `/session/${encodeURIComponent(binding.sessionId)}/diff`,
-        directory: binding.workspace,
-      }),
+      this.client.request<Record<string, OpenCodeStatusInfo>>({ method: "GET", path: "/session/status", directory: binding.workspace }),
+      this.client.request<readonly OpenCodeMessage[]>({ method: "GET", path: `/session/${encodeURIComponent(binding.sessionId)}/message`, directory: binding.workspace }),
+      this.client.request<readonly OpenCodePermissionRequest[]>({ method: "GET", path: "/permission", directory: binding.workspace }),
+      this.client.request<readonly OpenCodeFileDiff[]>({ method: "GET", path: `/session/${encodeURIComponent(binding.sessionId)}/diff`, directory: binding.workspace }),
     ]);
 
     const safeMessages = Array.isArray(messages) ? messages : [];
-    const safePermissions = Array.isArray(permissions)
-      ? permissions.filter((item) => stringValue(item.sessionID) === binding.sessionId)
-      : [];
+    const safePermissions = Array.isArray(permissions) ? permissions.filter((item) => stringValue(item.sessionID) === binding.sessionId) : [];
     const safeDiff = Array.isArray(rawDiff) ? rawDiff : [];
     const statusType = stringValue(statuses?.[binding.sessionId]?.type) ?? "idle";
-    if (!["idle", "busy", "retry"].includes(statusType)) {
-      throw new OpenCodeHttpError(`OpenCode returned unknown session status: ${statusType}`);
-    }
+    if (!["idle", "busy", "retry"].includes(statusType)) throw new OpenCodeHttpError(`OpenCode returned unknown session status: ${statusType}`);
 
     const observedAt = this.now();
     const status = deriveStatus(statusType, safeMessages, safePermissions);
     const events = summarizeEvents(binding.sessionId, safeMessages, safePermissions, observedAt);
-    const filesChanged = [
-      ...new Set(
-        safeDiff
-          .map((item) => stringValue(item.file))
-          .filter((item): item is string => Boolean(item)),
-      ),
-    ].sort();
+    const filesChanged = [...new Set(safeDiff.map((item) => stringValue(item.file)).filter((item): item is string => Boolean(item)))].sort();
     const patchObserved = safeDiff.some((item) => Boolean(stringValue(item.patch)));
 
     return Object.freeze({
@@ -129,19 +94,12 @@ export class OpenCodeRuntimeReconciliationProbe implements RuntimeReconciliation
         lastEventId: events.at(-1)?.id,
         lastEventAt: events.at(-1)?.timestamp,
       }),
-      diff: Object.freeze({
-        filesChanged: Object.freeze(filesChanged),
-        patchObserved,
-      }),
+      diff: Object.freeze({ filesChanged: Object.freeze(filesChanged), patchObserved }),
     });
   }
 }
 
-function deriveStatus(
-  statusType: string,
-  messages: readonly OpenCodeMessage[],
-  permissions: readonly OpenCodePermissionRequest[],
-): RuntimeObservation["status"] {
+function deriveStatus(statusType: string, messages: readonly OpenCodeMessage[], permissions: readonly OpenCodePermissionRequest[]): RuntimeObservation["status"] {
   if (permissions.length > 0) return "waiting_approval";
   if (statusType === "busy" || statusType === "retry") return "running";
   return hasTerminalAssistantAfterLatestUser(messages) ? "completed" : "created";
@@ -149,53 +107,33 @@ function deriveStatus(
 
 function hasTerminalAssistantAfterLatestUser(messages: readonly OpenCodeMessage[]): boolean {
   let latestUserIndex = -1;
-  for (let index = 0; index < messages.length; index += 1) {
-    if (stringValue(messages[index]?.info?.role) === "user") latestUserIndex = index;
-  }
+  for (let index = 0; index < messages.length; index += 1) if (stringValue(messages[index]?.info?.role) === "user") latestUserIndex = index;
   if (latestUserIndex < 0) return false;
   for (let index = latestUserIndex + 1; index < messages.length; index += 1) {
     const message = messages[index];
-    if (stringValue(message?.info?.role) === "assistant" && isTerminalAssistantFinish(message?.info?.finish)) {
-      return true;
-    }
+    if (stringValue(message?.info?.role) === "assistant" && isTerminalAssistantFinish(message?.info?.finish)) return true;
   }
   return false;
 }
 
-function summarizeEvents(
-  sessionId: string,
-  messages: readonly OpenCodeMessage[],
-  permissions: readonly OpenCodePermissionRequest[],
-  observedAt: string,
-): readonly { id: string; type: string; timestamp: string }[] {
+function summarizeEvents(sessionId: string, messages: readonly OpenCodeMessage[], permissions: readonly OpenCodePermissionRequest[], observedAt: string): readonly { id: string; type: string; timestamp: string }[] {
   const events: { id: string; type: string; timestamp: string }[] = [];
   for (const message of messages) {
     const id = stringValue(message.info?.id);
     const role = stringValue(message.info?.role);
     if (!id || !role) continue;
     const createdAt = timestamp(message.info?.time?.created) ?? observedAt;
-    if (role === "user") {
-      events.push({ id: `opencode:message:${id}:user`, type: "task_started", timestamp: createdAt });
-    } else if (role === "assistant" && isTerminalAssistantFinish(message.info?.finish)) {
-      events.push({
-        id: `opencode:message:${id}:assistant`,
-        type: "task_completed",
-        timestamp: timestamp(message.info?.time?.completed) ?? createdAt,
-      });
+    if (role === "user") events.push({ id: `opencode:message:${id}:user`, type: "task_started", timestamp: createdAt });
+    else if (role === "assistant" && isTerminalAssistantFinish(message.info?.finish)) {
+      events.push({ id: `opencode:message:${id}:assistant`, type: "task_completed", timestamp: timestamp(message.info?.time?.completed) ?? createdAt });
     }
   }
   for (const permission of permissions) {
     const id = stringValue(permission.id);
     if (!id) continue;
-    events.push({
-      id: `opencode:permission:${sessionId}:${id}`,
-      type: "approval_requested",
-      timestamp: observedAt,
-    });
+    events.push({ id: `opencode:permission:${sessionId}:${id}`, type: "approval_requested", timestamp: observedAt });
   }
-  return events.sort((a, b) =>
-    a.timestamp === b.timestamp ? a.id.localeCompare(b.id) : a.timestamp.localeCompare(b.timestamp),
-  );
+  return events.sort((a, b) => (a.timestamp === b.timestamp ? a.id.localeCompare(b.id) : a.timestamp.localeCompare(b.timestamp)));
 }
 
 function isTerminalAssistantFinish(value: unknown): boolean {
@@ -214,5 +152,5 @@ function timestamp(value: unknown): string | undefined {
 }
 
 function normalizePath(value: string): string {
-  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return value.replace(/\\/g, "/").replace(/\/+$/, "");
 }
