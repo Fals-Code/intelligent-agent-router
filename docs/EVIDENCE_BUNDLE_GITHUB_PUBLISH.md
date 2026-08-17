@@ -1,111 +1,139 @@
 # Evidence Bundle + GitHub Publish Boundary
 
-This layer turns an already-terminal 9Router Run Ledger record into a bounded, sanitized, immutable publication snapshot and then allows GitHub to publish only that sealed snapshot through an explicit policy/approval gate.
+This boundary makes 9Router evidence publishable without making GitHub a canonical control-plane owner.
 
-It does **not** make GitHub a canonical state owner.
+It follows the frozen ownership model:
 
-## Ownership
+- Git/GitHub owns source history, branches, commits, issues and pull requests.
+- 9Router owns workflow/run state, policy, evidence and evaluation.
+- Run Ledger remains authoritative for terminal control-plane outcome.
+- GitHub publication receipts are external references only.
 
-- `RunLedgerRecord` remains the canonical terminal audit record.
-- `EvidenceBundleBuilder` creates a publishable snapshot from that record plus source/CI/artifact evidence supplied by the caller.
-- `GitHubPublishAdapter` is an output adapter only. It receives a sealed bundle and explicit publication authorization.
-- GitHub comments are publication receipts, not workflow truth and not Run Ledger replacements.
+## Why publication has two stages
 
-The adapter has no workflow checkpoint store, runtime adapter, approval store, Run Ledger writer, or execution engine dependency.
+The frozen workflow orders publication before terminal Run Ledger finalization:
 
-## Evidence bundle contents
+`... -> review -> approval? -> publish -> terminal Run Ledger`
 
-Schema version 1 contains:
+The current `RunLedger` implementation intentionally stores terminal records only. PR publication therefore cannot require an already-terminal Run Ledger without reversing the workflow contract.
 
-- sanitized terminal Run Ledger snapshot;
-- SHA-256 of the canonical Run Ledger record;
-- runtime/deterministic verification evidence already present in the Run Ledger;
-- canonical workflow approval IDs and approval evidence already present in the Run Ledger;
-- optional source diff identity: repository, base/head Git object IDs, changed-file scope, diff byte count, and SHA-256;
-- optional GitHub CI records tied to the exact source head;
-- optional artifact digests, such as durable JSONL proof files;
-- SHA-256 sealing the complete bundle envelope.
+PR #28 uses one stable bundle identity with two content-addressed stages:
 
-Raw source patches are deliberately excluded from the bundle contract. The source diff is represented by scope and digest so publication does not become a new secret-bearing patch store.
+1. `candidate` - built only from a running workflow in `publish`, after the risk-class evidence gate is satisfied. This stage can create or update a GitHub pull request.
+2. `sealed_terminal` - created after terminal Run Ledger persistence. It preserves the same `bundleId`, records the candidate digest, adds the canonical Run Ledger SHA-256 and terminal outcome, and may attach post-publication CI evidence.
 
-## Canonical validation
+The terminal seal is published back to the existing PR as evidence. GitHub never decides workflow success.
 
-The builder first admits the supplied Run Ledger record through `InMemoryRunLedger`. It therefore reuses the existing structural validation and `EvidenceGate` requirements rather than inventing a second success definition.
+## Publication candidate
 
-The builder also:
+`EvidenceBundleBuilder.createCandidate()` accepts the current publish-phase workflow and the normalized facts that will later enter Run Ledger.
 
-- requires explicit collection and byte bounds;
-- normalizes and deduplicates changed-file scope;
-- requires CI commit identity to match the source head when source evidence is attached;
-- validates SHA-256 and Git object identifiers;
-- rejects duplicate CI run identities and artifact names;
-- redacts common Bearer and credential key/value patterns before publication data is sealed;
-- deep-freezes the completed bundle.
+The bundle contains:
 
-The Run Ledger SHA-256 is calculated from the canonical Run Ledger record before publication sanitization. The bundle SHA-256 is calculated from the sanitized publication envelope.
+- run/project/risk/attempt identity;
+- SHA-256 of task text, not task text;
+- SHA-256 of workspace path, not the local path;
+- runtime/model/context/skills/toolset references;
+- policy decisions and durable workflow approval IDs;
+- normalized evidence records;
+- bounded resource metrics;
+- trace identity;
+- optional source identity: repository, base/head Git object IDs, changed-file scope, diff byte count and diff SHA-256;
+- optional CI references tied to the exact source head;
+- optional artifact digests.
 
-## Publication authorization
+Raw source patches are not accepted by the bundle contract.
 
-`PublicationAuthorization` binds policy approval to:
+R0/R1 workflows cannot create an external GitHub publication candidate. R2-R4 candidates must pass the existing `EvidenceGate`; R3/R4 additionally require durable workflow approval IDs.
 
-- exact `runId`;
-- exact sealed `bundleSha256`;
-- an explicit `allow` or `deny` decision;
-- decision actor and timestamp;
-- one or more policy references;
-- the exact set of workflow approval IDs already recorded in the Run Ledger.
+## Terminal seal
 
-A deny decision never calls GitHub.
+`EvidenceBundleBuilder.sealTerminal()` binds the candidate to a terminal `RunLedgerRecord`.
 
-For R3/R4 publication, durable workflow approval IDs are mandatory. The adapter also requires authorization approval IDs to exactly match the bundle's canonical approval IDs. It does not accept a fabricated approval ID that is absent from the Run Ledger.
+The seal verifies that the terminal record agrees with the candidate on:
 
-R0-R2 publication may be policy-authorized without workflow approval IDs when the canonical workflow itself has none.
+- run/project/risk identity;
+- task and workspace digests;
+- runtime, model route and context compiler;
+- skills/toolsets;
+- policy decisions;
+- durable approval IDs;
+- change references;
+- resource metrics;
+- trace identity;
+- evidence already published in the candidate.
 
-## GitHub adapter behavior
+The sealed payload adds:
 
-The first adapter target is a pull-request comment.
+- candidate SHA-256;
+- canonical Run Ledger SHA-256;
+- terminal outcome;
+- SHA-256 of failure reason when one exists;
+- merged CI and artifact digest references.
 
-The adapter:
+For a succeeded terminal run, any CI evidence included in the seal must itself be successful. Absence of CI does not invent a universal CI requirement; risk-specific evidence remains governed by the existing `EvidenceGate`.
 
-1. validates `owner/name` and pull-request identity;
-2. validates publication authorization against the sealed bundle;
-3. renders a bounded Markdown evidence summary;
-4. performs exactly one `GitHubPublishClient.createPullRequestComment()` call;
-5. returns a publication receipt containing the external comment identity/reference and sealed bundle SHA-256.
+## Content identity
 
-The client receives an idempotency key derived from run ID + bundle SHA-256, but the adapter does **not** claim exactly-once publication because GitHub comment creation itself may not provide an atomic idempotency guarantee.
+The stable `bundleId` is derived from `runId + projectId + traceId`.
 
-A failed GitHub call is surfaced directly. The adapter does not automatically retry publication.
+Each stage has its own `bundleSha256` calculated from canonical, key-sorted serialization of the stage payload. No wall-clock `sealedAt` field participates in the digest, so identical canonical inputs produce identical hashes.
 
-## Public Markdown scope
+## Security and disclosure
 
-The rendered comment includes:
+The publishable bundle deliberately excludes:
 
-- bundle and Run Ledger SHA-256;
-- run outcome/risk/runtime/trace identity;
-- source base/head, diff digest, and changed-file scope;
-- verification evidence references;
-- attached CI run conclusions;
-- approval IDs;
-- artifact digests.
+- raw task text;
+- raw local workspace path;
+- raw source diff/patch;
+- credentials and bearer tokens;
+- provider-native full state.
 
-It intentionally does not render the Run Ledger task text or workspace path, reducing accidental exposure of local paths or sensitive task context.
+Secret-like metadata values are redacted. Identity references containing secret-like material fail closed instead of being silently rewritten into a different identity.
 
-## Explicit non-goals
+The bundle is bounded by caller-selected limits for total bytes, CI records, artifact digests and changed-file count.
 
-This PR does not add:
+## GitHub adapter
 
-- automatic GitHub publication from workflow success;
-- a GitHub App/token implementation inside core;
-- durable publication receipt persistence;
-- publication retries;
-- PR merge, branch push, release creation, issue creation, or deployment;
+`GitHubPublishAdapter` has two explicit operations.
+
+### `publishCandidate()`
+
+- accepts only a verified `candidate` bundle;
+- requires an explicit `PublicationAuthorization` bound to the exact run ID and bundle SHA-256;
+- requires policy references and the exact durable approval-ID set represented by the bundle;
+- creates or updates one PR through an injected `GitHubPublishClient`;
+- performs no automatic retry;
+- returns an external publication receipt only.
+
+### `publishTerminalSeal()`
+
+- accepts only a verified `sealed_terminal` bundle;
+- requires a fresh authorization bound to the sealed bundle digest;
+- adds one bounded terminal evidence comment to the existing PR;
+- does not modify Run Ledger, workflow, runtime, approvals or source state.
+
+The adapter itself owns no GitHub token. Credential acquisition/brokering remains outside this slice so long-lived credentials are not introduced into core publication code.
+
+## Idempotency boundary
+
+Requests contain deterministic idempotency keys derived from bundle identity + stage digest. They help an outer GitHub client recognize duplicate publication attempts, but PR #28 does **not** claim exactly-once GitHub side effects because no distributed transaction exists between GitHub and 9Router.
+
+A failed GitHub call is surfaced directly and is not automatically repeated.
+
+## Non-goals
+
+PR #28 does not add:
+
+- automatic merge or deployment;
+- branch push/commit ownership;
+- GitHub credential storage;
+- publication-receipt persistence;
+- automatic workflow success after PR creation;
 - raw patch persistence;
-- richer durable approval actor/reason records that do not yet exist in the canonical workflow contract;
-- OpenTelemetry or Eval Plane integration.
-
-Those should remain separate slices.
+- a second approval store;
+- OpenTelemetry or Eval Plane behavior.
 
 ## Next gate
 
-After the evidence bundle and GitHub publication contract are validated, the next recommended slice is an observability boundary: OpenTelemetry trace/span export plus Eval Plane correlation using existing `traceId`, Run Ledger, evidence bundle digest, runtime/session identity, and publication receipt references without making telemetry canonical workflow state.
+After this boundary is validated, the next slice is OpenTelemetry-compatible internal event/export plumbing correlated by `traceId`, `bundleId`, runtime/session identity and publication receipt references. Run Ledger remains authoritative. The following slice establishes the Eval Plane / golden-task baseline required for M4 measurement.
