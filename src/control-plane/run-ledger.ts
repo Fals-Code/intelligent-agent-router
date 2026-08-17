@@ -88,6 +88,8 @@ export class InMemoryRunLedger implements RunLedger {
 
 export interface JsonlRunLedgerOptions {
   readonly filePath: string;
+  readonly maxFileBytes: number;
+  readonly maxRecordBytes: number;
   readonly evidenceGate?: EvidenceGate;
 }
 
@@ -98,7 +100,8 @@ export interface JsonlRunLedgerOptions {
  * before it becomes visible through this instance. Startup reload is fail-closed:
  * malformed JSON, unsupported schema versions, truncated final writes, duplicate
  * run IDs, or evidence-invalid successful runs reject the ledger instead of being
- * silently skipped.
+ * silently skipped. File and per-record byte ceilings are explicit so persistence
+ * cannot grow without a caller-selected resource bound.
  *
  * This class deliberately does not coordinate multiple concurrent processes.
  * It detects file-size drift observed before an append and requires the caller to
@@ -108,11 +111,21 @@ export class JsonlRunLedger implements RunLedger {
   readonly filePath: string;
   private readonly records = new Map<string, RunLedgerRecord>();
   private readonly evidenceGate: EvidenceGate;
+  private readonly maxFileBytes: number;
+  private readonly maxRecordBytes: number;
   private expectedFileSize = 0;
 
   constructor(options: JsonlRunLedgerOptions) {
     if (!options.filePath.trim()) throw new Error("Run ledger filePath must not be empty");
+    assertPositiveInteger(options.maxFileBytes, "Run ledger maxFileBytes");
+    assertPositiveInteger(options.maxRecordBytes, "Run ledger maxRecordBytes");
+    if (options.maxRecordBytes > options.maxFileBytes) {
+      throw new Error("Run ledger maxRecordBytes must not exceed maxFileBytes");
+    }
+
     this.filePath = resolve(options.filePath);
+    this.maxFileBytes = options.maxFileBytes;
+    this.maxRecordBytes = options.maxRecordBytes;
     this.evidenceGate = options.evidenceGate ?? new EvidenceGate();
     mkdirSync(resolve(this.filePath, ".."), { recursive: true });
     this.load();
@@ -122,8 +135,19 @@ export class JsonlRunLedger implements RunLedger {
     this.assertStorageUnchanged();
     const prepared = prepareRecord(record, this.records, this.evidenceGate);
     const line = `${JSON.stringify({ schemaVersion: RUN_LEDGER_SCHEMA_VERSION, record: prepared })}\n`;
-    const handle = openSync(this.filePath, "a", 0o600);
+    const lineBytes = utf8ByteLength(line);
+    if (lineBytes > this.maxRecordBytes) {
+      throw new Error(
+        `Run ledger record exceeds maxRecordBytes: runId=${prepared.runId} bytes=${lineBytes} max=${this.maxRecordBytes}`,
+      );
+    }
+    if (this.expectedFileSize + lineBytes > this.maxFileBytes) {
+      throw new Error(
+        `Run ledger append would exceed maxFileBytes: current=${this.expectedFileSize} append=${lineBytes} max=${this.maxFileBytes}`,
+      );
+    }
 
+    const handle = openSync(this.filePath, "a", 0o600);
     try {
       writeFileSync(handle, line, "utf8");
       fsyncSync(handle);
@@ -131,7 +155,7 @@ export class JsonlRunLedger implements RunLedger {
       closeSync(handle);
     }
 
-    this.expectedFileSize += utf8ByteLength(line);
+    this.expectedFileSize += lineBytes;
     this.records.set(prepared.runId, prepared);
   }
 
@@ -145,6 +169,11 @@ export class JsonlRunLedger implements RunLedger {
 
   private load(): void {
     if (!existsSync(this.filePath)) return;
+    const size = statSync(this.filePath).size;
+    if (size > this.maxFileBytes) {
+      throw new Error(`Run ledger exceeds maxFileBytes: bytes=${size} max=${this.maxFileBytes}`);
+    }
+
     const raw = readFileSync(this.filePath, "utf8");
     this.expectedFileSize = utf8ByteLength(raw);
     if (raw.length === 0) return;
@@ -157,6 +186,12 @@ export class JsonlRunLedger implements RunLedger {
       const lineNumber = index + 1;
       const line = lines[index];
       if (!line.trim()) throw new Error(`Run ledger contains an empty record at line ${lineNumber}`);
+      const lineBytes = utf8ByteLength(`${line}\n`);
+      if (lineBytes > this.maxRecordBytes) {
+        throw new Error(
+          `Run ledger record at line ${lineNumber} exceeds maxRecordBytes: bytes=${lineBytes} max=${this.maxRecordBytes}`,
+        );
+      }
       const record = parsePersistedEntry(line, lineNumber);
       const prepared = prepareRecord(record, this.records, this.evidenceGate);
       this.records.set(prepared.runId, prepared);
@@ -282,12 +317,19 @@ function assertEvidenceRecord(value: unknown, label: string): asserts value is E
       ) {
         throw new Error(`${label}.metadata.${key} must be a scalar value`);
       }
+      if (typeof metadataValue === "number" && !Number.isFinite(metadataValue)) {
+        throw new Error(`${label}.metadata.${key} must be a finite number`);
+      }
     }
   }
 }
 
 function assertNonEmptyString(value: unknown, label: string): asserts value is string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must not be empty`);
+}
+
+function assertPositiveInteger(value: number, label: string): void {
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${label} must be a positive integer`);
 }
 
 function assertStringArray(value: unknown, label: string): asserts value is string[] {
