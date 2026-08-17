@@ -175,12 +175,12 @@ try {
     Invoke-CheckedCommand -Command "npm" -Arguments @("run", "build", "--silent")
     Write-Host "PASS - TypeScript build." -ForegroundColor Green
 
-    Write-Host "`n=== 9. CONTROL-PLANE PROCESS A — PREPARE ===" -ForegroundColor Yellow
+    Write-Host "`n=== 9. CONTROL-PLANE PROCESS A - PREPARE ===" -ForegroundColor Yellow
     Write-Host "INFO - Creates a real OpenCode session, durable workflow/binding, runs a read-only task, then exits while workflow remains active." -ForegroundColor DarkCyan
     Invoke-CheckedCommand -Command "node" -Arguments @("--env-file-if-exists=.env", "scripts/run-reference-restart-recovery-slice.mjs", "prepare")
     Write-Host "PASS - Process A durable prepare evidence." -ForegroundColor Green
 
-    Write-Host "`n=== 10. CONTROL-PLANE PROCESS B — RECOVER ===" -ForegroundColor Yellow
+    Write-Host "`n=== 10. CONTROL-PLANE PROCESS B - RECOVER ===" -ForegroundColor Yellow
     Write-Host "INFO - New Node PID reopens JSONL state, performs GET-only runtime reconciliation, deterministic verification, terminal ledger finalization, and final reopen." -ForegroundColor DarkCyan
     Invoke-CheckedCommand -Command "node" -Arguments @("--env-file-if-exists=.env", "scripts/run-reference-restart-recovery-slice.mjs", "recover")
     Write-Host "PASS - Process B restart/recovery proof." -ForegroundColor Green
@@ -196,11 +196,9 @@ try {
     Write-Host "PASS - Router Git HEAD and working tree remained unchanged." -ForegroundColor Green
     Write-Host "STATE_ROOT=$StateRoot" -ForegroundColor Cyan
     Write-Host "NEXT_GATE=INDEPENDENT_LIVE_RECOVERY_REVIEW" -ForegroundColor Cyan
-    [Environment]::ExitCode = 0
 }
 catch {
     $RunFailed = $true
-    [Environment]::ExitCode = 1
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Red
     Write-Host "  9ROUTER LIVE RESTART/RECOVERY PREFLIGHT : FAILED" -ForegroundColor Red
@@ -226,3 +224,6 @@ finally {
     Write-Host "STATE_ROOT=$StateRoot" -ForegroundColor Cyan
     Write-Host "LOG=$LogFile" -ForegroundColor Cyan
 }
+
+if ($RunFailed) { exit 1 }
+exit 0
