@@ -71,23 +71,15 @@ export interface JsonlExecutionIntegrityJournalOptions {
   readonly maxEntryBytes: number;
 }
 
-/**
- * Local, append-only, single-writer integrity journal for cross-store milestones.
- *
- * The journal does not claim distributed transaction semantics. It makes partial
- * durable state observable after restart and persists deterministic verification
- * evidence before terminal Run Ledger finalization. Every append is fsync'd.
- */
+/** Local, append-only, single-writer cross-store integrity journal. */
 export class JsonlExecutionIntegrityJournal implements ExecutionIntegrityJournal {
   readonly filePath: string;
-  private readonly maxFileBytes: number;
-  private readonly maxEntryBytes: number;
   private readonly entries: ExecutionIntegrityEntry[] = [];
   private readonly histories = new Map<string, ExecutionIntegrityEntry[]>();
   private expectedFileSize = 0;
   private nextSequence = 1;
 
-  constructor(options: JsonlExecutionIntegrityJournalOptions) {
+  constructor(private readonly options: JsonlExecutionIntegrityJournalOptions) {
     if (!options.filePath.trim()) throw new Error("Execution integrity filePath must not be empty");
     assertPositiveInteger(options.maxFileBytes, "Execution integrity maxFileBytes");
     assertPositiveInteger(options.maxEntryBytes, "Execution integrity maxEntryBytes");
@@ -95,8 +87,6 @@ export class JsonlExecutionIntegrityJournal implements ExecutionIntegrityJournal
       throw new Error("Execution integrity maxEntryBytes must not exceed maxFileBytes");
     }
     this.filePath = resolve(options.filePath);
-    this.maxFileBytes = options.maxFileBytes;
-    this.maxEntryBytes = options.maxEntryBytes;
     mkdirSync(resolve(this.filePath, ".."), { recursive: true });
     this.load();
   }
@@ -112,16 +102,12 @@ export class JsonlExecutionIntegrityJournal implements ExecutionIntegrityJournal
       sequence: this.nextSequence,
       entry: prepared,
     })}\n`;
-    const lineBytes = utf8ByteLength(line);
-    if (lineBytes > this.maxEntryBytes) {
-      throw new Error(
-        `Execution integrity entry exceeds maxEntryBytes: runId=${entry.runId} bytes=${lineBytes} max=${this.maxEntryBytes}`,
-      );
+    const bytes = utf8ByteLength(line);
+    if (bytes > this.options.maxEntryBytes) {
+      throw new Error(`Execution integrity entry exceeds maxEntryBytes: runId=${entry.runId} bytes=${bytes} max=${this.options.maxEntryBytes}`);
     }
-    if (this.expectedFileSize + lineBytes > this.maxFileBytes) {
-      throw new Error(
-        `Execution integrity append would exceed maxFileBytes: current=${this.expectedFileSize} append=${lineBytes} max=${this.maxFileBytes}`,
-      );
+    if (this.expectedFileSize + bytes > this.options.maxFileBytes) {
+      throw new Error(`Execution integrity append would exceed maxFileBytes: current=${this.expectedFileSize} append=${bytes} max=${this.options.maxFileBytes}`);
     }
 
     const handle = openSync(this.filePath, "a", 0o600);
@@ -131,8 +117,7 @@ export class JsonlExecutionIntegrityJournal implements ExecutionIntegrityJournal
     } finally {
       closeSync(handle);
     }
-
-    this.expectedFileSize += lineBytes;
+    this.expectedFileSize += bytes;
     this.nextSequence += 1;
     this.admit(prepared);
   }
@@ -148,8 +133,8 @@ export class JsonlExecutionIntegrityJournal implements ExecutionIntegrityJournal
   private load(): void {
     if (!existsSync(this.filePath)) return;
     const size = statSync(this.filePath).size;
-    if (size > this.maxFileBytes) {
-      throw new Error(`Execution integrity file exceeds maxFileBytes: bytes=${size} max=${this.maxFileBytes}`);
+    if (size > this.options.maxFileBytes) {
+      throw new Error(`Execution integrity file exceeds maxFileBytes: bytes=${size} max=${this.options.maxFileBytes}`);
     }
     const raw = readFileSync(this.filePath, "utf8");
     this.expectedFileSize = utf8ByteLength(raw);
@@ -164,17 +149,13 @@ export class JsonlExecutionIntegrityJournal implements ExecutionIntegrityJournal
       const lineNumber = index + 1;
       const line = lines[index];
       if (!line.trim()) throw new Error(`Execution integrity file contains an empty record at line ${lineNumber}`);
-      const lineBytes = utf8ByteLength(`${line}\n`);
-      if (lineBytes > this.maxEntryBytes) {
-        throw new Error(
-          `Execution integrity entry at line ${lineNumber} exceeds maxEntryBytes: bytes=${lineBytes} max=${this.maxEntryBytes}`,
-        );
+      const bytes = utf8ByteLength(`${line}\n`);
+      if (bytes > this.options.maxEntryBytes) {
+        throw new Error(`Execution integrity entry at line ${lineNumber} exceeds maxEntryBytes: bytes=${bytes} max=${this.options.maxEntryBytes}`);
       }
       const parsed = parseIntegrityEntry(line, lineNumber);
       if (parsed.sequence !== expectedSequence) {
-        throw new Error(
-          `Execution integrity sequence mismatch at line ${lineNumber}: expected=${expectedSequence} actual=${parsed.sequence}`,
-        );
+        throw new Error(`Execution integrity sequence mismatch at line ${lineNumber}: expected=${expectedSequence} actual=${parsed.sequence}`);
       }
       expectedSequence += 1;
       const history = this.histories.get(parsed.entry.runId) ?? [];
@@ -192,11 +173,9 @@ export class JsonlExecutionIntegrityJournal implements ExecutionIntegrityJournal
   }
 
   private assertStorageUnchanged(): void {
-    const currentSize = existsSync(this.filePath) ? statSync(this.filePath).size : 0;
-    if (currentSize !== this.expectedFileSize) {
-      throw new Error(
-        `Execution integrity file changed outside this writer; reopen before appending: expectedBytes=${this.expectedFileSize} actualBytes=${currentSize}`,
-      );
+    const actual = existsSync(this.filePath) ? statSync(this.filePath).size : 0;
+    if (actual !== this.expectedFileSize) {
+      throw new Error(`Execution integrity file changed outside this writer; reopen before appending: expectedBytes=${this.expectedFileSize} actualBytes=${actual}`);
     }
   }
 }
@@ -235,11 +214,9 @@ export interface ExecutionIntegrityCoordinatorOptions {
 }
 
 /**
- * Coordinates durable integrity milestones and classifies partial state.
- *
- * It never contacts a runtime/provider, advances a workflow, retries work, or
- * writes a missing Run Ledger record automatically. Reports are recovery plans,
- * not mutation authority.
+ * Records cross-store milestones and classifies partial durable state.
+ * It never contacts a provider, advances workflow state, retries work, or writes
+ * missing terminal state automatically.
  */
 export class ExecutionIntegrityCoordinator {
   private readonly now: () => string;
@@ -254,9 +231,9 @@ export class ExecutionIntegrityCoordinator {
     if (!storedRun || !sameWorkflowIdentity(storedRun, run)) {
       throw new Error(`Workflow ${run.id} must be durably checkpointed before recording runtime binding integrity`);
     }
-    const storedBinding = this.options.bindingStore.get(run.id);
+    const storedBinding = bindingForAttempt(this.options.bindingStore, run.id, run.attempt);
     if (!storedBinding || !sameBinding(storedBinding, binding)) {
-      throw new Error(`Runtime binding for workflow ${run.id} must be durable before recording integrity milestone`);
+      throw new Error(`Runtime binding for workflow ${run.id} attempt ${run.attempt} must be durable before recording integrity milestone`);
     }
     const entry: RuntimeBoundIntegrityEntry = {
       runId: run.id,
@@ -267,7 +244,7 @@ export class ExecutionIntegrityCoordinator {
       binding: cloneBinding(binding),
     };
     this.options.journal.append(entry);
-    return latestStage(this.options.journal.history(run.id), "runtime_bound", run.attempt) as RuntimeBoundIntegrityEntry;
+    return requireTypedStage(this.options.journal.history(run.id), "runtime_bound", run.attempt);
   }
 
   recordVerification(
@@ -278,20 +255,20 @@ export class ExecutionIntegrityCoordinator {
     assertWorkflowBinding(run, binding);
     assertVerificationMatches(verification, run, binding);
     requireStage(this.options.journal.history(run.id), "runtime_bound", run.attempt);
-    const storedBinding = this.options.bindingStore.get(run.id);
-    if (!storedBinding || !sameBinding(storedBinding, binding)) {
-      throw new Error(`Durable runtime binding drift detected for workflow ${run.id}`);
-    }
+    const storedRun = this.options.workflowStore.get(run.id);
+    if (!storedRun || !sameWorkflowIdentity(storedRun, run)) throw new Error(`Durable workflow drift detected for ${run.id}`);
+    const storedBinding = bindingForAttempt(this.options.bindingStore, run.id, run.attempt);
+    if (!storedBinding || !sameBinding(storedBinding, binding)) throw new Error(`Durable runtime binding drift detected for workflow ${run.id}`);
     const entry: VerificationRecordedIntegrityEntry = {
       runId: run.id,
       projectId: run.projectId,
       attempt: run.attempt,
       stage: "verification_recorded",
       recordedAt: this.now(),
-      verification: cloneVerification(verification),
+      verification: sanitizeVerification(verification),
     };
     this.options.journal.append(entry);
-    return latestStage(this.options.journal.history(run.id), "verification_recorded", run.attempt) as VerificationRecordedIntegrityEntry;
+    return requireTypedStage(this.options.journal.history(run.id), "verification_recorded", run.attempt);
   }
 
   recordWorkflowTerminal(run: WorkflowRun): WorkflowTerminalIntegrityEntry {
@@ -300,15 +277,12 @@ export class ExecutionIntegrityCoordinator {
     if (!storedRun || !sameWorkflowSnapshot(storedRun, run)) {
       throw new Error(`Terminal workflow ${run.id} must be durably checkpointed before recording terminal integrity`);
     }
-    const binding = this.options.bindingStore.get(run.id);
-    if (!binding) throw new Error(`Runtime-backed terminal workflow ${run.id} has no durable runtime binding`);
+    const binding = bindingForAttempt(this.options.bindingStore, run.id, run.attempt);
+    if (!binding) throw new Error(`Runtime-backed terminal workflow ${run.id} has no durable runtime binding for attempt ${run.attempt}`);
     assertWorkflowBinding(run, binding);
     requireStage(this.options.journal.history(run.id), "runtime_bound", run.attempt);
-    if (run.status === "succeeded") {
-      const verification = verificationFor(this.options.journal.history(run.id), run.attempt);
-      if (!verification?.passed) {
-        throw new Error(`Successful workflow ${run.id} requires durable deterministic verification before terminal integrity`);
-      }
+    if (run.status === "succeeded" && !verificationFor(this.options.journal.history(run.id), run.attempt)?.passed) {
+      throw new Error(`Successful workflow ${run.id} requires durable deterministic verification before terminal integrity`);
     }
     const entry: WorkflowTerminalIntegrityEntry = {
       runId: run.id,
@@ -320,15 +294,19 @@ export class ExecutionIntegrityCoordinator {
       workflowUpdatedAt: run.updatedAt,
     };
     this.options.journal.append(entry);
-    return latestStage(this.options.journal.history(run.id), "workflow_terminal", run.attempt) as WorkflowTerminalIntegrityEntry;
+    return requireTypedStage(this.options.journal.history(run.id), "workflow_terminal", run.attempt);
   }
 
   recordLedgerFinalized(run: WorkflowRun): LedgerFinalizedIntegrityEntry {
     assertTerminalWorkflow(run);
+    const storedRun = this.options.workflowStore.get(run.id);
+    if (!storedRun || !sameWorkflowSnapshot(storedRun, run)) throw new Error(`Canonical terminal workflow drift detected for ${run.id}`);
     requireStage(this.options.journal.history(run.id), "workflow_terminal", run.attempt);
+    const binding = bindingForAttempt(this.options.bindingStore, run.id, run.attempt);
+    if (!binding) throw new Error(`Runtime binding is missing for terminal workflow ${run.id}`);
     const record = this.options.runLedger.get(run.id);
     if (!record) throw new Error(`Run Ledger record ${run.id} must exist before finalization integrity can be recorded`);
-    assertLedgerMatchesWorkflow(record, run, this.options.bindingStore.get(run.id));
+    assertLedgerMatchesWorkflow(record, run, binding);
     const entry: LedgerFinalizedIntegrityEntry = {
       runId: run.id,
       projectId: run.projectId,
@@ -339,12 +317,11 @@ export class ExecutionIntegrityCoordinator {
       traceId: record.traceId,
     };
     this.options.journal.append(entry);
-    return latestStage(this.options.journal.history(run.id), "ledger_finalized", run.attempt) as LedgerFinalizedIntegrityEntry;
+    return requireTypedStage(this.options.journal.history(run.id), "ledger_finalized", run.attempt);
   }
 
   recoverVerification(runId: string, attempt?: number): RuntimeVerificationOutcome | undefined {
-    const workflow = this.options.workflowStore.get(runId);
-    const targetAttempt = attempt ?? workflow?.attempt;
+    const targetAttempt = attempt ?? this.options.workflowStore.get(runId)?.attempt;
     if (!targetAttempt) return undefined;
     const verification = verificationFor(this.options.journal.history(runId), targetAttempt);
     return verification ? deepFreeze(cloneVerification(verification)) : undefined;
@@ -352,18 +329,23 @@ export class ExecutionIntegrityCoordinator {
 
   inspect(runId: string): ExecutionIntegrityReport {
     const workflow = this.options.workflowStore.get(runId);
-    const binding = this.options.bindingStore.get(runId);
     const ledgerRecord = this.options.runLedger.get(runId);
     const history = this.options.journal.history(runId);
     const journalStages = Object.freeze(history.map((entry) => entry.stage));
+    const latestBinding = this.options.bindingStore.get(runId);
 
     if (!workflow) {
-      if (binding || ledgerRecord || history.length > 0) {
-        return integrityReport(runId, "manual_intervention", "Durable runtime/ledger/journal state exists without a canonical workflow checkpoint.", undefined, binding, undefined, ledgerRecord, journalStages);
+      if (latestBinding || ledgerRecord || history.length > 0) {
+        return report(runId, "manual_intervention", "Durable runtime/ledger/journal state exists without a canonical workflow checkpoint.", undefined, latestBinding, undefined, ledgerRecord, journalStages);
       }
-      return integrityReport(runId, "not_found", "No durable workflow, runtime binding, Run Ledger record, or integrity journal exists for this run.", undefined, undefined, undefined, undefined, journalStages);
+      return report(runId, "not_found", "No durable state exists for this run.", undefined, undefined, undefined, undefined, journalStages);
     }
 
+    if (latestBinding && latestBinding.workflowAttempt > workflow.attempt) {
+      return report(runId, "manual_intervention", `Runtime binding attempt ${latestBinding.workflowAttempt} is ahead of canonical workflow attempt ${workflow.attempt}.`, workflow, latestBinding, undefined, ledgerRecord, journalStages);
+    }
+
+    const binding = bindingForAttempt(this.options.bindingStore, runId, workflow.attempt);
     const verification = verificationFor(history, workflow.attempt);
     const runtimeMilestone = latestStage(history, "runtime_bound", workflow.attempt);
     const terminalMilestone = latestStage(history, "workflow_terminal", workflow.attempt);
@@ -373,69 +355,70 @@ export class ExecutionIntegrityCoordinator {
       try {
         assertWorkflowBinding(workflow, binding);
       } catch (error) {
-        return integrityReport(runId, "manual_intervention", safeErrorMessage(error), workflow, binding, verification, ledgerRecord, journalStages);
+        return report(runId, "manual_intervention", safeErrorMessage(error), workflow, binding, verification, ledgerRecord, journalStages);
       }
     }
-
     if (runtimeMilestone && !binding) {
-      return integrityReport(runId, "manual_intervention", "Integrity journal records a runtime binding that is missing from the durable binding store.", workflow, undefined, verification, ledgerRecord, journalStages);
+      return report(runId, "manual_intervention", "Integrity journal records a current-attempt runtime binding that is missing from RuntimeBindingStore.", workflow, undefined, verification, ledgerRecord, journalStages);
     }
     if (verification && !binding) {
-      return integrityReport(runId, "manual_intervention", "Durable verification exists without a matching durable runtime binding.", workflow, undefined, verification, ledgerRecord, journalStages);
+      return report(runId, "manual_intervention", "Durable verification exists without a matching current-attempt runtime binding.", workflow, undefined, verification, ledgerRecord, journalStages);
     }
     if (terminalMilestone && !isTerminal(workflow)) {
-      return integrityReport(runId, "manual_intervention", "Integrity journal records a terminal workflow while the canonical workflow is non-terminal.", workflow, binding, verification, ledgerRecord, journalStages);
+      return report(runId, "manual_intervention", "Integrity journal records current-attempt terminal state while canonical workflow is non-terminal.", workflow, binding, verification, ledgerRecord, journalStages);
     }
     if (ledgerMilestone && !ledgerRecord) {
-      return integrityReport(runId, "manual_intervention", "Integrity journal records Run Ledger finalization but the Run Ledger record is missing.", workflow, binding, verification, undefined, journalStages);
+      return report(runId, "manual_intervention", "Integrity journal records Run Ledger finalization but the Run Ledger record is missing.", workflow, binding, verification, undefined, journalStages);
     }
 
     if (ledgerRecord) {
+      if (!binding) {
+        return report(runId, "manual_intervention", "Run Ledger exists but the final workflow attempt has no durable runtime binding.", workflow, undefined, verification, ledgerRecord, journalStages);
+      }
       try {
         assertLedgerMatchesWorkflow(ledgerRecord, workflow, binding);
       } catch (error) {
-        return integrityReport(runId, "manual_intervention", safeErrorMessage(error), workflow, binding, verification, ledgerRecord, journalStages);
+        return report(runId, "manual_intervention", safeErrorMessage(error), workflow, binding, verification, ledgerRecord, journalStages);
       }
       if (!isTerminal(workflow)) {
-        return integrityReport(runId, "manual_intervention", "Run Ledger contains a terminal record for a non-terminal canonical workflow.", workflow, binding, verification, ledgerRecord, journalStages);
+        return report(runId, "manual_intervention", "Run Ledger contains a terminal record for a non-terminal canonical workflow.", workflow, binding, verification, ledgerRecord, journalStages);
       }
       if (!terminalMilestone) {
-        return integrityReport(runId, "record_terminal_milestone", "Workflow and Run Ledger are terminal but the integrity journal is missing the terminal milestone.", workflow, binding, verification, ledgerRecord, journalStages);
+        return report(runId, "record_terminal_milestone", "Workflow and Run Ledger are terminal but the integrity terminal milestone is missing.", workflow, binding, verification, ledgerRecord, journalStages);
       }
       if (!ledgerMilestone) {
-        return integrityReport(runId, "record_ledger_finalized_milestone", "Run Ledger is already durable; only the local integrity finalization marker is missing.", workflow, binding, verification, ledgerRecord, journalStages);
+        return report(runId, "record_ledger_finalized_milestone", "Run Ledger is durable; only the integrity finalization marker is missing.", workflow, binding, verification, ledgerRecord, journalStages);
       }
-      return integrityReport(runId, "consistent_terminal", "Workflow, runtime identity, integrity journal, and Run Ledger agree on terminal state.", workflow, binding, verification, ledgerRecord, journalStages);
+      return report(runId, "consistent_terminal", "Workflow, runtime binding, integrity journal, and Run Ledger agree on terminal state.", workflow, binding, verification, ledgerRecord, journalStages);
     }
 
     if (isTerminal(workflow)) {
       if (!binding) {
-        return integrityReport(runId, "manual_intervention", "Runtime-backed terminal workflow has no durable runtime binding and cannot be finalized safely.", workflow, undefined, verification, undefined, journalStages);
+        return report(runId, "manual_intervention", "Runtime-backed terminal workflow has no durable binding for its final attempt.", workflow, undefined, verification, undefined, journalStages);
       }
       if (!runtimeMilestone) {
-        return integrityReport(runId, "record_runtime_binding_milestone", "Runtime binding is durable but its integrity milestone is missing.", workflow, binding, verification, undefined, journalStages);
+        return report(runId, "record_runtime_binding_milestone", "Runtime binding is durable but its current-attempt integrity milestone is missing.", workflow, binding, verification, undefined, journalStages);
       }
       if (workflow.status === "succeeded" && !verification?.passed) {
-        return integrityReport(runId, "manual_intervention", "Successful terminal workflow has no durable passed verification evidence; do not synthesize success evidence.", workflow, binding, verification, undefined, journalStages);
+        return report(runId, "manual_intervention", "Successful terminal workflow has no durable passed verification; success evidence must not be synthesized.", workflow, binding, verification, undefined, journalStages);
       }
       if (!terminalMilestone) {
-        return integrityReport(runId, "record_terminal_milestone", "Canonical workflow is terminal but terminal integrity has not yet been journaled.", workflow, binding, verification, undefined, journalStages);
+        return report(runId, "record_terminal_milestone", "Canonical workflow is terminal but terminal integrity has not yet been journaled.", workflow, binding, verification, undefined, journalStages);
       }
-      return integrityReport(runId, "finalize_run_ledger", "Terminal workflow and required durable evidence exist, but the immutable Run Ledger record is missing.", workflow, binding, verification, undefined, journalStages);
+      return report(runId, "finalize_run_ledger", "Terminal workflow and required durable evidence exist, but the immutable Run Ledger record is missing.", workflow, binding, verification, undefined, journalStages);
     }
 
     if (!binding) {
       if (workflow.phase === "start" || workflow.phase === "classify" || workflow.phase === "compile_context") {
-        return integrityReport(runId, "consistent_pre_runtime", "Workflow has not reached runtime execution and no runtime durable state exists.", workflow, undefined, undefined, undefined, journalStages);
+        return report(runId, "consistent_pre_runtime", "Workflow has not reached runtime execution and no current-attempt runtime state exists.", workflow, undefined, undefined, undefined, journalStages);
       }
-      return integrityReport(runId, "manual_intervention", "Workflow has reached or passed execute without a durable runtime binding; unknown side effects must be reconciled explicitly.", workflow, undefined, undefined, undefined, journalStages);
+      return report(runId, "manual_intervention", "Workflow has reached or passed execute without a current-attempt durable runtime binding; unknown side effects require explicit reconciliation.", workflow, undefined, undefined, undefined, journalStages);
     }
-
     if (!runtimeMilestone) {
-      return integrityReport(runId, "record_runtime_binding_milestone", "Runtime binding exists but the execution integrity journal has not recorded it.", workflow, binding, verification, undefined, journalStages);
+      return report(runId, "record_runtime_binding_milestone", "Current-attempt runtime binding exists but its integrity milestone is missing.", workflow, binding, verification, undefined, journalStages);
     }
     if (verification) {
-      return integrityReport(
+      return report(
         runId,
         verification.passed ? "verification_available" : "verification_failed",
         verification.passed
@@ -448,11 +431,11 @@ export class ExecutionIntegrityCoordinator {
         journalStages,
       );
     }
-    return integrityReport(runId, "reconcile_runtime", "Durable runtime binding exists but no verification is durable; re-observe runtime before any continuation or re-dispatch.", workflow, binding, undefined, undefined, journalStages);
+    return report(runId, "reconcile_runtime", "Durable current-attempt runtime binding exists but no verification is durable; re-observe runtime before continuation or re-dispatch.", workflow, binding, undefined, undefined, journalStages);
   }
 }
 
-function integrityReport(
+function report(
   runId: string,
   disposition: ExecutionIntegrityDisposition,
   reason: string,
@@ -462,17 +445,7 @@ function integrityReport(
   ledgerRecord: RunLedgerRecord | undefined,
   journalStages: readonly ExecutionIntegrityStage[],
 ): ExecutionIntegrityReport {
-  return Object.freeze({
-    runId,
-    disposition,
-    automaticMutationAllowed: false as const,
-    reason,
-    workflow,
-    binding,
-    verification,
-    ledgerRecord,
-    journalStages,
-  });
+  return Object.freeze({ runId, disposition, automaticMutationAllowed: false as const, reason, workflow, binding, verification, ledgerRecord, journalStages });
 }
 
 function parseIntegrityEntry(line: string, lineNumber: number): { sequence: number; entry: ExecutionIntegrityEntry } {
@@ -486,19 +459,18 @@ function parseIntegrityEntry(line: string, lineNumber: number): { sequence: numb
   if (value.schemaVersion !== EXECUTION_INTEGRITY_SCHEMA_VERSION) {
     throw new Error(`Unsupported execution integrity schema version at line ${lineNumber}: ${String(value.schemaVersion)}`);
   }
-  if (!Number.isInteger(value.sequence) || Number(value.sequence) <= 0) {
+  if (typeof value.sequence !== "number" || !Number.isInteger(value.sequence) || value.sequence <= 0) {
     throw new Error(`Execution integrity sequence at line ${lineNumber} must be a positive integer`);
   }
   assertIntegrityEntry(value.entry, `Execution integrity entry at line ${lineNumber}`);
-  return { sequence: Number(value.sequence), entry: value.entry };
+  return { sequence: value.sequence, entry: value.entry };
 }
 
 function assertIntegrityEntry(value: unknown, label: string): asserts value is ExecutionIntegrityEntry {
   if (!isRecord(value)) throw new Error(`${label} must be an object`);
-  for (const field of ["runId", "projectId", "stage", "recordedAt"] as const) {
-    assertNonEmptyString(value[field], `${label}.${field}`);
-  }
-  assertPositiveInteger(Number(value.attempt), `${label}.attempt`);
+  for (const field of ["runId", "projectId", "stage", "recordedAt"] as const) assertNonEmptyString(value[field], `${label}.${field}`);
+  if (typeof value.attempt !== "number") throw new Error(`${label}.attempt must be a positive integer`);
+  assertPositiveInteger(value.attempt, `${label}.attempt`);
   if (!Number.isFinite(Date.parse(String(value.recordedAt)))) throw new Error(`${label}.recordedAt must be a valid timestamp`);
 
   switch (value.stage) {
@@ -535,18 +507,15 @@ function assertIntegrityEntry(value: unknown, label: string): asserts value is E
 }
 
 function assertIntegrityProgression(history: readonly ExecutionIntegrityEntry[], next: ExecutionIntegrityEntry): void {
-  const finalized = history.find((entry) => entry.stage === "ledger_finalized");
-  if (finalized) throw new Error(`Execution integrity journal for ${next.runId} is already finalized`);
+  if (history.some((entry) => entry.stage === "ledger_finalized")) {
+    throw new Error(`Execution integrity journal for ${next.runId} is already finalized`);
+  }
   const last = history.at(-1);
   if (last && Date.parse(next.recordedAt) < Date.parse(last.recordedAt)) {
     throw new Error(`Execution integrity recordedAt cannot move backwards for ${next.runId}`);
   }
-  const attempts = history.map((entry) => entry.attempt);
-  const maxAttempt = attempts.length > 0 ? Math.max(...attempts) : 0;
-  if (next.attempt < maxAttempt) {
-    throw new Error(`Execution integrity attempt cannot move backwards for ${next.runId}`);
-  }
-
+  const maxAttempt = history.length > 0 ? Math.max(...history.map((entry) => entry.attempt)) : 0;
+  if (next.attempt < maxAttempt) throw new Error(`Execution integrity attempt cannot move backwards for ${next.runId}`);
   const sameAttempt = history.filter((entry) => entry.attempt === next.attempt);
   if (sameAttempt.some((entry) => entry.stage === next.stage)) {
     throw new Error(`Execution integrity stage ${next.stage} already exists for ${next.runId} attempt ${next.attempt}`);
@@ -554,57 +523,56 @@ function assertIntegrityProgression(history: readonly ExecutionIntegrityEntry[],
 
   if (next.stage === "runtime_bound") {
     if (sameAttempt.length > 0) throw new Error(`runtime_bound must be the first integrity stage for ${next.runId} attempt ${next.attempt}`);
-    if (maxAttempt > 0 && next.attempt <= maxAttempt) {
-      throw new Error(`New runtime binding attempt must increase for ${next.runId}`);
-    }
+    if (maxAttempt > 0 && next.attempt <= maxAttempt) throw new Error(`New runtime binding attempt must increase for ${next.runId}`);
     return;
   }
-
   if (!sameAttempt.some((entry) => entry.stage === "runtime_bound")) {
     throw new Error(`Execution integrity stage ${next.stage} requires runtime_bound for ${next.runId} attempt ${next.attempt}`);
   }
-  if (sameAttempt.some((entry) => entry.stage === "workflow_terminal")) {
-    throw new Error(`Execution integrity cannot append ${next.stage} after workflow_terminal for ${next.runId} attempt ${next.attempt}`);
-  }
 
-  if (next.stage === "verification_recorded") return;
+  const terminal = sameAttempt.find((entry): entry is WorkflowTerminalIntegrityEntry => entry.stage === "workflow_terminal");
+  if (next.stage === "verification_recorded") {
+    if (terminal) throw new Error(`verification_recorded cannot follow workflow_terminal for ${next.runId} attempt ${next.attempt}`);
+    return;
+  }
   if (next.stage === "workflow_terminal") {
     if (next.terminalStatus === "succeeded") {
       const verification = sameAttempt.find((entry): entry is VerificationRecordedIntegrityEntry => entry.stage === "verification_recorded");
-      if (!verification?.verification.passed) {
-        throw new Error(`Successful workflow_terminal requires passed verification for ${next.runId} attempt ${next.attempt}`);
-      }
+      if (!verification?.verification.passed) throw new Error(`Successful workflow_terminal requires passed verification for ${next.runId} attempt ${next.attempt}`);
     }
     return;
   }
-  if (next.stage === "ledger_finalized") {
-    const terminal = sameAttempt.find((entry): entry is WorkflowTerminalIntegrityEntry => entry.stage === "workflow_terminal");
-    if (!terminal) throw new Error(`ledger_finalized requires workflow_terminal for ${next.runId} attempt ${next.attempt}`);
-    if (terminal.terminalStatus !== next.ledgerOutcome) {
-      throw new Error(`ledger_finalized outcome must match workflow_terminal for ${next.runId}`);
-    }
-  }
+  if (!terminal) throw new Error(`ledger_finalized requires workflow_terminal for ${next.runId} attempt ${next.attempt}`);
+  if (terminal.terminalStatus !== next.ledgerOutcome) throw new Error(`ledger_finalized outcome must match workflow_terminal for ${next.runId}`);
 }
 
 function verificationFor(history: readonly ExecutionIntegrityEntry[], attempt: number): RuntimeVerificationOutcome | undefined {
-  const entry = [...history]
+  return [...history]
     .reverse()
-    .find((item): item is VerificationRecordedIntegrityEntry => item.attempt === attempt && item.stage === "verification_recorded");
-  return entry?.verification;
+    .find((entry): entry is VerificationRecordedIntegrityEntry => entry.stage === "verification_recorded" && entry.attempt === attempt)
+    ?.verification;
 }
 
-function latestStage(
-  history: readonly ExecutionIntegrityEntry[],
-  stage: ExecutionIntegrityStage,
-  attempt: number,
-): ExecutionIntegrityEntry | undefined {
+function latestStage(history: readonly ExecutionIntegrityEntry[], stage: ExecutionIntegrityStage, attempt: number): ExecutionIntegrityEntry | undefined {
   return [...history].reverse().find((entry) => entry.stage === stage && entry.attempt === attempt);
 }
 
 function requireStage(history: readonly ExecutionIntegrityEntry[], stage: ExecutionIntegrityStage, attempt: number): void {
-  if (!latestStage(history, stage, attempt)) {
-    throw new Error(`Execution integrity stage ${stage} is required for attempt ${attempt}`);
-  }
+  if (!latestStage(history, stage, attempt)) throw new Error(`Execution integrity stage ${stage} is required for attempt ${attempt}`);
+}
+
+function requireTypedStage<T extends ExecutionIntegrityStage>(
+  history: readonly ExecutionIntegrityEntry[],
+  stage: T,
+  attempt: number,
+): Extract<ExecutionIntegrityEntry, { stage: T }> {
+  const entry = latestStage(history, stage, attempt);
+  if (!entry) throw new Error(`Execution integrity stage ${stage} was not persisted for attempt ${attempt}`);
+  return entry as Extract<ExecutionIntegrityEntry, { stage: T }>;
+}
+
+function bindingForAttempt(store: RuntimeBindingStore, runId: string, attempt: number): RuntimeBinding | undefined {
+  return [...store.history(runId)].reverse().find((binding) => binding.workflowAttempt === attempt);
 }
 
 function assertWorkflowBinding(run: WorkflowRun, binding: RuntimeBinding): void {
@@ -613,11 +581,7 @@ function assertWorkflowBinding(run: WorkflowRun, binding: RuntimeBinding): void 
   }
 }
 
-function assertVerificationMatches(
-  verification: RuntimeVerificationOutcome,
-  run: WorkflowRun,
-  binding: RuntimeBinding,
-): void {
+function assertVerificationMatches(verification: RuntimeVerificationOutcome, run: WorkflowRun, binding: RuntimeBinding): void {
   assertVerificationShape(verification, "Runtime verification");
   if (verification.workflowRunId !== run.id) throw new Error(`Runtime verification workflowRunId mismatch for ${run.id}`);
   if (verification.runtimeId !== binding.runtimeId || verification.sessionId !== binding.sessionId) {
@@ -637,23 +601,13 @@ function isTerminal(run: WorkflowRun): run is WorkflowRun & { readonly status: "
   return run.status === "failed" || run.status === "cancelled" || run.status === "succeeded";
 }
 
-function assertLedgerMatchesWorkflow(
-  record: RunLedgerRecord,
-  run: WorkflowRun,
-  binding: RuntimeBinding | undefined,
-): void {
-  if (record.runId !== run.id || record.projectId !== run.projectId || record.riskClass !== run.riskClass) {
-    throw new Error(`Run Ledger identity does not match workflow ${run.id}`);
-  }
+function assertLedgerMatchesWorkflow(record: RunLedgerRecord, run: WorkflowRun, binding: RuntimeBinding): void {
+  if (record.runId !== run.id || record.projectId !== run.projectId || record.riskClass !== run.riskClass) throw new Error(`Run Ledger identity does not match workflow ${run.id}`);
   if (record.outcome !== run.status) throw new Error(`Run Ledger outcome does not match workflow ${run.id}`);
-  if (binding) {
-    if (record.runtimeId !== binding.runtimeId || normalizePath(record.workspace) !== normalizePath(binding.workspace)) {
-      throw new Error(`Run Ledger runtime identity does not match durable binding for ${run.id}`);
-    }
+  if (record.runtimeId !== binding.runtimeId || normalizePath(record.workspace) !== normalizePath(binding.workspace)) {
+    throw new Error(`Run Ledger runtime identity does not match durable binding for ${run.id}`);
   }
-  if (run.status === "failed" && record.failureReason !== run.failureReason) {
-    throw new Error(`Run Ledger failureReason does not match workflow ${run.id}`);
-  }
+  if (run.status === "failed" && record.failureReason !== run.failureReason) throw new Error(`Run Ledger failureReason does not match workflow ${run.id}`);
 }
 
 function sameWorkflowIdentity(left: WorkflowRun, right: WorkflowRun): boolean {
@@ -671,73 +625,51 @@ function sameBinding(left: RuntimeBinding, right: RuntimeBinding): boolean {
 function assertRuntimeBindingShape(value: unknown, label: string): asserts value is RuntimeBinding {
   if (!isRecord(value)) throw new Error(`${label} must be an object`);
   assertAllowedKeys(value, ["workflowRunId", "projectId", "workflowAttempt", "runtimeId", "sessionId", "workspace", "boundAt"], label);
-  for (const field of ["workflowRunId", "projectId", "runtimeId", "sessionId", "workspace", "boundAt"] as const) {
-    assertNonEmptyString(value[field], `${label}.${field}`);
-  }
-  assertPositiveInteger(Number(value.workflowAttempt), `${label}.workflowAttempt`);
+  for (const field of ["workflowRunId", "projectId", "runtimeId", "sessionId", "workspace", "boundAt"] as const) assertNonEmptyString(value[field], `${label}.${field}`);
+  if (typeof value.workflowAttempt !== "number") throw new Error(`${label}.workflowAttempt must be a positive integer`);
+  assertPositiveInteger(value.workflowAttempt, `${label}.workflowAttempt`);
   if (!Number.isFinite(Date.parse(String(value.boundAt)))) throw new Error(`${label}.boundAt must be a valid timestamp`);
 }
 
 function assertVerificationShape(value: unknown, label: string): asserts value is RuntimeVerificationOutcome {
   if (!isRecord(value)) throw new Error(`${label} must be an object`);
   assertAllowedKeys(value, ["workflowRunId", "runtimeId", "sessionId", "verifierId", "passed", "evidence"], label);
-  for (const field of ["workflowRunId", "runtimeId", "sessionId", "verifierId"] as const) {
-    assertNonEmptyString(value[field], `${label}.${field}`);
-  }
+  for (const field of ["workflowRunId", "runtimeId", "sessionId", "verifierId"] as const) assertNonEmptyString(value[field], `${label}.${field}`);
   if (typeof value.passed !== "boolean") throw new Error(`${label}.passed must be boolean`);
   if (!Array.isArray(value.evidence)) throw new Error(`${label}.evidence must be an array`);
   value.evidence.forEach((item, index) => assertEvidenceRecord(item, `${label}.evidence[${index}]`));
-  const deterministic = value.evidence.filter((item) => item.kind === "deterministic_check");
+  const deterministic = value.evidence.filter((item): item is EvidenceRecord => isRecord(item) && item.kind === "deterministic_check");
   if (deterministic.length === 0) throw new Error(`${label} must include deterministic_check evidence`);
   if (value.passed && !deterministic.some((item) => item.status === "passed" && item.producer === value.verifierId)) {
     throw new Error(`${label} passed=true requires verifier-owned passed deterministic_check evidence`);
+  }
+  const runtimeProducer = `runtime-reconciliation:${value.runtimeId}`;
+  const runtimeReference = `runtime:${value.runtimeId}:${value.sessionId}`;
+  if (!value.evidence.some((item) => isRecord(item) && item.kind === "other" && item.status === "passed" && item.producer === runtimeProducer && item.reference === runtimeReference)) {
+    throw new Error(`${label} must include matching runtime reconciliation evidence`);
   }
 }
 
 function assertEvidenceRecord(value: unknown, label: string): asserts value is EvidenceRecord {
   if (!isRecord(value)) throw new Error(`${label} must be an object`);
-  const kinds = new Set([
-    "policy",
-    "isolation",
-    "deterministic_check",
-    "test",
-    "browser",
-    "review",
-    "independent_review",
-    "approval",
-    "backup",
-    "rollback",
-    "other",
-  ]);
+  const kinds = new Set(["policy", "isolation", "deterministic_check", "test", "browser", "review", "independent_review", "approval", "backup", "rollback", "other"]);
   if (!kinds.has(String(value.kind))) throw new Error(`${label}.kind is invalid`);
-  if (value.status !== "passed" && value.status !== "failed" && value.status !== "not_applicable") {
-    throw new Error(`${label}.status is invalid`);
-  }
-  for (const field of ["reference", "producer", "collectedAt"] as const) {
-    assertNonEmptyString(value[field], `${label}.${field}`);
-  }
+  if (value.status !== "passed" && value.status !== "failed" && value.status !== "not_applicable") throw new Error(`${label}.status is invalid`);
+  for (const field of ["reference", "producer", "collectedAt"] as const) assertNonEmptyString(value[field], `${label}.${field}`);
   if (!Number.isFinite(Date.parse(String(value.collectedAt)))) throw new Error(`${label}.collectedAt must be a valid timestamp`);
   if (value.metadata !== undefined) {
     if (!isRecord(value.metadata)) throw new Error(`${label}.metadata must be an object`);
     for (const [key, item] of Object.entries(value.metadata)) {
-      if (item !== null && typeof item !== "string" && typeof item !== "number" && typeof item !== "boolean") {
-        throw new Error(`${label}.metadata.${key} must be scalar`);
-      }
+      if (item !== null && typeof item !== "string" && typeof item !== "number" && typeof item !== "boolean") throw new Error(`${label}.metadata.${key} must be scalar`);
       if (typeof item === "number" && !Number.isFinite(item)) throw new Error(`${label}.metadata.${key} must be finite`);
     }
   }
 }
 
 function cloneIntegrityEntry(entry: ExecutionIntegrityEntry): ExecutionIntegrityEntry {
-  switch (entry.stage) {
-    case "runtime_bound":
-      return { ...entry, binding: cloneBinding(entry.binding) };
-    case "verification_recorded":
-      return { ...entry, verification: cloneVerification(entry.verification) };
-    case "workflow_terminal":
-    case "ledger_finalized":
-      return { ...entry };
-  }
+  if (entry.stage === "runtime_bound") return { ...entry, binding: cloneBinding(entry.binding) };
+  if (entry.stage === "verification_recorded") return { ...entry, verification: sanitizeVerification(entry.verification) };
+  return { ...entry };
 }
 
 function cloneBinding(binding: RuntimeBinding): RuntimeBinding {
@@ -747,11 +679,34 @@ function cloneBinding(binding: RuntimeBinding): RuntimeBinding {
 function cloneVerification(verification: RuntimeVerificationOutcome): RuntimeVerificationOutcome {
   return {
     ...verification,
+    evidence: verification.evidence.map((item) => ({ ...item, metadata: item.metadata ? { ...item.metadata } : undefined })),
+  };
+}
+
+function sanitizeVerification(verification: RuntimeVerificationOutcome): RuntimeVerificationOutcome {
+  return {
+    ...verification,
     evidence: verification.evidence.map((item) => ({
       ...item,
-      metadata: item.metadata ? { ...item.metadata } : undefined,
+      metadata: item.metadata ? sanitizeMetadata(item.metadata) : undefined,
     })),
   };
+}
+
+function sanitizeMetadata(metadata: Readonly<Record<string, string | number | boolean | null>>): Readonly<Record<string, string | number | boolean | null>> {
+  return Object.fromEntries(Object.entries(metadata).map(([key, value]) => {
+    if (isSensitiveKey(key)) return [key, "[redacted]"];
+    return [key, typeof value === "string" ? sanitizeString(value) : value];
+  }));
+}
+
+function isSensitiveKey(key: string): boolean {
+  const normalized = key.replace(/[_\-\s]+/g, "").toLowerCase();
+  return normalized.includes("apikey") || normalized.includes("accesstoken") || normalized === "authorization" || normalized.includes("password") || normalized.includes("secret") || normalized.includes("credential") || normalized.includes("token");
+}
+
+function sanitizeString(value: string): string {
+  return value.replace(/(authorization|api[_-]?key|access[_-]?token|password|secret|credential)\s*[:=]\s*(Bearer\s+)?[^\s,;]+/gi, "$1=[redacted]").slice(0, 1_000);
 }
 
 function assertAllowedKeys(value: Record<string, unknown>, allowed: readonly string[], label: string): void {
@@ -780,10 +735,7 @@ function utf8ByteLength(value: string): number {
 }
 
 function safeErrorMessage(error: unknown): string {
-  const raw = error instanceof Error ? error.message : String(error);
-  return raw
-    .replace(/(authorization|api[_-]?key|access[_-]?token|password|secret|credential)\s*[:=]\s*(Bearer\s+)?[^\s,;]+/gi, "$1=[redacted]")
-    .slice(0, 1_000);
+  return sanitizeString(error instanceof Error ? error.message : String(error));
 }
 
 function deepFreeze<T>(value: T): T {
