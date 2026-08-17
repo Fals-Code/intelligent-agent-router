@@ -25,6 +25,19 @@ const PHASE_ORDER: Readonly<Record<WorkflowPhase, number>> = {
   publish: 7,
 };
 
+const WORKFLOW_RUN_FIELDS = new Set([
+  "id",
+  "projectId",
+  "riskClass",
+  "phase",
+  "status",
+  "attempt",
+  "approvalIds",
+  "createdAt",
+  "updatedAt",
+  "failureReason",
+]);
+
 export interface WorkflowCheckpointStore {
   checkpoint(run: WorkflowRun): void;
   get(runId: string): WorkflowRun | undefined;
@@ -44,6 +57,10 @@ export interface JsonlWorkflowCheckpointStoreOptions {
  * Every line is a versioned full WorkflowRun snapshot with a monotonic global
  * sequence number. File and checkpoint byte limits are explicit. A successful
  * checkpoint is fsync'd before it becomes visible through this instance.
+ *
+ * The first checkpoint for a run must equal WorkflowStateMachine.create(). Every
+ * later checkpoint is replay-validated against an official state-machine
+ * transition so persistence cannot silently invent a second workflow semantics.
  */
 export class JsonlWorkflowCheckpointStore implements WorkflowCheckpointStore {
   readonly filePath: string;
@@ -73,7 +90,8 @@ export class JsonlWorkflowCheckpointStore implements WorkflowCheckpointStore {
     this.assertStorageUnchanged();
     assertWorkflowRun(run, "Workflow checkpoint");
     const previous = this.latest.get(run.id);
-    if (previous) assertCheckpointProgression(previous, run);
+    if (previous) assertCheckpointTransition(previous, run);
+    else assertInitialCheckpoint(run);
 
     const prepared = deepFreeze(cloneWorkflowRun(run));
     const line = `${JSON.stringify({
@@ -155,7 +173,8 @@ export class JsonlWorkflowCheckpointStore implements WorkflowCheckpointStore {
       expectedSequence += 1;
 
       const previous = this.latest.get(parsed.run.id);
-      if (previous) assertCheckpointProgression(previous, parsed.run);
+      if (previous) assertCheckpointTransition(previous, parsed.run);
+      else assertInitialCheckpoint(parsed.run);
       this.admit(deepFreeze(cloneWorkflowRun(parsed.run)));
     }
 
@@ -323,6 +342,9 @@ function parseCheckpoint(line: string, lineNumber: number): { sequence: number; 
 
 function assertWorkflowRun(value: unknown, label: string): asserts value is WorkflowRun {
   if (!isRecord(value)) throw new Error(`${label} must be an object`);
+  for (const key of Object.keys(value)) {
+    if (!WORKFLOW_RUN_FIELDS.has(key)) throw new Error(`${label}.${key} is not allowed`);
+  }
   for (const field of ["id", "projectId", "createdAt", "updatedAt"] as const) {
     assertNonEmptyString(value[field], `${label}.${field}`);
   }
@@ -373,24 +395,79 @@ function assertWorkflowRun(value: unknown, label: string): asserts value is Work
   }
 }
 
-function assertCheckpointProgression(previous: WorkflowRun, next: WorkflowRun): void {
-  if (previous.id !== next.id) throw new Error("Workflow checkpoint run ID changed");
+function assertInitialCheckpoint(run: WorkflowRun): void {
+  const machine = new WorkflowStateMachine();
+  const expected = machine.create({
+    id: run.id,
+    projectId: run.projectId,
+    riskClass: run.riskClass,
+    now: run.createdAt,
+  });
+  if (!sameWorkflowRun(expected, run)) {
+    throw new Error(`Workflow ${run.id} initial checkpoint must equal canonical WorkflowStateMachine.create() state`);
+  }
+}
+
+function assertCheckpointTransition(previous: WorkflowRun, next: WorkflowRun): void {
   if (previous.projectId !== next.projectId) throw new Error(`Workflow ${next.id} projectId is immutable`);
   if (previous.riskClass !== next.riskClass) throw new Error(`Workflow ${next.id} riskClass is immutable`);
   if (previous.createdAt !== next.createdAt) throw new Error(`Workflow ${next.id} createdAt is immutable`);
-  if (previous.status === "cancelled" || previous.status === "succeeded") {
-    throw new Error(`Workflow ${next.id} is terminal and cannot accept another checkpoint`);
-  }
-  if (next.attempt < previous.attempt) throw new Error(`Workflow ${next.id} attempt cannot decrease`);
-  if (PHASE_ORDER[next.phase] < PHASE_ORDER[previous.phase]) {
-    throw new Error(`Workflow ${next.id} phase cannot move backwards`);
-  }
   if (timestamp(next.updatedAt) < timestamp(previous.updatedAt)) {
     throw new Error(`Workflow ${next.id} updatedAt cannot move backwards`);
   }
   if (!isPrefix(previous.approvalIds, next.approvalIds)) {
     throw new Error(`Workflow ${next.id} approvalIds are append-only`);
   }
+
+  const machine = new WorkflowStateMachine();
+  const candidates: WorkflowRun[] = [];
+  const collect = (transition: () => WorkflowRun): void => {
+    try {
+      candidates.push(transition());
+    } catch {
+      // An invalid transition from this previous state is simply not a candidate.
+    }
+  };
+
+  collect(() => machine.start(previous, next.updatedAt));
+  collect(() => machine.advance(previous, next.updatedAt));
+  collect(() => machine.requestApproval(previous, next.updatedAt));
+  if (
+    next.approvalIds.length === previous.approvalIds.length + 1 &&
+    isPrefix(previous.approvalIds, next.approvalIds)
+  ) {
+    collect(() => machine.approve(previous, next.approvalIds[previous.approvalIds.length], next.updatedAt));
+  }
+  collect(() => machine.skipApproval(previous, next.updatedAt));
+  collect(() => machine.pause(previous, next.updatedAt));
+  collect(() => machine.resume(previous, next.updatedAt));
+  collect(() => machine.retry(previous, next.updatedAt));
+  collect(() => machine.recover(previous, next.updatedAt));
+  if (next.failureReason) collect(() => machine.fail(previous, next.failureReason, next.updatedAt));
+  collect(() => machine.cancel(previous, next.updatedAt));
+  collect(() => machine.succeed(previous, true, next.updatedAt));
+
+  if (!candidates.some((candidate) => sameWorkflowRun(candidate, next))) {
+    throw new Error(
+      `Workflow ${next.id} checkpoint does not match any valid WorkflowStateMachine transition from ${previous.status}/${previous.phase}`,
+    );
+  }
+}
+
+function sameWorkflowRun(left: WorkflowRun, right: WorkflowRun): boolean {
+  return (
+    left.id === right.id &&
+    left.projectId === right.projectId &&
+    left.riskClass === right.riskClass &&
+    left.phase === right.phase &&
+    left.status === right.status &&
+    left.attempt === right.attempt &&
+    left.createdAt === right.createdAt &&
+    left.updatedAt === right.updatedAt &&
+    left.failureReason === right.failureReason &&
+    left.approvalIds.length === right.approvalIds.length &&
+    left.approvalIds.every((item, index) => right.approvalIds[index] === item)
+  );
 }
 
 function recovery(
