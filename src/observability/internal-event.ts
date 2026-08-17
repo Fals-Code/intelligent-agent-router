@@ -74,6 +74,40 @@ const EVENT_NAMES = new Set<InternalObservabilityEventName>([
   "9router.publication.completed",
   "9router.run.terminal",
 ]);
+const EVENT_ATTRIBUTE_KEYS: Readonly<Record<InternalObservabilityEventName, ReadonlySet<string>>> = {
+  "9router.runtime.reconciled": new Set([
+    "router.runtime.disposition",
+    "router.runtime.verification_required",
+    "router.runtime.automatic_redispatch_allowed",
+    "router.workflow.phase",
+    "router.workflow.status",
+    "router.runtime.id",
+    "router.workflow.attempt",
+    "router.runtime.status",
+    "router.runtime.event_count",
+    "router.runtime.files_changed_count",
+    "router.runtime.diff_observed",
+  ]),
+  "9router.verification.completed": new Set([
+    "router.verification.passed",
+    "router.verifier.id",
+    "router.runtime.id",
+    "router.verification.evidence_count",
+  ]),
+  "9router.publication.completed": new Set([
+    "router.publication.adapter",
+    "router.publication.operation",
+    "router.publication.pull_request_number",
+  ]),
+  "9router.run.terminal": new Set([
+    "router.run.outcome",
+    "router.risk.class",
+    "router.runtime.id",
+    "router.run.evidence_count",
+    "router.run.approval_count",
+    "router.run.change_reference_count",
+  ]),
+};
 const SEVERITIES = new Set<ObservabilitySeverity>(["debug", "info", "warn", "error"]);
 const LINK_TYPES = new Set<ObservabilityLinkType>([
   "runtime_session",
@@ -120,7 +154,7 @@ export class InternalObservabilityEventBuilder {
       traceId: prepareIdentity(input.traceId, "Observability traceId", this.options.maxStringBytes),
       runId: input.runId === undefined ? undefined : prepareIdentity(input.runId, "Observability runId", this.options.maxStringBytes),
       projectId: input.projectId === undefined ? undefined : prepareIdentity(input.projectId, "Observability projectId", this.options.maxStringBytes),
-      attributes: prepareAttributes(input.attributes ?? {}, this.options),
+      attributes: prepareAttributes(input.name, input.attributes ?? {}, this.options),
       links: prepareLinks(input.links ?? [], this.options),
     });
 
@@ -154,7 +188,7 @@ export async function verifyInternalObservabilityEvent(event: InternalObservabil
     traceId: prepareIdentity(event.payload.traceId, "Observability traceId", verificationOptions.maxStringBytes),
     runId: event.payload.runId === undefined ? undefined : prepareIdentity(event.payload.runId, "Observability runId", verificationOptions.maxStringBytes),
     projectId: event.payload.projectId === undefined ? undefined : prepareIdentity(event.payload.projectId, "Observability projectId", verificationOptions.maxStringBytes),
-    attributes: prepareAttributes(event.payload.attributes, verificationOptions),
+    attributes: prepareAttributes(event.payload.name, event.payload.attributes, verificationOptions),
     links: prepareLinks(event.payload.links, verificationOptions),
   });
   if (stableStringify(prepared) !== stableStringify(event.payload)) throw new Error("Observability event payload is not canonically normalized");
@@ -165,14 +199,16 @@ export async function verifyInternalObservabilityEvent(event: InternalObservabil
   assertEventBytes(event, verificationOptions.maxEventBytes);
 }
 
-function prepareAttributes(attributes: Readonly<Record<string, ObservabilityAttributeValue>>, options: InternalObservabilityEventBuilderOptions): Readonly<Record<string, ObservabilityAttributeValue>> {
+function prepareAttributes(name: InternalObservabilityEventName, attributes: Readonly<Record<string, ObservabilityAttributeValue>>, options: InternalObservabilityEventBuilderOptions): Readonly<Record<string, ObservabilityAttributeValue>> {
   if (!isRecord(attributes)) throw new Error("Observability attributes must be an object");
   const entries = Object.entries(attributes);
   if (entries.length > options.maxAttributes) throw new Error(`Observability attributes exceed maxAttributes: count=${entries.length} max=${options.maxAttributes}`);
+  const allowed = EVENT_ATTRIBUTE_KEYS[name];
   const prepared: Record<string, ObservabilityAttributeValue> = {};
   for (const [rawKey, rawValue] of entries.sort(([left], [right]) => left.localeCompare(right))) {
     const key = rawKey.trim().toLowerCase();
     if (!/^router\.[a-z0-9_.-]+$/.test(key)) throw new Error(`Observability attribute key must use router.* namespace: ${rawKey}`);
+    if (!allowed.has(key)) throw new Error(`Observability attribute is not allowed for ${name}: ${key}`);
     const segments = key.split(/[._-]/g);
     if (segments.some((segment) => FORBIDDEN_ATTRIBUTE_SEGMENTS.has(segment))) throw new Error(`Observability attribute key may expose sensitive/raw payload data: ${key}`);
     if (rawValue !== null && typeof rawValue !== "string" && typeof rawValue !== "number" && typeof rawValue !== "boolean") throw new Error(`Observability attribute ${key} must be a scalar value`);
