@@ -6,5 +6,6 @@ export * from "./execution/index.js";
 export * from "./providers/index.js";
 export * from "./control-plane/index.js";
 export * from "./runtime/index.js";
+export * from "./reconciliation/index.js";
 export * from "./tools/index.js";
 export * from "./workspace/index.js";
