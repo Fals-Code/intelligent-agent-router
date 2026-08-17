@@ -24,6 +24,8 @@ Every other tool is denied by the runtime adapter. An approval request is denied
 
 ## Durable state
 
+The harness requires `ROUTER_RESTART_RECOVERY_STATE_ROOT` to identify one dedicated proof directory. Process A refuses to start unless that directory is empty. There is intentionally no shared/static fallback directory, so stale evidence from an earlier proof cannot be mixed into a new run. The Windows wrapper creates a unique `%TEMP%` directory automatically and passes the same directory to both processes.
+
 The reference state directory contains four authoritative JSONL stores:
 
 - `workflow.jsonl`
@@ -64,7 +66,7 @@ A provider `completed` status alone is never treated as workflow success.
 
 ## Windows entry point
 
-`scripts/windows-reference-restart-recovery-slice.ps1` performs the guarded local proof. It requires a clean router checkout whose HEAD exactly matches `origin/main`, validates the source and eval suite, starts a temporary loopback OpenCode server only when needed, runs the existing live OpenCode preflight, then launches the prepare and recover Node processes separately.
+`scripts/windows-reference-restart-recovery-slice.ps1` is the authoritative guarded local entry point. It requires a clean router checkout whose HEAD exactly matches `origin/main`, validates the source and eval suite, creates a unique empty state root under `%TEMP%`, starts a temporary loopback OpenCode server only when needed, runs the existing live OpenCode preflight, then launches the prepare and recover Node processes separately with the same explicit state root.
 
 The wrapper retains the state directory and transcript path in its final output so the proof can be reviewed independently.
 
