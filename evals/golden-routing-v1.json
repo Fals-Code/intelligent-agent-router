@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "suiteId": "golden-routing-v1",
+  "description": "Synthetic routing golden tasks migrated from the original six-case evaluation harness.",
+  "tasks": [
+    {
+      "id": "simple-summary",
+      "kind": "routing",
+      "prompt": "Ringkas paragraf ini menjadi tiga kalimat.",
+      "critical": false,
+      "minimumScore": 1,
+      "assertions": [
+        { "id": "model", "kind": "primary_model_equals", "weight": 1, "expected": "openai-fast" },
+        { "id": "verification", "kind": "requires_verification_equals", "weight": 1, "expected": false }
+      ]
+    },
+    {
+      "id": "fresh-public-research",
+      "kind": "routing",
+      "prompt": "Cari berita teknologi terbaru hari ini dan berikan sumber.",
+      "critical": true,
+      "minimumScore": 1,
+      "assertions": [
+        { "id": "model", "kind": "primary_model_equals", "weight": 1, "expected": "openai-balanced" },
+        { "id": "skills", "kind": "selected_skills_include", "weight": 1, "expected": ["web-search"] },
+        { "id": "verification", "kind": "requires_verification_equals", "weight": 1, "expected": true }
+      ]
+    },
+    {
+      "id": "github-security-remediation",
+      "kind": "routing",
+      "prompt": "Gunakan GitHub untuk audit auth bypass, perbaiki kode, jalankan test, dan buat pull request.",
+      "critical": true,
+      "minimumScore": 1,
+      "assertions": [
+        { "id": "model", "kind": "primary_model_equals", "weight": 1, "expected": "openai-frontier" },
+        { "id": "skills", "kind": "selected_skills_include", "weight": 1, "expected": ["github", "human-approval"] },
+        { "id": "verification", "kind": "requires_verification_equals", "weight": 1, "expected": true }
+      ]
+    },
+    {
+      "id": "spreadsheet-artifact",
+      "kind": "routing",
+      "prompt": "Buat spreadsheet anggaran dengan rumus varians dan grafik bulanan.",
+      "critical": false,
+      "minimumScore": 1,
+      "assertions": [
+        { "id": "model", "kind": "primary_model_equals", "weight": 1, "expected": "openai-balanced" },
+        { "id": "skills", "kind": "selected_skills_include", "weight": 1, "expected": ["spreadsheet-builder"] },
+        { "id": "verification", "kind": "requires_verification_equals", "weight": 1, "expected": false }
+      ]
+    },
+    {
+      "id": "image-generation",
+      "kind": "routing",
+      "prompt": "Buat poster promosi dari foto produk ini.",
+      "critical": false,
+      "minimumScore": 1,
+      "assertions": [
+        { "id": "model", "kind": "primary_model_equals", "weight": 1, "expected": "openai-balanced" },
+        { "id": "skills", "kind": "selected_skills_include", "weight": 1, "expected": ["image-generation"] },
+        { "id": "verification", "kind": "requires_verification_equals", "weight": 1, "expected": false }
+      ]
+    },
+    {
+      "id": "document-research",
+      "kind": "routing",
+      "prompt": "Buat laporan akademik dari PDF ini dan cek sitasinya.",
+      "critical": false,
+      "minimumScore": 1,
+      "assertions": [
+        { "id": "model", "kind": "primary_model_equals", "weight": 1, "expected": "openai-balanced" },
+        { "id": "skills", "kind": "selected_skills_include", "weight": 1, "expected": ["document-builder"] },
+        { "id": "verification", "kind": "requires_verification_equals", "weight": 1, "expected": false }
+      ]
+    }
+  ]
+}
