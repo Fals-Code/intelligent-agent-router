@@ -26,6 +26,14 @@ export interface RuntimeSession {
   readonly createdAt: string;
 }
 
+export interface RuntimeSessionReference {
+  readonly id: string;
+  readonly runtimeId: string;
+  readonly projectId: string;
+  readonly workspace: string;
+  readonly createdAt?: string;
+}
+
 export interface RuntimeTask {
   readonly taskId: string;
   readonly prompt: string;
@@ -77,4 +85,14 @@ export interface AgentRuntimeAdapter {
   respondToApproval(sessionId: string, response: ApprovalResponse): Promise<void>;
   abort(sessionId: string, reason?: string): Promise<void>;
   destroy(sessionId: string): Promise<void>;
+}
+
+export interface RecoverableAgentRuntimeAdapter extends AgentRuntimeAdapter {
+  attachSession(reference: RuntimeSessionReference): Promise<RuntimeSession>;
+}
+
+export function supportsRuntimeSessionAttach(
+  adapter: AgentRuntimeAdapter,
+): adapter is RecoverableAgentRuntimeAdapter {
+  return typeof (adapter as Partial<RecoverableAgentRuntimeAdapter>).attachSession === "function";
 }
