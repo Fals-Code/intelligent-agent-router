@@ -53,7 +53,7 @@ export class NodeCommandRunner implements CommandRunner {
 
 function sanitize(value: string, truncated: boolean): string {
   const safe = value
-    .replace(/(authorization|api[_-]?key|access[_-]?token|password|secret|credential)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
+    .replace(/(authorization|api[_-]?key|access[_-]?token|password|secret|credential)\s*[:=]\s*(Bearer\s+)?[^\s,;]+/gi, "$1=[redacted]")
     .trim();
   return truncated ? `${safe}\n[output truncated]` : safe;
 }
