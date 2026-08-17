@@ -8,5 +8,6 @@ export * from "./control-plane/index.js";
 export * from "./runtime/index.js";
 export * from "./reconciliation/index.js";
 export * from "./integration/index.js";
+export * from "./publication/index.js";
 export * from "./tools/index.js";
 export * from "./workspace/index.js";
