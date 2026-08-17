@@ -21,6 +21,7 @@ const T4 = "2026-08-18T00:00:04.000Z";
 const T5 = "2026-08-18T00:00:05.000Z";
 const T6 = "2026-08-18T00:00:06.000Z";
 const T7 = "2026-08-18T00:00:07.000Z";
+const T8 = "2026-08-18T00:00:08.000Z";
 
 function openStore(filePath, overrides = {}) {
   return new JsonlWorkflowCheckpointStore({
@@ -114,6 +115,11 @@ test("waiting approval survives restart and approval IDs remain durable append-o
   const afterRestart = openStore(filePath).get("wf-approval");
   assert.deepEqual(afterRestart?.approvalIds, ["approval-1"]);
   assert.equal(afterRestart?.phase, "publish");
+
+  assert.throws(
+    () => store.checkpoint({ ...run, approvalIds: [], updatedAt: T8 }),
+    /approvalIds are append-only/,
+  );
 });
 
 test("restart recovery never silently resumes active or retrying work", async (t) => {
@@ -159,7 +165,39 @@ test("terminal workflow remains terminal and cannot accept later checkpoints", a
   assert.equal(planWorkflowRecovery(run).disposition, "terminal");
   assert.throws(
     () => store.checkpoint({ ...run, updatedAt: T2 }),
-    /terminal and cannot accept another checkpoint/,
+    /does not match any valid WorkflowStateMachine transition/,
+  );
+});
+
+test("first checkpoint must be canonical create state and later checkpoints must replay a real transition", async (t) => {
+  const filePath = await withTempStore(t);
+  const store = openStore(filePath);
+
+  assert.throws(
+    () =>
+      store.checkpoint(
+        queuedRun("wf-imported-active", {
+          phase: "classify",
+          status: "running",
+          attempt: 1,
+          updatedAt: T1,
+        }),
+      ),
+    /initial checkpoint must equal canonical WorkflowStateMachine\.create\(\) state/,
+  );
+
+  store.checkpoint(queuedRun("wf-leap"));
+  assert.throws(
+    () =>
+      store.checkpoint(
+        queuedRun("wf-leap", {
+          phase: "publish",
+          status: "running",
+          attempt: 1,
+          updatedAt: T1,
+        }),
+      ),
+    /does not match any valid WorkflowStateMachine transition/,
   );
 });
 
@@ -185,28 +223,19 @@ test("workflow checkpoint reload fails closed on truncated, unsupported, and seq
   assert.throws(() => openStore(filePath), /sequence mismatch at line 1: expected=1 actual=2/);
 });
 
-test("workflow checkpoint store enforces immutable identity and monotonic approval history", async (t) => {
+test("workflow checkpoint store rejects unknown fields and immutable identity changes", async (t) => {
   const filePath = await withTempStore(t);
   const store = openStore(filePath);
-  store.checkpoint(queuedRun("wf-identity"));
 
+  assert.throws(
+    () => store.checkpoint({ ...queuedRun("wf-extra"), providerSession: "must-not-be-canonical" }),
+    /providerSession is not allowed/,
+  );
+
+  store.checkpoint(queuedRun("wf-identity"));
   assert.throws(
     () => store.checkpoint(queuedRun("wf-identity", { projectId: "other-project", updatedAt: T1 })),
     /projectId is immutable/,
-  );
-
-  const running = {
-    ...queuedRun("wf-approval-history"),
-    phase: "publish",
-    status: "running",
-    attempt: 1,
-    approvalIds: ["approval-1"],
-    updatedAt: T1,
-  };
-  store.checkpoint(running);
-  assert.throws(
-    () => store.checkpoint({ ...running, approvalIds: [], updatedAt: T2 }),
-    /approvalIds are append-only/,
   );
 });
 
