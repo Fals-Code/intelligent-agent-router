@@ -18,6 +18,16 @@ The sequence is global and monotonic within the local file. Reload fails closed 
 
 The caller must provide an explicit file path, `maxFileBytes`, and `maxCheckpointBytes`. No persistence-size default is hidden in the implementation.
 
+## State-machine replay validation
+
+Persistence does not define a second workflow transition model.
+
+The first checkpoint for every run must exactly match canonical `WorkflowStateMachine.create()` output. Every later checkpoint is validated by replaying the official state machine from the previous durable checkpoint and requiring the new snapshot to exactly match one legitimate transition (`start`, `advance`, approval transitions, pause/resume, retry/recover, fail, cancel, or succeed).
+
+This prevents a structurally valid JSONL file from silently jumping, for example, from `queued/start` directly to `running/publish`.
+
+Unknown fields are rejected. Provider-native identifiers or session payloads therefore cannot be smuggled into `WorkflowRun` and become accidental canonical control-plane state.
+
 ## Durable wrapper
 
 `DurableWorkflowStateMachine` delegates every transition to the existing `WorkflowStateMachine` and checkpoints the returned state before returning it to the caller. If persistence fails, the transition is not returned as durable success.
@@ -45,15 +55,16 @@ This matches the current OpenCode limitation that an interrupted generation cann
 The local checkpoint store enforces:
 
 - append-only checkpoint history
+- canonical create state as the first checkpoint
+- exact replay validation against `WorkflowStateMachine` for every later checkpoint
+- rejection of unknown/non-contract workflow fields
 - explicit file and per-checkpoint byte ceilings
 - file `fsync` before in-process admission
 - restart/reopen reconstruction of latest state and per-run history
 - monotonic checkpoint sequence
-- immutable workflow `projectId`, `riskClass`, and `createdAt`
-- non-decreasing attempt, phase, and `updatedAt`
+- immutable workflow identity through state-machine replay
 - append-only approval IDs
-- no checkpoint after `cancelled` or `succeeded`
-- fail-closed malformed JSON, unknown schema, truncated final writes, invalid workflow shapes, oversized files/checkpoints, and stale-writer file-size drift
+- fail-closed malformed JSON, unknown schema, truncated final writes, invalid workflow shapes/transitions, oversized files/checkpoints, and stale-writer file-size drift
 
 The stale-writer check is not a multi-process lock or tamper detector.
 
