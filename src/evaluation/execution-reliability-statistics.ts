@@ -69,6 +69,7 @@ export async function buildExecutionReliabilitySummary(
   for (const projection of projections) await verifyExecutionMetricProjection(projection);
   const records = validateRunLedgerSet(runLedgerRecords);
   const projectionById = new Map(projections.map((item) => [item.projectionId, item]));
+  if (projectionById.size !== projections.length) throw new Error("Execution reliability projections contain duplicate projection IDs");
 
   const first = observations[0].payload;
   for (const observation of observations.slice(1)) {
@@ -93,6 +94,8 @@ export async function buildExecutionReliabilitySummary(
     if (record.projectId !== projection.payload.projectId || record.traceId !== projection.payload.traceId || record.runtimeId !== projection.payload.runtimeId || record.outcome !== projection.payload.outcome) {
       throw new Error(`Execution reliability projection ${projection.projectionId} does not match canonical Run Ledger identity/outcome`);
     }
+    assertProjectedMetricMatchesLedger(record, projection, "latency");
+    assertProjectedMetricMatchesLedger(record, projection, "cost");
     if (measurement.latencyMs !== projection.payload.latencyMs || measurement.costUsd !== projection.payload.costUsd) {
       throw new Error(`Execution reliability observation ${observation.observationId} measurement does not match execution metric projection`);
     }
@@ -182,6 +185,24 @@ export async function verifyExecutionReliabilityComparison(comparison: Execution
   if (comparison.comparisonId !== `execrelcmp:${expected.slice(0, 32).toLowerCase()}`) throw new Error("Execution reliability comparisonId does not match canonical payload");
 }
 
+function assertProjectedMetricMatchesLedger(
+  record: RunLedgerRecord,
+  projection: ExecutionMetricProjection,
+  dimension: "latency" | "cost",
+): void {
+  const key = projection.payload.metricKeys[dimension];
+  const projected = dimension === "latency" ? projection.payload.latencyMs : projection.payload.costUsd;
+  if (projected === undefined) {
+    if (key !== undefined) throw new Error(`Execution reliability projection ${projection.projectionId} has ${dimension} metric key without projected value`);
+    return;
+  }
+  if (!key) throw new Error(`Execution reliability projection ${projection.projectionId} has ${dimension} value without metric key`);
+  const canonicalValue = record.resourceMetrics[key];
+  if (canonicalValue === undefined || canonicalValue !== projected) {
+    throw new Error(`Execution reliability projection ${projection.projectionId} ${dimension} metric does not match canonical Run Ledger resourceMetrics[${key}]`);
+  }
+}
+
 function validateRunLedgerSet(records: readonly RunLedgerRecord[]): Map<string, RunLedgerRecord> {
   const ledger = new InMemoryRunLedger();
   for (const record of records) ledger.append(record);
@@ -190,7 +211,10 @@ function validateRunLedgerSet(records: readonly RunLedgerRecord[]): Map<string, 
 
 function validateSummaryPayload(payload: ExecutionReliabilitySummaryPayload): void {
   if (!isRecord(payload)) throw new Error("Execution reliability summary payload must be an object");
+  if (!Array.isArray(payload.observationIds) || !Array.isArray(payload.projectionIds)) throw new Error("Execution reliability summary IDs must be arrays");
   if (!Number.isInteger(payload.sampleCount) || payload.sampleCount <= 0) throw new Error("Execution reliability sampleCount is invalid");
+  if (payload.observationIds.length !== payload.sampleCount || payload.projectionIds.length !== payload.sampleCount) throw new Error("Execution reliability summary ID counts do not match sampleCount");
+  if (new Set(payload.observationIds).size !== payload.observationIds.length || new Set(payload.projectionIds).size !== payload.projectionIds.length) throw new Error("Execution reliability summary IDs must be unique");
   if (!Number.isInteger(payload.succeeded) || !Number.isInteger(payload.failed) || !Number.isInteger(payload.cancelled)) throw new Error("Execution reliability outcome counts must be integers");
   if (payload.succeeded < 0 || payload.failed < 0 || payload.cancelled < 0) throw new Error("Execution reliability outcome counts must be non-negative");
   if (payload.succeeded + payload.failed + payload.cancelled !== payload.sampleCount) throw new Error("Execution reliability outcome counts do not match sampleCount");
