@@ -81,7 +81,7 @@ export async function buildExecutionReliabilitySummary(
   const resolved = observations.map((observation) => {
     const measurement = observation.payload.measurement;
     if (!measurement) throw new Error(`Execution reliability observation ${observation.observationId} has no measurement sample`);
-    const projectionRefs = measurement.sourceReferences.filter((item) => item.startsWith("execution-metric:"));
+    const projectionRefs = measurement.sourceReferences.filter((item: string) => item.startsWith("execution-metric:"));
     if (projectionRefs.length !== 1) throw new Error(`Execution reliability observation ${observation.observationId} must reference exactly one execution metric projection`);
     const projectionId = projectionRefs[0].slice("execution-metric:".length);
     const projection = projectionById.get(projectionId);
