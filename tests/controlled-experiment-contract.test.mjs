@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  controlledExperimentAuthorizationToEvidence,
   prepareControlledExperimentAuthorization,
   prepareControlledExperimentDefinition,
+  verifiedControlledExperimentAuthorizationToEvidence,
   verifyControlledExperimentAuthorization,
   verifyControlledExperimentDefinition,
 } from "../dist/index.js";
@@ -60,7 +60,13 @@ test("controlled experiment authorization binds exact experiment to approved wor
   assert.deepEqual(authorization.payload.approvalIds, workflow.approvalIds);
   assert.equal(authorization.payload.automaticDispatchAllowed, false);
   assert.equal(authorization.payload.productionRoutingMutationAllowed, false);
-  const evidence = controlledExperimentAuthorizationToEvidence(authorization, "2026-08-18T07:33:00.000Z");
+  const evidence = await verifiedControlledExperimentAuthorizationToEvidence(
+    authorization,
+    experiment,
+    admissionDecision,
+    workflow,
+    "2026-08-18T07:33:00.000Z",
+  );
   assert.equal(evidence.kind, "approval");
   assert.equal(evidence.status, "passed");
   assert.match(evidence.reference, /^controlled-experiment-authorization:m5expauth:/);
@@ -91,7 +97,7 @@ test("controlled experiment allow authorization fails closed on approval, workfl
   assert.equal(denied.payload.experimentContractAuthorized, false);
 });
 
-test("controlled experiment definition and authorization are structurally fail closed", async (t) => {
+test("controlled experiment definition, authorization, and evidence conversion are structurally fail closed", async (t) => {
   const { admissionDecision } = await controlledExperimentFixture(t);
   await assert.rejects(
     () => prepareControlledExperimentDefinition(admissionDecision, { ...experimentDefinitionInput(), unexpected: true }),
@@ -104,4 +110,8 @@ test("controlled experiment definition and authorization are structurally fail c
   await assert.rejects(() => verifyControlledExperimentDefinition(tamperedExperiment, admissionDecision), /cannot grant automatic authority|digest does not match/);
   const tamperedAuthorization = { ...authorization, payload: { ...authorization.payload, productionRoutingMutationAllowed: true } };
   await assert.rejects(() => verifyControlledExperimentAuthorization(tamperedAuthorization, experiment, admissionDecision, workflow), /cannot grant automatic dispatch or production routing mutation authority|digest does not match/);
+  await assert.rejects(
+    () => verifiedControlledExperimentAuthorizationToEvidence(tamperedAuthorization, experiment, admissionDecision, workflow, "2026-08-18T07:34:00.000Z"),
+    /cannot grant automatic dispatch or production routing mutation authority|digest does not match/,
+  );
 });
