@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  controlledExperimentGuardrailDecisionToEvidence,
   evaluateControlledExperimentGuardrails,
   prepareControlledExperimentAuthorization,
   prepareControlledExperimentDefinition,
+  verifiedControlledExperimentGuardrailDecisionToEvidence,
   verifyControlledExperimentGuardrailDecision,
 } from "../dist/index.js";
 import {
@@ -110,7 +110,7 @@ test("controlled experiment requires stop before live and rollback after live wh
   assert.equal(rollback.payload.classification, "ROLLBACK_REQUIRED");
   assert.equal(rollback.payload.automaticRollbackAllowed, false);
   assert.ok(rollback.payload.reasons.includes("cancellation_rate_exceeded_stop_condition"));
-  const evidence = controlledExperimentGuardrailDecisionToEvidence(rollback, "2026-08-18T10:31:00.000Z");
+  const evidence = await verifiedControlledExperimentGuardrailDecisionToEvidence(rollback, "2026-08-18T10:31:00.000Z");
   assert.equal(evidence.kind, "deterministic_check");
   assert.equal(evidence.status, "failed");
 });
@@ -132,12 +132,16 @@ test("controlled experiment fails closed on live exposure before shadow minimum 
   assert.ok(decision.payload.reasons.includes("candidate_live_traffic_share_exceeded"));
 });
 
-test("controlled experiment guardrail decisions are content-addressed and structurally fail closed", async (t) => {
+test("controlled experiment guardrail decisions and evidence conversion are content-addressed and fail closed", async (t) => {
   const ctx = await experimentContext(t);
   const cohorts = await progressCohorts(ctx, { count: 3, minuteBase: 180 });
   const decision = await evaluate(ctx, cohorts, { shadowSamples: 3, liveSamples: 0, candidateLiveSamples: 0 });
   const tampered = { ...decision, payload: { ...decision.payload, automaticDispatchAllowed: true } };
   await assert.rejects(() => verifyControlledExperimentGuardrailDecision(tampered), /cannot grant automatic authority|digest does not match/);
+  await assert.rejects(
+    () => verifiedControlledExperimentGuardrailDecisionToEvidence(tampered, "2026-08-18T10:32:00.000Z"),
+    /cannot grant automatic authority|digest does not match/,
+  );
   const badCounters = { ...decision, payload: { ...decision.payload, liveSamples: 1 } };
   await assert.rejects(() => verifyControlledExperimentGuardrailDecision(badCounters), /sample counters are inconsistent|candidateTrafficBasisPoints mismatch|digest does not match/);
 });
