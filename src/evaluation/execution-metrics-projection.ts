@@ -38,6 +38,10 @@ export interface ExecutionMetricProjection {
   readonly payload: ExecutionMetricProjectionPayload;
 }
 
+const TOP_LEVEL_FIELDS = new Set(["schemaVersion", "algorithm", "projectionId", "projectionSha256", "payload"]);
+const PAYLOAD_FIELDS = new Set(["runId", "projectId", "traceId", "runtimeId", "outcome", "latencyMs", "costUsd", "metricKeys", "sourceReferences"]);
+const METRIC_KEY_FIELDS = new Set(["latency", "cost"]);
+
 export class ExecutionMetricProjector {
   private readonly policy: ExecutionMetricProjectionPolicy;
 
@@ -113,19 +117,55 @@ export class ExecutionMetricProjector {
 
 export async function verifyExecutionMetricProjection(projection: ExecutionMetricProjection): Promise<void> {
   if (!isRecord(projection)) throw new Error("Execution metric projection must be an object");
+  assertAllowedFields(projection, TOP_LEVEL_FIELDS, "Execution metric projection");
+  for (const field of TOP_LEVEL_FIELDS) if (!(field in projection)) throw new Error(`Execution metric projection is missing field: ${field}`);
   if (projection.schemaVersion !== EXECUTION_METRIC_PROJECTION_SCHEMA_VERSION) throw new Error("Unsupported execution metric projection schema version");
   if (projection.algorithm !== "sha256") throw new Error("Execution metric projection algorithm must be sha256");
   if (!isRecord(projection.payload)) throw new Error("Execution metric projection payload must be an object");
+  assertAllowedFields(projection.payload, PAYLOAD_FIELDS, "Execution metric projection payload");
+  for (const field of ["runId", "projectId", "traceId", "runtimeId", "outcome", "metricKeys", "sourceReferences"]) {
+    if (!(field in projection.payload)) throw new Error(`Execution metric projection payload is missing field: ${field}`);
+  }
+
+  for (const [field, value] of [
+    ["runId", projection.payload.runId],
+    ["projectId", projection.payload.projectId],
+    ["traceId", projection.payload.traceId],
+    ["runtimeId", projection.payload.runtimeId],
+  ] as const) prepareReferenceIdentity(value, `Execution metric projection ${field}`);
+
+  if (!["failed", "cancelled", "succeeded"].includes(projection.payload.outcome)) throw new Error("Execution metric projection outcome is invalid");
+  if (!isRecord(projection.payload.metricKeys)) throw new Error("Execution metric projection metricKeys must be an object");
+  assertAllowedFields(projection.payload.metricKeys, METRIC_KEY_FIELDS, "Execution metric projection metricKeys");
+
+  if (projection.payload.latencyMs !== undefined) {
+    prepareNonNegative(projection.payload.latencyMs, "Execution metric projection latencyMs");
+    if (projection.payload.metricKeys.latency === undefined) throw new Error("Execution metric projection latencyMs requires metricKeys.latency");
+    prepareMetricKey(projection.payload.metricKeys.latency, "Execution metric projection latency metric key", Number.MAX_SAFE_INTEGER);
+  } else if (projection.payload.metricKeys.latency !== undefined) {
+    throw new Error("Execution metric projection metricKeys.latency requires latencyMs");
+  }
+  if (projection.payload.costUsd !== undefined) {
+    prepareNonNegative(projection.payload.costUsd, "Execution metric projection costUsd");
+    if (projection.payload.metricKeys.cost === undefined) throw new Error("Execution metric projection costUsd requires metricKeys.cost");
+    prepareMetricKey(projection.payload.metricKeys.cost, "Execution metric projection cost metric key", Number.MAX_SAFE_INTEGER);
+  } else if (projection.payload.metricKeys.cost !== undefined) {
+    throw new Error("Execution metric projection metricKeys.cost requires costUsd");
+  }
+  if (projection.payload.latencyMs === undefined && projection.payload.costUsd === undefined) throw new Error("Execution metric projection has no projected metric sample");
+
+  if (!Array.isArray(projection.payload.sourceReferences) || projection.payload.sourceReferences.length === 0) {
+    throw new Error("Execution metric projection requires source references");
+  }
+  const preparedReferences = projection.payload.sourceReferences.map((reference, index) => prepareReferenceIdentity(reference, `Execution metric projection sourceReferences[${index}]`));
+  if (new Set(preparedReferences).size !== preparedReferences.length) throw new Error("Execution metric projection sourceReferences contain duplicates");
+  const sortedReferences = [...preparedReferences].sort();
+  if (JSON.stringify(preparedReferences) !== JSON.stringify(sortedReferences)) throw new Error("Execution metric projection sourceReferences are not canonically sorted");
+  if (!preparedReferences.includes(`run-ledger:${projection.payload.runId}`)) throw new Error("Execution metric projection requires canonical Run Ledger source reference");
+
   const expected = await sha256Canonical(projection.payload);
   if (projection.projectionSha256 !== expected) throw new Error("Execution metric projection digest does not match canonical payload");
   if (projection.projectionId !== `execmetric:${expected.slice(0, 32).toLowerCase()}`) throw new Error("Execution metric projectionId does not match canonical payload");
-  if (!["failed", "cancelled", "succeeded"].includes(projection.payload.outcome)) throw new Error("Execution metric projection outcome is invalid");
-  if (projection.payload.latencyMs !== undefined) prepareNonNegative(projection.payload.latencyMs, "Execution metric projection latencyMs");
-  if (projection.payload.costUsd !== undefined) prepareNonNegative(projection.payload.costUsd, "Execution metric projection costUsd");
-  if (projection.payload.latencyMs === undefined && projection.payload.costUsd === undefined) throw new Error("Execution metric projection has no projected metric sample");
-  if (!Array.isArray(projection.payload.sourceReferences) || !projection.payload.sourceReferences.includes(`run-ledger:${projection.payload.runId}`)) {
-    throw new Error("Execution metric projection requires canonical Run Ledger source reference");
-  }
 }
 
 export async function executionProjectionToEvalMeasurement(
@@ -172,6 +212,22 @@ function prepareMetricKey(value: string, label: string, maxBytes: number): strin
   return key;
 }
 
+function prepareReferenceIdentity(value: unknown, label: string): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must not be empty`);
+  const prepared = value.trim();
+  if (/\r|\n/.test(prepared)) throw new Error(`${label} must be single-line`);
+  if (containsSecretLikeMaterial(prepared)) throw new Error(`${label} contains secret-like material`);
+  return prepared;
+}
+
+function containsSecretLikeMaterial(value: string): boolean {
+  return /\bBearer\s+[A-Za-z0-9._~+\/-]+=*/i.test(value)
+    || /(authorization|api[_-]?key|access[_-]?token|password|secret|credential|cookie)\s*[:=]/i.test(value)
+    || /\bghp_[A-Za-z0-9]{20,}\b/.test(value)
+    || /\bgithub_pat_[A-Za-z0-9_]{20,}\b/.test(value)
+    || /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/.test(value);
+}
+
 function prepareNonNegative(value: number, label: string): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error(`${label} must be finite and non-negative`);
   return value;
@@ -179,6 +235,10 @@ function prepareNonNegative(value: number, label: string): number {
 
 function assertPositiveInteger(value: number, label: string): void {
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${label} must be a positive integer`);
+}
+
+function assertAllowedFields(value: Record<string, unknown>, allowed: ReadonlySet<string>, label: string): void {
+  for (const field of Object.keys(value)) if (!allowed.has(field)) throw new Error(`${label} contains unknown field: ${field}`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
