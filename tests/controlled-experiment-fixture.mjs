@@ -2,8 +2,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  DurableWorkflowStateMachine,
   ExecutionMetricProjector,
   JsonlEvalHistory,
+  JsonlWorkflowCheckpointStore,
   RoutingEvalPlane,
   assessM5ControlledExperimentAdmission,
   buildCanonicalMetricTaxonomy,
@@ -30,6 +32,8 @@ const historyOptions = (filePath) => ({
   maxStringBytes: 2048,
   maxSourceReferences: 8,
 });
+
+let workflowFixtureSequence = 0;
 
 export async function controlledExperimentFixture(t) {
   const root = await mkdtemp(join(tmpdir(), "9router-controlled-experiment-"));
@@ -132,19 +136,30 @@ export function experimentDefinitionInput(overrides = {}) {
   };
 }
 
-export function approvedExperimentWorkflow(overrides = {}) {
-  return {
-    id: "workflow-controlled-experiment",
+export async function durableApprovedExperimentWorkflow(root, overrides = {}) {
+  workflowFixtureSequence += 1;
+  const store = new JsonlWorkflowCheckpointStore({
+    filePath: join(root, `workflow-${workflowFixtureSequence}.jsonl`),
+    maxFileBytes: 512 * 1024,
+    maxCheckpointBytes: 32 * 1024,
+  });
+  const durable = new DurableWorkflowStateMachine(store);
+  const input = {
+    id: `workflow-controlled-experiment-${workflowFixtureSequence}`,
     projectId: "project-controlled-experiment",
     riskClass: "R3",
-    phase: "publish",
-    status: "running",
-    attempt: 1,
-    approvalIds: ["approval:controlled-experiment-1"],
-    createdAt: "2026-08-18T07:30:00.000Z",
-    updatedAt: "2026-08-18T07:31:00.000Z",
+    now: "2026-08-18T07:30:00.000Z",
     ...overrides,
   };
+  let run = durable.create(input);
+  run = durable.start(run, "2026-08-18T07:30:01.000Z");
+  run = durable.advance(run, "2026-08-18T07:30:02.000Z");
+  run = durable.advance(run, "2026-08-18T07:30:03.000Z");
+  run = durable.advance(run, "2026-08-18T07:30:04.000Z");
+  run = durable.advance(run, "2026-08-18T07:30:05.000Z");
+  run = durable.requestApproval(run, "2026-08-18T07:30:06.000Z");
+  run = durable.approve(run, "approval:controlled-experiment-1", "2026-08-18T07:31:00.000Z");
+  return { run, store };
 }
 
 export function authorizationInput(overrides = {}) {
