@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "baselineId": "routing-m4-v1",
+  "suiteId": "golden-routing-v1",
+  "suiteSha256": "DB2C3C264FEF0F7731B1BDBB0BBD12A2ADD782001D9356576AE0C6F342343E46",
+  "subjectId": "intelligent-agent-router",
+  "minimumWeightedScore": 1,
+  "minimumTaskPassRate": 1,
+  "minimumCriticalPassRate": 1,
+  "maximumFailedTasks": 0
+}
