@@ -8,3 +8,4 @@ export * from "./metric-taxonomy.js";
 export * from "./m5-admission-gate.js";
 export * from "./controlled-experiment.js";
 export * from "./controlled-experiment-guardrails.js";
+export * from "./controlled-experiment-evidence.js";
