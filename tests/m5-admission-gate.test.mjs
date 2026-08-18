@@ -227,10 +227,11 @@ test("M5 admission fails closed when execution provenance does not belong to the
   const { history, taxonomy, passReport, baseline } = await fixture(t);
   const reference = await buildCohort({ history, report: passReport, baseline, prefix: "ref-id", minuteBase: 100 });
   const candidate = await buildCohort({ history, report: passReport, baseline, prefix: "cand-id", minuteBase: 110 });
+  const admissionPolicy = await policy(taxonomy);
   await assert.rejects(
     () => assessM5ControlledExperimentAdmission({
       taxonomy,
-      policy: await policy(taxonomy),
+      policy: admissionPolicy,
       reference,
       candidate: { evalSummary: candidate.evalSummary, executionSummary: reference.executionSummary },
     }),
