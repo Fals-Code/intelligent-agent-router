@@ -111,10 +111,12 @@ test("execution metric projector fails closed on missing required metrics, negat
   await assert.rejects(() => projector.project(ledgerRecord), /requires terminal observability evidence/);
 
   const missingCost = { ...ledgerRecord, resourceMetrics: { "runtime.total_ms": 420 } };
-  await assert.rejects(() => projector.project(missingCost, await terminalEventFor(missingCost)), /missing required cost metric/);
+  const missingCostEvent = await terminalEventFor(missingCost);
+  await assert.rejects(() => projector.project(missingCost, missingCostEvent), /missing required cost metric/);
 
   const negativeCost = record({ costUsd: -0.01 });
-  await assert.rejects(() => projector.project(negativeCost, await terminalEventFor(negativeCost)), /must be finite and non-negative/);
+  const negativeCostEvent = await terminalEventFor(negativeCost);
+  await assert.rejects(() => projector.project(negativeCost, negativeCostEvent), /must be finite and non-negative/);
 
   const mismatched = await terminalEventFor({ ...ledgerRecord, runId: "other-run" });
   await assert.rejects(() => projector.project(ledgerRecord, mismatched), /runId does not match/);
@@ -125,4 +127,17 @@ test("metric policy never guesses canonical cost or latency keys", async () => {
   const projector = new ExecutionMetricProjector({ maxMetricKeyBytes: 256 });
   await assert.rejects(() => projector.project(record()), /no configured execution metric sample/);
   assert.throws(() => new ExecutionMetricProjector({ latencyMetricKey: "authorization.token", maxMetricKeyBytes: 256 }), /sensitive/);
+});
+
+test("projection verifier rejects structural metric/reference inconsistencies", async () => {
+  const projector = new ExecutionMetricProjector({ latencyMetricKey: "runtime.total_ms", requireLatency: true, maxMetricKeyBytes: 256 });
+  const projection = await projector.project(record());
+  await assert.rejects(
+    () => verifyExecutionMetricProjection({ ...projection, payload: { ...projection.payload, metricKeys: {} } }),
+    /latencyMs requires metricKeys.latency/,
+  );
+  await assert.rejects(
+    () => verifyExecutionMetricProjection({ ...projection, payload: { ...projection.payload, sourceReferences: [...projection.payload.sourceReferences, ...projection.payload.sourceReferences] } }),
+    /sourceReferences contain duplicates/,
+  );
 });
