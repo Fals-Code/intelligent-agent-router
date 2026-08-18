@@ -98,17 +98,92 @@ export interface M5AdmissionDecision {
   readonly payload: M5AdmissionDecisionPayload;
 }
 
+const POLICY_INPUT_FIELDS = new Set([
+  "name",
+  "minimumObservationCount",
+  "requireExecutionReliability",
+  "requireFullExecutionProvenance",
+  "minimumExecutionSampleCount",
+  "minimumDecidedExecutionSampleCount",
+  "minimumLatencyCoverageRatio",
+  "minimumCostCoverageRatio",
+  "maximumCoverageRegressionRatio",
+  "maximumWeightedScoreMeanRegression",
+  "maximumTaskPassRateMeanRegression",
+  "maximumCriticalPassRateMeanRegression",
+  "maximumBaselinePassRateRegression",
+  "maximumExecutionSuccessRateRegression",
+  "maximumCancellationRateIncrease",
+  "maximumLatencyMeanIncreaseMs",
+  "maximumCostMeanIncreaseUsd",
+]);
+const POLICY_PAYLOAD_FIELDS = new Set([...POLICY_INPUT_FIELDS, "taxonomyId"]);
+const POLICY_ENVELOPE_FIELDS = new Set(["schemaVersion", "algorithm", "policyId", "policySha256", "payload"]);
+const DECISION_ENVELOPE_FIELDS = new Set(["schemaVersion", "algorithm", "decisionId", "decisionSha256", "payload"]);
+const DECISION_PAYLOAD_FIELDS = new Set([
+  "taxonomyId",
+  "policyId",
+  "policySha256",
+  "suiteId",
+  "suiteSha256",
+  "baselineId",
+  "referenceSubjectId",
+  "candidateSubjectId",
+  "referenceEvalSummaryId",
+  "candidateEvalSummaryId",
+  "referenceExecutionSummaryId",
+  "candidateExecutionSummaryId",
+  "classification",
+  "reasons",
+  "facts",
+  "evalDeltas",
+  "executionDeltas",
+  "experimentAdmissionEligible",
+  "controlledExperimentAutomaticallyAuthorized",
+  "productionRoutingMutationAllowed",
+  "automaticDispatchAllowed",
+]);
+const FACT_FIELDS = new Set([
+  "referenceObservationCount",
+  "candidateObservationCount",
+  "referenceExecutionSampleCount",
+  "candidateExecutionSampleCount",
+  "referenceDecidedExecutionSampleCount",
+  "candidateDecidedExecutionSampleCount",
+  "referenceExecutionCoverageRatio",
+  "candidateExecutionCoverageRatio",
+  "referenceLatencyCoverageRatio",
+  "candidateLatencyCoverageRatio",
+  "referenceCostCoverageRatio",
+  "candidateCostCoverageRatio",
+]);
+const EVAL_DELTA_FIELDS = new Set([
+  "weightedScoreMean",
+  "taskPassRateMean",
+  "criticalPassRateMean",
+  "baselinePassRate",
+  "latencyMeanMs",
+  "costMeanUsd",
+]);
+const EXECUTION_DELTA_FIELDS = new Set([
+  "successRateExcludingCancelled",
+  "failureRateExcludingCancelled",
+  "cancellationRate",
+]);
+const CLASSIFICATIONS = new Set<M5AdmissionClassification>([
+  "INSUFFICIENT_EVIDENCE",
+  "MEASUREMENT_DRIFT",
+  "NOT_ELIGIBLE_FOR_CONTROLLED_EXPERIMENT",
+  "ELIGIBLE_FOR_CONTROLLED_EXPERIMENT",
+]);
+
 export async function prepareM5AdmissionPolicy(
   taxonomy: MetricTaxonomy,
   input: M5AdmissionPolicyInput,
 ): Promise<M5AdmissionPolicy> {
   await verifyMetricTaxonomy(taxonomy);
-  validatePolicyInput(input);
-  const payload: M5AdmissionPolicyPayload = deepFreeze({
-    ...input,
-    name: prepareIdentity(input.name, "M5 admission policy name"),
-    taxonomyId: taxonomy.taxonomyId,
-  });
+  assertExactAllowedFields(input as unknown as Record<string, unknown>, POLICY_INPUT_FIELDS, "M5 admission policy input");
+  const payload = normalizePolicyPayload(input, taxonomy.taxonomyId);
   const policySha256 = await sha256Canonical(payload);
   return deepFreeze({
     schemaVersion: M5_ADMISSION_POLICY_SCHEMA_VERSION,
@@ -121,11 +196,14 @@ export async function prepareM5AdmissionPolicy(
 
 export async function verifyM5AdmissionPolicy(policy: M5AdmissionPolicy, taxonomy: MetricTaxonomy): Promise<void> {
   await verifyMetricTaxonomy(taxonomy);
-  if (!isRecord(policy) || policy.schemaVersion !== M5_ADMISSION_POLICY_SCHEMA_VERSION || policy.algorithm !== "sha256") throw new Error("M5 admission policy envelope is invalid");
+  if (!isRecord(policy)) throw new Error("M5 admission policy must be an object");
+  assertExactAllowedFields(policy, POLICY_ENVELOPE_FIELDS, "M5 admission policy");
+  if (policy.schemaVersion !== M5_ADMISSION_POLICY_SCHEMA_VERSION || policy.algorithm !== "sha256") throw new Error("M5 admission policy envelope is invalid");
   if (!isRecord(policy.payload)) throw new Error("M5 admission policy payload is invalid");
+  assertExactAllowedFields(policy.payload, POLICY_PAYLOAD_FIELDS, "M5 admission policy payload");
   if (policy.payload.taxonomyId !== taxonomy.taxonomyId) throw new Error("M5 admission policy taxonomyId does not match canonical taxonomy");
-  validatePolicyInput(policy.payload);
-  prepareIdentity(policy.payload.name, "M5 admission policy name");
+  const normalized = normalizePolicyPayload(policy.payload as unknown as M5AdmissionPolicyInput, taxonomy.taxonomyId);
+  if (stableStringify(normalized) !== stableStringify(policy.payload)) throw new Error("M5 admission policy payload is not canonically normalized");
   const expected = await sha256Canonical(policy.payload);
   if (policy.policySha256 !== expected) throw new Error("M5 admission policy digest does not match canonical payload");
   if (policy.policyId !== `m5policy:${expected.slice(0, 32).toLowerCase()}`) throw new Error("M5 admission policyId does not match canonical payload");
@@ -141,45 +219,39 @@ export async function assessM5ControlledExperimentAdmission(input: {
   await verifyM5AdmissionPolicy(input.policy, input.taxonomy);
   await verifyEvalCohortSummary(input.reference.evalSummary);
   await verifyEvalCohortSummary(input.candidate.evalSummary);
-
   const evalComparison = await compareEvalCohorts(input.reference.evalSummary, input.candidate.evalSummary);
+
   const referenceExecution = input.reference.executionSummary;
   const candidateExecution = input.candidate.executionSummary;
-  if (referenceExecution) await verifyExecutionReliabilitySummary(referenceExecution);
-  if (candidateExecution) await verifyExecutionReliabilitySummary(candidateExecution);
-  if ((referenceExecution === undefined) !== (candidateExecution === undefined)) {
-    throw new Error("M5 admission requires execution summaries to be supplied for both cohorts or neither cohort");
+  if ((referenceExecution === undefined) !== (candidateExecution === undefined)) throw new Error("M5 admission requires execution summaries for both cohorts or neither cohort");
+  if (referenceExecution) {
+    await verifyExecutionReliabilitySummary(referenceExecution);
+    assertExecutionSummaryMatchesEval(input.reference.evalSummary, referenceExecution, "reference");
   }
-  if (referenceExecution) assertExecutionSummaryMatchesEval(input.reference.evalSummary, referenceExecution, "reference");
-  if (candidateExecution) assertExecutionSummaryMatchesEval(input.candidate.evalSummary, candidateExecution, "candidate");
-
+  if (candidateExecution) {
+    await verifyExecutionReliabilitySummary(candidateExecution);
+    assertExecutionSummaryMatchesEval(input.candidate.evalSummary, candidateExecution, "candidate");
+  }
   const executionComparison = referenceExecution && candidateExecution
     ? await compareExecutionReliabilitySummaries(referenceExecution, candidateExecution)
     : undefined;
+
   const facts = buildFacts(input.reference, input.candidate);
   const policy = input.policy.payload;
-
   const insufficiencyReasons = collectInsufficiencyReasons(policy, input.reference, input.candidate, facts, evalComparison, executionComparison);
   const driftReasons = insufficiencyReasons.length === 0 ? collectMeasurementDriftReasons(policy, facts) : [];
   const performanceReasons = insufficiencyReasons.length === 0 && driftReasons.length === 0
     ? collectPerformanceRegressionReasons(policy, evalComparison, executionComparison)
     : [];
 
-  let classification: M5AdmissionClassification;
-  let reasons: readonly string[];
-  if (insufficiencyReasons.length > 0) {
-    classification = "INSUFFICIENT_EVIDENCE";
-    reasons = insufficiencyReasons;
-  } else if (driftReasons.length > 0) {
-    classification = "MEASUREMENT_DRIFT";
-    reasons = driftReasons;
-  } else if (performanceReasons.length > 0) {
-    classification = "NOT_ELIGIBLE_FOR_CONTROLLED_EXPERIMENT";
-    reasons = performanceReasons;
-  } else {
-    classification = "ELIGIBLE_FOR_CONTROLLED_EXPERIMENT";
-    reasons = ["evidence_sufficient_and_guardrails_satisfied"];
-  }
+  const classification = chooseClassification(insufficiencyReasons, driftReasons, performanceReasons);
+  const reasons = classification === "ELIGIBLE_FOR_CONTROLLED_EXPERIMENT"
+    ? ["evidence_sufficient_and_guardrails_satisfied"]
+    : classification === "INSUFFICIENT_EVIDENCE"
+      ? insufficiencyReasons
+      : classification === "MEASUREMENT_DRIFT"
+        ? driftReasons
+        : performanceReasons;
 
   const referenceEval = input.reference.evalSummary.payload;
   const candidateEval = input.candidate.evalSummary.payload;
@@ -199,8 +271,8 @@ export async function assessM5ControlledExperimentAdmission(input: {
     classification,
     reasons: [...new Set(reasons)].sort(),
     facts,
-    evalDeltas: evalComparison.payload.deltas,
-    executionDeltas: executionComparison?.payload.deltas,
+    evalDeltas: deepFreeze({ ...evalComparison.payload.deltas }),
+    executionDeltas: executionComparison ? deepFreeze({ ...executionComparison.payload.deltas }) : undefined,
     experimentAdmissionEligible: classification === "ELIGIBLE_FOR_CONTROLLED_EXPERIMENT",
     controlledExperimentAutomaticallyAuthorized: false as const,
     productionRoutingMutationAllowed: false as const,
@@ -217,18 +289,89 @@ export async function assessM5ControlledExperimentAdmission(input: {
 }
 
 export async function verifyM5AdmissionDecision(decision: M5AdmissionDecision): Promise<void> {
-  if (!isRecord(decision) || decision.schemaVersion !== M5_ADMISSION_DECISION_SCHEMA_VERSION || decision.algorithm !== "sha256") throw new Error("M5 admission decision envelope is invalid");
+  if (!isRecord(decision)) throw new Error("M5 admission decision must be an object");
+  assertExactAllowedFields(decision, DECISION_ENVELOPE_FIELDS, "M5 admission decision");
+  if (decision.schemaVersion !== M5_ADMISSION_DECISION_SCHEMA_VERSION || decision.algorithm !== "sha256") throw new Error("M5 admission decision envelope is invalid");
   if (!isRecord(decision.payload)) throw new Error("M5 admission decision payload is invalid");
-  if (!["INSUFFICIENT_EVIDENCE", "MEASUREMENT_DRIFT", "NOT_ELIGIBLE_FOR_CONTROLLED_EXPERIMENT", "ELIGIBLE_FOR_CONTROLLED_EXPERIMENT"].includes(decision.payload.classification)) throw new Error("M5 admission decision classification is invalid");
-  if (!Array.isArray(decision.payload.reasons) || decision.payload.reasons.length === 0) throw new Error("M5 admission decision requires reasons");
-  if (new Set(decision.payload.reasons).size !== decision.payload.reasons.length) throw new Error("M5 admission decision reasons must be unique");
-  if (stableStringify([...decision.payload.reasons].sort()) !== stableStringify(decision.payload.reasons)) throw new Error("M5 admission decision reasons must be canonically sorted");
+  assertExactAllowedFields(decision.payload, DECISION_PAYLOAD_FIELDS, "M5 admission decision payload");
+  if (!CLASSIFICATIONS.has(decision.payload.classification)) throw new Error("M5 admission decision classification is invalid");
+  for (const [value, label] of [
+    [decision.payload.taxonomyId, "taxonomyId"],
+    [decision.payload.policyId, "policyId"],
+    [decision.payload.policySha256, "policySha256"],
+    [decision.payload.suiteId, "suiteId"],
+    [decision.payload.suiteSha256, "suiteSha256"],
+    [decision.payload.baselineId, "baselineId"],
+    [decision.payload.referenceSubjectId, "referenceSubjectId"],
+    [decision.payload.candidateSubjectId, "candidateSubjectId"],
+    [decision.payload.referenceEvalSummaryId, "referenceEvalSummaryId"],
+    [decision.payload.candidateEvalSummaryId, "candidateEvalSummaryId"],
+  ] as const) prepareIdentity(value, `M5 admission ${label}`);
+  if (decision.payload.referenceExecutionSummaryId !== undefined) prepareIdentity(decision.payload.referenceExecutionSummaryId, "M5 admission referenceExecutionSummaryId");
+  if (decision.payload.candidateExecutionSummaryId !== undefined) prepareIdentity(decision.payload.candidateExecutionSummaryId, "M5 admission candidateExecutionSummaryId");
+  if ((decision.payload.referenceExecutionSummaryId === undefined) !== (decision.payload.candidateExecutionSummaryId === undefined)) throw new Error("M5 admission decision execution summary IDs must be paired");
+  validateReasons(decision.payload.reasons);
+  validateFacts(decision.payload.facts);
+  validateEvalDeltas(decision.payload.evalDeltas);
+  if (decision.payload.executionDeltas !== undefined) validateExecutionDeltas(decision.payload.executionDeltas);
   if (decision.payload.controlledExperimentAutomaticallyAuthorized !== false || decision.payload.productionRoutingMutationAllowed !== false || decision.payload.automaticDispatchAllowed !== false) throw new Error("M5 admission decision cannot grant automatic authority");
   if (decision.payload.experimentAdmissionEligible !== (decision.payload.classification === "ELIGIBLE_FOR_CONTROLLED_EXPERIMENT")) throw new Error("M5 admission eligibility flag does not match classification");
-  validateFacts(decision.payload.facts);
   const expected = await sha256Canonical(decision.payload);
   if (decision.decisionSha256 !== expected) throw new Error("M5 admission decision digest does not match canonical payload");
   if (decision.decisionId !== `m5admit:${expected.slice(0, 32).toLowerCase()}`) throw new Error("M5 admission decisionId does not match canonical payload");
+}
+
+function normalizePolicyPayload(input: M5AdmissionPolicyInput, taxonomyId: string): M5AdmissionPolicyPayload {
+  validatePolicyValues(input);
+  return deepFreeze({
+    name: prepareIdentity(input.name, "M5 admission policy name"),
+    minimumObservationCount: input.minimumObservationCount,
+    requireExecutionReliability: input.requireExecutionReliability,
+    requireFullExecutionProvenance: input.requireFullExecutionProvenance,
+    minimumExecutionSampleCount: input.minimumExecutionSampleCount,
+    minimumDecidedExecutionSampleCount: input.minimumDecidedExecutionSampleCount,
+    minimumLatencyCoverageRatio: input.minimumLatencyCoverageRatio,
+    minimumCostCoverageRatio: input.minimumCostCoverageRatio,
+    maximumCoverageRegressionRatio: input.maximumCoverageRegressionRatio,
+    maximumWeightedScoreMeanRegression: input.maximumWeightedScoreMeanRegression,
+    maximumTaskPassRateMeanRegression: input.maximumTaskPassRateMeanRegression,
+    maximumCriticalPassRateMeanRegression: input.maximumCriticalPassRateMeanRegression,
+    maximumBaselinePassRateRegression: input.maximumBaselinePassRateRegression,
+    maximumExecutionSuccessRateRegression: input.maximumExecutionSuccessRateRegression,
+    maximumCancellationRateIncrease: input.maximumCancellationRateIncrease,
+    maximumLatencyMeanIncreaseMs: input.maximumLatencyMeanIncreaseMs,
+    maximumCostMeanIncreaseUsd: input.maximumCostMeanIncreaseUsd,
+    taxonomyId: prepareIdentity(taxonomyId, "M5 admission taxonomyId"),
+  });
+}
+
+function validatePolicyValues(input: M5AdmissionPolicyInput): void {
+  assertPositiveInteger(input.minimumObservationCount, "minimumObservationCount");
+  assertBoolean(input.requireExecutionReliability, "requireExecutionReliability");
+  assertBoolean(input.requireFullExecutionProvenance, "requireFullExecutionProvenance");
+  assertNonNegativeInteger(input.minimumExecutionSampleCount, "minimumExecutionSampleCount");
+  assertNonNegativeInteger(input.minimumDecidedExecutionSampleCount, "minimumDecidedExecutionSampleCount");
+  for (const [label, value] of [
+    ["minimumLatencyCoverageRatio", input.minimumLatencyCoverageRatio],
+    ["minimumCostCoverageRatio", input.minimumCostCoverageRatio],
+    ["maximumCoverageRegressionRatio", input.maximumCoverageRegressionRatio],
+    ["maximumWeightedScoreMeanRegression", input.maximumWeightedScoreMeanRegression],
+    ["maximumTaskPassRateMeanRegression", input.maximumTaskPassRateMeanRegression],
+    ["maximumCriticalPassRateMeanRegression", input.maximumCriticalPassRateMeanRegression],
+    ["maximumBaselinePassRateRegression", input.maximumBaselinePassRateRegression],
+    ["maximumExecutionSuccessRateRegression", input.maximumExecutionSuccessRateRegression],
+    ["maximumCancellationRateIncrease", input.maximumCancellationRateIncrease],
+  ] as const) assertRatio(value, label);
+  if (input.maximumLatencyMeanIncreaseMs !== undefined) assertNonNegativeNumber(input.maximumLatencyMeanIncreaseMs, "maximumLatencyMeanIncreaseMs");
+  if (input.maximumCostMeanIncreaseUsd !== undefined) assertNonNegativeNumber(input.maximumCostMeanIncreaseUsd, "maximumCostMeanIncreaseUsd");
+  if (input.requireFullExecutionProvenance && !input.requireExecutionReliability) throw new Error("requireFullExecutionProvenance requires requireExecutionReliability");
+  if (input.requireExecutionReliability && input.minimumExecutionSampleCount === 0) throw new Error("requireExecutionReliability requires minimumExecutionSampleCount > 0");
+  if (input.requireExecutionReliability && input.minimumDecidedExecutionSampleCount === 0) throw new Error("requireExecutionReliability requires minimumDecidedExecutionSampleCount > 0");
+  const usesEfficiencyEvidence = input.minimumLatencyCoverageRatio > 0
+    || input.minimumCostCoverageRatio > 0
+    || input.maximumLatencyMeanIncreaseMs !== undefined
+    || input.maximumCostMeanIncreaseUsd !== undefined;
+  if (usesEfficiencyEvidence && !input.requireFullExecutionProvenance) throw new Error("Efficiency admission metrics require full canonical execution provenance");
 }
 
 function collectInsufficiencyReasons(
@@ -260,7 +403,7 @@ function collectInsufficiencyReasons(
   }
   if (policy.maximumLatencyMeanIncreaseMs !== undefined && evalComparison.payload.deltas.latencyMeanMs === null) reasons.push("latency_delta_unavailable_for_configured_guardrail");
   if (policy.maximumCostMeanIncreaseUsd !== undefined && evalComparison.payload.deltas.costMeanUsd === null) reasons.push("cost_delta_unavailable_for_configured_guardrail");
-  if ((policy.maximumExecutionSuccessRateRegression > 0 || policy.maximumCancellationRateIncrease > 0 || policy.requireExecutionReliability) && !executionComparison) reasons.push("execution_delta_unavailable_for_configured_guardrail");
+  if (policy.requireExecutionReliability && !executionComparison) reasons.push("execution_delta_unavailable_for_configured_guardrail");
   return reasons;
 }
 
@@ -286,11 +429,18 @@ function collectPerformanceRegressionReasons(
   if (policy.maximumLatencyMeanIncreaseMs !== undefined && deltas.latencyMeanMs !== null && deltas.latencyMeanMs > policy.maximumLatencyMeanIncreaseMs) reasons.push("latency_mean_increased_beyond_guardrail");
   if (policy.maximumCostMeanIncreaseUsd !== undefined && deltas.costMeanUsd !== null && deltas.costMeanUsd > policy.maximumCostMeanIncreaseUsd) reasons.push("cost_mean_increased_beyond_guardrail");
   if (executionComparison) {
-    const executionDeltas = executionComparison.payload.deltas;
-    if (executionDeltas.successRateExcludingCancelled !== null && executionDeltas.successRateExcludingCancelled < -policy.maximumExecutionSuccessRateRegression) reasons.push("execution_success_rate_regressed_beyond_guardrail");
-    if (executionDeltas.cancellationRate > policy.maximumCancellationRateIncrease) reasons.push("cancellation_rate_increased_beyond_guardrail");
+    const execution = executionComparison.payload.deltas;
+    if (execution.successRateExcludingCancelled !== null && execution.successRateExcludingCancelled < -policy.maximumExecutionSuccessRateRegression) reasons.push("execution_success_rate_regressed_beyond_guardrail");
+    if (execution.cancellationRate > policy.maximumCancellationRateIncrease) reasons.push("cancellation_rate_increased_beyond_guardrail");
   }
   return reasons;
+}
+
+function chooseClassification(insufficient: readonly string[], drift: readonly string[], performance: readonly string[]): M5AdmissionClassification {
+  if (insufficient.length > 0) return "INSUFFICIENT_EVIDENCE";
+  if (drift.length > 0) return "MEASUREMENT_DRIFT";
+  if (performance.length > 0) return "NOT_ELIGIBLE_FOR_CONTROLLED_EXPERIMENT";
+  return "ELIGIBLE_FOR_CONTROLLED_EXPERIMENT";
 }
 
 function buildFacts(reference: M5AdmissionCohortInput, candidate: M5AdmissionCohortInput): M5AdmissionEvidenceFacts {
@@ -317,51 +467,49 @@ function buildFacts(reference: M5AdmissionCohortInput, candidate: M5AdmissionCoh
 function assertExecutionSummaryMatchesEval(evalSummary: EvalCohortSummary, executionSummary: ExecutionReliabilitySummary, label: string): void {
   const evalPayload = evalSummary.payload;
   const executionPayload = executionSummary.payload;
-  if (executionPayload.suiteId !== evalPayload.suiteId || executionPayload.suiteSha256 !== evalPayload.suiteSha256 || executionPayload.baselineId !== evalPayload.baselineId || executionPayload.subjectId !== evalPayload.subjectId) {
-    throw new Error(`M5 admission ${label} execution summary identity does not match eval summary`);
-  }
+  if (executionPayload.suiteId !== evalPayload.suiteId || executionPayload.suiteSha256 !== evalPayload.suiteSha256 || executionPayload.baselineId !== evalPayload.baselineId || executionPayload.subjectId !== evalPayload.subjectId) throw new Error(`M5 admission ${label} execution summary identity does not match eval summary`);
   const evalIds = new Set(evalPayload.observationIds);
   if (executionPayload.observationIds.some((id) => !evalIds.has(id))) throw new Error(`M5 admission ${label} execution summary references observations outside eval cohort`);
 }
 
-function validatePolicyInput(input: M5AdmissionPolicyInput | M5AdmissionPolicyPayload): void {
-  if (!isRecord(input)) throw new Error("M5 admission policy input must be an object");
-  prepareIdentity(input.name, "M5 admission policy name");
-  assertPositiveInteger(input.minimumObservationCount, "minimumObservationCount");
-  assertBoolean(input.requireExecutionReliability, "requireExecutionReliability");
-  assertBoolean(input.requireFullExecutionProvenance, "requireFullExecutionProvenance");
-  assertNonNegativeInteger(input.minimumExecutionSampleCount, "minimumExecutionSampleCount");
-  assertNonNegativeInteger(input.minimumDecidedExecutionSampleCount, "minimumDecidedExecutionSampleCount");
-  for (const [label, value] of [
-    ["minimumLatencyCoverageRatio", input.minimumLatencyCoverageRatio],
-    ["minimumCostCoverageRatio", input.minimumCostCoverageRatio],
-    ["maximumCoverageRegressionRatio", input.maximumCoverageRegressionRatio],
-    ["maximumWeightedScoreMeanRegression", input.maximumWeightedScoreMeanRegression],
-    ["maximumTaskPassRateMeanRegression", input.maximumTaskPassRateMeanRegression],
-    ["maximumCriticalPassRateMeanRegression", input.maximumCriticalPassRateMeanRegression],
-    ["maximumBaselinePassRateRegression", input.maximumBaselinePassRateRegression],
-    ["maximumExecutionSuccessRateRegression", input.maximumExecutionSuccessRateRegression],
-    ["maximumCancellationRateIncrease", input.maximumCancellationRateIncrease],
-  ] as const) assertRatio(value, label);
-  if (input.maximumLatencyMeanIncreaseMs !== undefined) assertNonNegativeNumber(input.maximumLatencyMeanIncreaseMs, "maximumLatencyMeanIncreaseMs");
-  if (input.maximumCostMeanIncreaseUsd !== undefined) assertNonNegativeNumber(input.maximumCostMeanIncreaseUsd, "maximumCostMeanIncreaseUsd");
-  if (input.requireFullExecutionProvenance && !input.requireExecutionReliability) throw new Error("requireFullExecutionProvenance requires requireExecutionReliability");
-  if (input.requireExecutionReliability && input.minimumExecutionSampleCount === 0) throw new Error("requireExecutionReliability requires minimumExecutionSampleCount > 0");
-  if (input.requireExecutionReliability && input.minimumDecidedExecutionSampleCount === 0) throw new Error("requireExecutionReliability requires minimumDecidedExecutionSampleCount > 0");
+function validateReasons(reasons: readonly string[]): void {
+  if (!Array.isArray(reasons) || reasons.length === 0) throw new Error("M5 admission decision requires reasons");
+  if (new Set(reasons).size !== reasons.length) throw new Error("M5 admission decision reasons must be unique");
+  if (stableStringify([...reasons].sort()) !== stableStringify(reasons)) throw new Error("M5 admission decision reasons must be canonically sorted");
+  for (const reason of reasons) prepareIdentity(reason, "M5 admission reason");
 }
 
 function validateFacts(facts: M5AdmissionEvidenceFacts): void {
   if (!isRecord(facts)) throw new Error("M5 admission evidence facts are invalid");
+  assertExactAllowedFields(facts, FACT_FIELDS, "M5 admission evidence facts");
   for (const value of [facts.referenceObservationCount, facts.candidateObservationCount]) if (!Number.isInteger(value) || value <= 0) throw new Error("M5 admission observation counts are invalid");
   for (const value of [facts.referenceExecutionSampleCount, facts.candidateExecutionSampleCount, facts.referenceDecidedExecutionSampleCount, facts.candidateDecidedExecutionSampleCount]) if (!Number.isInteger(value) || value < 0) throw new Error("M5 admission execution counts are invalid");
   for (const value of [facts.referenceExecutionCoverageRatio, facts.candidateExecutionCoverageRatio, facts.referenceLatencyCoverageRatio, facts.candidateLatencyCoverageRatio, facts.referenceCostCoverageRatio, facts.candidateCostCoverageRatio]) assertRatio(value, "M5 admission coverage ratio");
 }
 
+function validateEvalDeltas(value: EvalCohortComparison["payload"]["deltas"]): void {
+  if (!isRecord(value)) throw new Error("M5 admission eval deltas are invalid");
+  assertExactAllowedFields(value, EVAL_DELTA_FIELDS, "M5 admission eval deltas");
+  for (const delta of [value.weightedScoreMean, value.taskPassRateMean, value.criticalPassRateMean, value.baselinePassRate]) assertFiniteNumber(delta, "M5 admission eval delta");
+  if (value.latencyMeanMs !== null) assertFiniteNumber(value.latencyMeanMs, "M5 admission latency delta");
+  if (value.costMeanUsd !== null) assertFiniteNumber(value.costMeanUsd, "M5 admission cost delta");
+}
+
+function validateExecutionDeltas(value: ExecutionReliabilityComparison["payload"]["deltas"]): void {
+  if (!isRecord(value)) throw new Error("M5 admission execution deltas are invalid");
+  assertExactAllowedFields(value, EXECUTION_DELTA_FIELDS, "M5 admission execution deltas");
+  if (value.successRateExcludingCancelled !== null) assertFiniteNumber(value.successRateExcludingCancelled, "M5 admission execution success delta");
+  if (value.failureRateExcludingCancelled !== null) assertFiniteNumber(value.failureRateExcludingCancelled, "M5 admission execution failure delta");
+  assertFiniteNumber(value.cancellationRate, "M5 admission cancellation delta");
+}
+
 function sameIdentitySet(left: readonly string[], right: readonly string[]): boolean {
   if (left.length !== right.length) return false;
-  const leftSorted = [...left].sort();
-  const rightSorted = [...right].sort();
-  return stableStringify(leftSorted) === stableStringify(rightSorted);
+  return stableStringify([...left].sort()) === stableStringify([...right].sort());
+}
+
+function assertExactAllowedFields(value: Record<string, unknown>, allowed: ReadonlySet<string>, label: string): void {
+  for (const field of Object.keys(value)) if (!allowed.has(field)) throw new Error(`${label} contains unknown field: ${field}`);
 }
 
 function prepareIdentity(value: unknown, label: string): string {
@@ -387,6 +535,10 @@ function assertRatio(value: number, label: string): void {
 
 function assertNonNegativeNumber(value: number, label: string): void {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error(`${label} must be finite and non-negative`);
+}
+
+function assertFiniteNumber(value: number, label: string): void {
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${label} must be finite`);
 }
 
 function assertBoolean(value: boolean, label: string): void {
