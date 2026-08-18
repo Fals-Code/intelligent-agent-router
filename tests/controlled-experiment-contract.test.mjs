@@ -8,9 +8,9 @@ import {
   verifyControlledExperimentDefinition,
 } from "../dist/index.js";
 import {
-  approvedExperimentWorkflow,
   authorizationInput,
   controlledExperimentFixture,
+  durableApprovedExperimentWorkflow,
   experimentDefinitionInput,
 } from "./controlled-experiment-fixture.mjs";
 
@@ -50,10 +50,12 @@ test("controlled experiment definition rejects non-eligible admission and unsafe
   );
 });
 
-test("controlled experiment authorization binds exact experiment to approved workflow approvals", async (t) => {
-  const { admissionDecision } = await controlledExperimentFixture(t);
+test("controlled experiment authorization binds exact experiment to durable approved workflow approvals", async (t) => {
+  const { root, admissionDecision } = await controlledExperimentFixture(t);
   const experiment = await prepareControlledExperimentDefinition(admissionDecision, experimentDefinitionInput());
-  const workflow = approvedExperimentWorkflow();
+  const { run: workflow, store } = await durableApprovedExperimentWorkflow(root);
+  assert.equal(store.get(workflow.id)?.phase, "publish");
+  assert.deepEqual(store.get(workflow.id)?.approvalIds, ["approval:controlled-experiment-1"]);
   const authorization = await prepareControlledExperimentAuthorization(experiment, admissionDecision, workflow, authorizationInput());
   await verifyControlledExperimentAuthorization(authorization, experiment, admissionDecision, workflow);
   assert.equal(authorization.payload.experimentContractAuthorized, true);
@@ -73,38 +75,38 @@ test("controlled experiment authorization binds exact experiment to approved wor
 });
 
 test("controlled experiment allow authorization fails closed on approval, workflow, and experiment drift", async (t) => {
-  const { admissionDecision } = await controlledExperimentFixture(t);
+  const { root, admissionDecision } = await controlledExperimentFixture(t);
   const experiment = await prepareControlledExperimentDefinition(admissionDecision, experimentDefinitionInput());
-  const workflow = approvedExperimentWorkflow();
+  const { run: workflow } = await durableApprovedExperimentWorkflow(root);
   await assert.rejects(
     () => prepareControlledExperimentAuthorization(experiment, admissionDecision, workflow, authorizationInput({ approvalIds: ["approval:forged"] })),
     /approvalIds do not match durable WorkflowRun approvals/,
   );
   await assert.rejects(
-    () => prepareControlledExperimentAuthorization(experiment, admissionDecision, approvedExperimentWorkflow({ phase: "approval", status: "waiting_approval" }), authorizationInput()),
+    () => prepareControlledExperimentAuthorization(experiment, admissionDecision, { ...workflow, phase: "approval", status: "waiting_approval" }, authorizationInput()),
     /requires workflow phase=publish/,
   );
   await assert.rejects(
-    () => prepareControlledExperimentAuthorization(experiment, admissionDecision, approvedExperimentWorkflow({ projectId: "other-project" }), authorizationInput()),
+    () => prepareControlledExperimentAuthorization(experiment, admissionDecision, { ...workflow, projectId: "other-project" }, authorizationInput()),
     /workflow projectId does not match/,
   );
   const denied = await prepareControlledExperimentAuthorization(
     experiment,
     admissionDecision,
-    approvedExperimentWorkflow({ approvalIds: [] }),
+    { ...workflow, approvalIds: [] },
     authorizationInput({ decision: "deny", approvalIds: [] }),
   );
   assert.equal(denied.payload.experimentContractAuthorized, false);
 });
 
 test("controlled experiment definition, authorization, and evidence conversion are structurally fail closed", async (t) => {
-  const { admissionDecision } = await controlledExperimentFixture(t);
+  const { root, admissionDecision } = await controlledExperimentFixture(t);
   await assert.rejects(
     () => prepareControlledExperimentDefinition(admissionDecision, { ...experimentDefinitionInput(), unexpected: true }),
     /unexpected is not allowed/,
   );
   const experiment = await prepareControlledExperimentDefinition(admissionDecision, experimentDefinitionInput());
-  const workflow = approvedExperimentWorkflow();
+  const { run: workflow } = await durableApprovedExperimentWorkflow(root);
   const authorization = await prepareControlledExperimentAuthorization(experiment, admissionDecision, workflow, authorizationInput());
   const tamperedExperiment = { ...experiment, payload: { ...experiment.payload, automaticDispatchAllowed: true } };
   await assert.rejects(() => verifyControlledExperimentDefinition(tamperedExperiment, admissionDecision), /cannot grant automatic authority|digest does not match/);
