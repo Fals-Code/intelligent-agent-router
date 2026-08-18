@@ -6,3 +6,5 @@ export * from "./execution-metrics-projection.js";
 export * from "./execution-reliability-statistics.js";
 export * from "./metric-taxonomy.js";
 export * from "./m5-admission-gate.js";
+export * from "./controlled-experiment.js";
+export * from "./controlled-experiment-guardrails.js";
