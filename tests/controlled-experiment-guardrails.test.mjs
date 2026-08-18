@@ -8,17 +8,17 @@ import {
   verifyControlledExperimentGuardrailDecision,
 } from "../dist/index.js";
 import {
-  approvedExperimentWorkflow,
   authorizationInput,
   buildExperimentCohort,
   controlledExperimentFixture,
+  durableApprovedExperimentWorkflow,
   experimentDefinitionInput,
 } from "./controlled-experiment-fixture.mjs";
 
 async function experimentContext(t, definitionOverrides = {}) {
   const fixture = await controlledExperimentFixture(t);
   const experiment = await prepareControlledExperimentDefinition(fixture.admissionDecision, experimentDefinitionInput(definitionOverrides));
-  const workflow = approvedExperimentWorkflow({ riskClass: experiment.payload.riskClass });
+  const { run: workflow } = await durableApprovedExperimentWorkflow(fixture.root, { riskClass: experiment.payload.riskClass });
   const authorization = await prepareControlledExperimentAuthorization(experiment, fixture.admissionDecision, workflow, authorizationInput());
   return { ...fixture, experiment, workflow, authorization };
 }
