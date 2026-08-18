@@ -186,3 +186,26 @@ test("execution reliability summary rejects projection/history/ledger identity d
     /digest does not match canonical payload|must reference exactly one execution metric projection/,
   );
 });
+
+test("execution reliability rejects a valid projection whose metric value came from a different Run Ledger sample", async (t) => {
+  const { report, baseline, history, projector } = await fixture(t);
+  const canonicalRecord = runRecord("run-metric-provenance", "succeeded", 100);
+  const fabricatedMetricSource = { ...canonicalRecord, resourceMetrics: { "runtime.total_ms": 999 } };
+  const projection = await projector.project(fabricatedMetricSource);
+  const measurement = await executionProjectionToEvalMeasurement(projection);
+  const observation = await history.append({
+    observedAt: "2026-08-18T09:30:00.000Z",
+    report,
+    baseline,
+    measurement,
+  });
+
+  await assert.rejects(
+    () => buildExecutionReliabilitySummary([observation], [projection], [canonicalRecord]),
+    /metric does not match canonical Run Ledger resourceMetrics/,
+  );
+  await assert.rejects(
+    () => buildExecutionReliabilitySummary([observation], [projection, projection], [fabricatedMetricSource]),
+    /duplicate projection IDs/,
+  );
+});
