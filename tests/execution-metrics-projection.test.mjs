@@ -111,7 +111,7 @@ test("execution metric projector fails closed on missing required metrics, negat
   await assert.rejects(() => projector.project(ledgerRecord), /requires terminal observability evidence/);
 
   const missingCost = { ...ledgerRecord, resourceMetrics: { "runtime.total_ms": 420 } };
-  await assert.rejects(() => projector.project(missingCost, terminalEventFor(missingCost)), /missing required cost metric/);
+  await assert.rejects(() => projector.project(missingCost, await terminalEventFor(missingCost)), /missing required cost metric/);
 
   const negativeCost = record({ costUsd: -0.01 });
   await assert.rejects(() => projector.project(negativeCost, await terminalEventFor(negativeCost)), /must be finite and non-negative/);
