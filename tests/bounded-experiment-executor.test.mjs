@@ -48,13 +48,14 @@ async function executorContext(t, definitionOverrides = {}) {
   const { run: workflow } = await durableApprovedExperimentWorkflow(fixture.root, { riskClass: experiment.payload.riskClass });
   const authorization = await prepareControlledExperimentAuthorization(experiment, fixture.admissionDecision, workflow, authorizationInput());
   const journalPath = join(fixture.root, "bounded-executor.jsonl");
-  const journal = await JsonlControlledExperimentExecutionJournal.open({
+  const journalOptions = {
     filePath: journalPath,
     experimentId: experiment.experimentId,
     maxFileBytes: 2 * 1024 * 1024,
     maxEventBytes: 64 * 1024,
     maxStringBytes: 2048,
-  });
+  };
+  const journal = await JsonlControlledExperimentExecutionJournal.open(journalOptions);
   const adapter = new FakeExperimentAdapter();
   const executor = new BoundedExperimentExecutor(journal, adapter, { maxStringBytes: 2048, now: () => "2026-08-19T00:11:00.000Z" });
   const reference = await buildExperimentCohort({
@@ -77,7 +78,7 @@ async function executorContext(t, definitionOverrides = {}) {
     costBase: 0.06,
     minuteBase: 140,
   });
-  return { ...fixture, experiment, workflow, authorization, journal, journalPath, adapter, executor, progressReference: reference, progressCandidate: candidate };
+  return { ...fixture, experiment, workflow, authorization, journal, journalPath, journalOptions, adapter, executor, progressReference: reference, progressCandidate: candidate };
 }
 
 async function progress(ctx, count, observedAt = "2026-08-19T00:20:00.000Z") {
@@ -202,19 +203,34 @@ test("adapter failure records unknown side effect and permanently blocks automat
   assert.deepEqual(state.unresolvedSampleIds, ["uncertain-1"]);
   assert.deepEqual(state.dispatchErrorSampleIds, ["uncertain-1"]);
   assert.equal(state.automaticRedispatchAllowed, false);
-  const serialized = JSON.stringify(ctx.journal.list());
-  assert.doesNotMatch(serialized, /super-secret-value/);
+  assert.doesNotMatch(JSON.stringify(ctx.journal.list()), /super-secret-value/);
 
-  const reopened = await JsonlControlledExperimentExecutionJournal.open({
-    filePath: ctx.journalPath,
-    experimentId: ctx.experiment.experimentId,
-    maxFileBytes: 2 * 1024 * 1024,
-    maxEventBytes: 64 * 1024,
-    maxStringBytes: 2048,
-  });
+  const reopened = await JsonlControlledExperimentExecutionJournal.open(ctx.journalOptions);
   const executor = new BoundedExperimentExecutor(reopened, ctx.adapter, { maxStringBytes: 2048 });
   await assert.rejects(
     () => executor.dispatchSample(dispatchInput({ ...ctx, executor }, "uncertain-2", "shadow", "none")),
+    /manual reconciliation is required before any new dispatch/,
+  );
+});
+
+test("accepted adapter dispatch with failed durable dispatch persistence remains manual-reconciliation only", async (t) => {
+  const ctx = await executorContext(t);
+  ctx.journal.recordDispatch = async () => {
+    throw new Error("synthetic durable dispatch persistence failure");
+  };
+  await assert.rejects(
+    () => ctx.executor.dispatchSample(dispatchInput(ctx, "accepted-but-unpersisted", "shadow", "none")),
+    /adapter accepted sample accepted-but-unpersisted.*external side effect may have occurred.*manual reconciliation is required.*automatic redispatch is forbidden/,
+  );
+  assert.equal(ctx.adapter.requests.length, 1);
+
+  const reopened = await JsonlControlledExperimentExecutionJournal.open(ctx.journalOptions);
+  assert.deepEqual(reopened.inspect().unresolvedSampleIds, ["accepted-but-unpersisted"]);
+  assert.equal(reopened.latest("accepted-but-unpersisted").payload.eventType, "sample_reserved");
+  await assert.rejects(
+    () => new BoundedExperimentExecutor(reopened, ctx.adapter, { maxStringBytes: 2048 }).dispatchSample(
+      dispatchInput(ctx, "accepted-but-unpersisted-2", "shadow", "none"),
+    ),
     /manual reconciliation is required before any new dispatch/,
   );
 });
