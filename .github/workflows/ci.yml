@@ -39,7 +39,9 @@ jobs:
           node --check scripts/run-reference-shadow-runtime-slice.mjs
           node --check scripts/shadow-runtime-slice-policy.mjs
       - name: Validate end-to-end shadow provenance script syntax
-        run: node --check scripts/run-end-to-end-shadow-executor-provenance.mjs
+        run: |
+          node --check scripts/run-end-to-end-shadow-executor-provenance.mjs
+          node --check scripts/verify-end-to-end-shadow-runtime-binding-seal.mjs
       - name: Validate Windows preflight PowerShell syntax
         if: runner.os == 'Windows'
         shell: powershell
