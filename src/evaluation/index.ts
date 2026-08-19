@@ -9,3 +9,6 @@ export * from "./m5-admission-gate.js";
 export * from "./controlled-experiment.js";
 export * from "./controlled-experiment-guardrails.js";
 export * from "./controlled-experiment-evidence.js";
+export * from "./controlled-experiment-execution-adapter.js";
+export * from "./controlled-experiment-execution-journal.js";
+export * from "./bounded-experiment-executor.js";
