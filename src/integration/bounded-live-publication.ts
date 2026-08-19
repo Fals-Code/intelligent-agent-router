@@ -2,6 +2,7 @@ import type { RunLedgerRecord } from "../control-plane/contracts.js";
 import type { BoundedLiveAssignment, BoundedLiveSampleAuthorization } from "../evaluation/bounded-live-sample-authorization.js";
 import { verifyBoundedLiveSampleAuthorizationEnvelope } from "../evaluation/bounded-live-sample-authorization.js";
 import type { RuntimeBinding } from "../reconciliation/runtime-reconciliation.js";
+import type { JsonlBoundedLiveSideEffectJournal } from "./bounded-live-side-effect-journal.js";
 
 export const VERIFIED_BOUNDED_LIVE_RUNTIME_RESULT_SCHEMA_VERSION = 1 as const;
 export const BOUNDED_LIVE_PUBLICATION_RECEIPT_SCHEMA_VERSION = 1 as const;
@@ -83,6 +84,8 @@ export interface BoundedLivePublicationReceiptPayload {
   readonly sinkId: string;
   readonly publicationReference: string;
   readonly publicationIdempotencyKey: string;
+  readonly sideEffectOperationId: string;
+  readonly sideEffectCommitEventId: string;
   readonly outputSha256: string;
   readonly outputBytes: number;
   readonly verifiedAt: string;
@@ -111,13 +114,9 @@ export async function prepareVerifiedBoundedLiveRuntimeResult(input: VerifiedBou
   if (input.run.runId !== input.binding.workflowRunId || input.run.projectId !== input.binding.projectId || input.run.runtimeId !== input.binding.runtimeId) {
     throw new Error("Bounded-live runtime result Run Ledger identity does not match durable RuntimeBinding");
   }
-  if (normalizePath(input.run.workspace) !== normalizePath(input.binding.workspace)) {
-    throw new Error("Bounded-live runtime result Run Ledger workspace does not match durable RuntimeBinding");
-  }
+  if (normalizePath(input.run.workspace) !== normalizePath(input.binding.workspace)) throw new Error("Bounded-live runtime result Run Ledger workspace does not match durable RuntimeBinding");
   if (input.run.projectId !== authorization.payload.projectId) throw new Error("Bounded-live runtime result projectId does not match sample authorization");
-  if (!input.run.modelRoute.includes(authorization.payload.selectedSubjectId)) {
-    throw new Error("Bounded-live Run Ledger modelRoute does not contain the authorized selected subject");
-  }
+  if (!input.run.modelRoute.includes(authorization.payload.selectedSubjectId)) throw new Error("Bounded-live Run Ledger modelRoute does not contain the authorized selected subject");
   if (!Number.isInteger(input.binding.workflowAttempt) || input.binding.workflowAttempt <= 0) throw new Error("Bounded-live RuntimeBinding workflowAttempt is invalid");
   prepareIdentity(input.binding.sessionId, "Bounded-live RuntimeBinding sessionId");
   const verificationReference = prepareIdentity(input.verificationReference, "Bounded-live verification reference");
@@ -126,9 +125,7 @@ export async function prepareVerifiedBoundedLiveRuntimeResult(input: VerifiedBou
   const outputSha256 = prepareSha256(input.outputSha256, "Bounded-live outputSha256");
   if (!Number.isInteger(input.outputBytes) || input.outputBytes <= 0) throw new Error("Bounded-live outputBytes must be a positive integer");
   const verifiedAt = prepareTimestamp(input.verifiedAt, "Bounded-live verifiedAt");
-  if (Date.parse(verifiedAt) < Date.parse(authorization.payload.approvedAt)) {
-    throw new Error("Bounded-live runtime verification cannot predate sample authorization approval");
-  }
+  if (Date.parse(verifiedAt) < Date.parse(authorization.payload.approvedAt)) throw new Error("Bounded-live runtime verification cannot predate sample authorization approval");
   const payload: VerifiedBoundedLiveRuntimeResultPayload = deepFreeze({
     sampleAuthorizationId: authorization.authorizationId,
     sampleAuthorizationSha256: authorization.authorizationSha256,
@@ -151,45 +148,35 @@ export async function prepareVerifiedBoundedLiveRuntimeResult(input: VerifiedBou
     productionRoutingMutationAllowed: false as const,
   });
   const resultSha256 = await sha256Canonical(payload);
-  return deepFreeze({
-    schemaVersion: VERIFIED_BOUNDED_LIVE_RUNTIME_RESULT_SCHEMA_VERSION,
-    algorithm: "sha256" as const,
-    resultId: `m5liveresult:${resultSha256.slice(0, 32).toLowerCase()}`,
-    resultSha256,
-    payload,
-  });
+  return deepFreeze({ schemaVersion: VERIFIED_BOUNDED_LIVE_RUNTIME_RESULT_SCHEMA_VERSION, algorithm: "sha256" as const, resultId: `m5liveresult:${resultSha256.slice(0, 32).toLowerCase()}`, resultSha256, payload });
 }
 
 export async function verifyVerifiedBoundedLiveRuntimeResultEnvelope(result: VerifiedBoundedLiveRuntimeResult): Promise<void> {
-  if (!result || typeof result !== "object" || result.schemaVersion !== VERIFIED_BOUNDED_LIVE_RUNTIME_RESULT_SCHEMA_VERSION || result.algorithm !== "sha256") {
-    throw new Error("Bounded-live runtime result envelope is invalid");
-  }
+  if (!result || typeof result !== "object" || result.schemaVersion !== VERIFIED_BOUNDED_LIVE_RUNTIME_RESULT_SCHEMA_VERSION || result.algorithm !== "sha256") throw new Error("Bounded-live runtime result envelope is invalid");
   const payload = result.payload;
   if (!payload || typeof payload !== "object") throw new Error("Bounded-live runtime result payload is invalid");
   if (payload.role !== "reference" && payload.role !== "candidate") throw new Error("Bounded-live runtime result role is invalid");
-  if (payload.runLedgerOutcome !== "succeeded" || payload.rawOutputPersisted !== false || payload.productionRoutingMutationAllowed !== false) {
-    throw new Error("Bounded-live runtime result safety flags are invalid");
-  }
+  if (payload.runLedgerOutcome !== "succeeded" || payload.rawOutputPersisted !== false || payload.productionRoutingMutationAllowed !== false) throw new Error("Bounded-live runtime result safety flags are invalid");
   if (payload.candidateOutputMayBeExternallyVisible !== (payload.role === "candidate")) throw new Error("Bounded-live runtime result candidate visibility flag mismatch");
   prepareSha256(payload.outputSha256, "Bounded-live runtime result outputSha256");
   if (!Number.isInteger(payload.outputBytes) || payload.outputBytes <= 0) throw new Error("Bounded-live runtime result outputBytes is invalid");
   prepareTimestamp(payload.verifiedAt, "Bounded-live runtime result verifiedAt");
   const expected = await sha256Canonical(payload);
-  if (result.resultSha256 !== expected || result.resultId !== `m5liveresult:${expected.slice(0, 32).toLowerCase()}`) {
-    throw new Error("Bounded-live runtime result digest is invalid");
-  }
+  if (result.resultSha256 !== expected || result.resultId !== `m5liveresult:${expected.slice(0, 32).toLowerCase()}`) throw new Error("Bounded-live runtime result digest is invalid");
 }
 
 export async function verifyVerifiedBoundedLiveRuntimeResult(result: VerifiedBoundedLiveRuntimeResult, input: VerifiedBoundedLiveRuntimeResultInput): Promise<void> {
   await verifyVerifiedBoundedLiveRuntimeResultEnvelope(result);
   const expected = await prepareVerifiedBoundedLiveRuntimeResult(input);
-  if (result.resultId !== expected.resultId || result.resultSha256 !== expected.resultSha256 || stableStringify(result.payload) !== stableStringify(expected.payload)) {
-    throw new Error("Bounded-live runtime result does not match authoritative sources");
-  }
+  if (result.resultId !== expected.resultId || result.resultSha256 !== expected.resultSha256 || stableStringify(result.payload) !== stableStringify(expected.payload)) throw new Error("Bounded-live runtime result does not match authoritative sources");
 }
 
 export class BoundedLivePublicationCoordinator {
-  constructor(private readonly reader: BoundedLiveOutputReader, private readonly sink: BoundedLivePublicationSink) {
+  constructor(
+    private readonly reader: BoundedLiveOutputReader,
+    private readonly sink: BoundedLivePublicationSink,
+    private readonly sideEffects: JsonlBoundedLiveSideEffectJournal,
+  ) {
     prepareIdentity(sink.id, "Bounded-live publication sink id");
   }
 
@@ -204,38 +191,49 @@ export class BoundedLivePublicationCoordinator {
       || runtimeResult.payload.selectedSubjectId !== authorization.payload.selectedSubjectId) {
       throw new Error("Bounded-live publication runtime result does not match exact sample authorization");
     }
-    if (authorization.payload.automaticDispatchAllowed !== false || authorization.payload.automaticRedispatchAllowed !== false
-      || authorization.payload.productionRoutingMutationAllowed !== false || authorization.payload.automaticRollbackAllowed !== false) {
-      throw new Error("Bounded-live sample authorization unexpectedly grants automatic or production-routing authority");
-    }
 
     const output = await this.reader.read({ runtimeId: runtimeResult.payload.runtimeId, sessionId: runtimeResult.payload.sessionId, runId: runtimeResult.payload.runId });
     if (typeof output !== "string" || output.length === 0) throw new Error("Bounded-live output reader returned empty output");
     const outputBytes = utf8ByteLength(output);
     const outputSha256 = await sha256Text(output);
-    if (outputBytes !== runtimeResult.payload.outputBytes || outputSha256 !== runtimeResult.payload.outputSha256) {
-      throw new Error("Bounded-live ephemeral output does not match verified runtime result hash/size");
-    }
+    if (outputBytes !== runtimeResult.payload.outputBytes || outputSha256 !== runtimeResult.payload.outputSha256) throw new Error("Bounded-live ephemeral output does not match verified runtime result hash/size");
 
     const idempotencyKey = `${authorization.authorizationId}:${runtimeResult.resultId}`;
+    const operationId = `publication:${authorization.authorizationId}:${runtimeResult.resultId}`;
+    await this.sideEffects.reserve({
+      kind: "publication",
+      operationId,
+      idempotencyKey,
+      sinkId: this.sink.id,
+      authorityId: authorization.authorizationId,
+      subjectId: authorization.payload.selectedSubjectId,
+      sampleId: authorization.payload.sampleId,
+      outputSha256,
+      reservedAt: runtimeResult.payload.verifiedAt,
+    });
+
     let sinkReceipt: Awaited<ReturnType<BoundedLivePublicationSink["publish"]>>;
     try {
-      sinkReceipt = await this.sink.publish({
-        idempotencyKey,
-        sampleAuthorizationId: authorization.authorizationId,
-        sampleId: authorization.payload.sampleId,
-        selectedSubjectId: authorization.payload.selectedSubjectId,
-        selectedRole: authorization.payload.liveAssignment,
-        output,
-        outputSha256,
-      });
+      sinkReceipt = await this.sink.publish({ idempotencyKey, sampleAuthorizationId: authorization.authorizationId, sampleId: authorization.payload.sampleId, selectedSubjectId: authorization.payload.selectedSubjectId, selectedRole: authorization.payload.liveAssignment, output, outputSha256 });
+      assertSinkReceipt(sinkReceipt, this.sink.id, idempotencyKey, authorization.payload.liveAssignment, outputSha256);
     } catch (error) {
-      throw new Error(`Bounded-live publication side effect is unknown; automatic retry is forbidden: ${safeError(error)}`);
+      const message = safeError(error);
+      try {
+        const errorEvent = await this.sideEffects.recordError({ operationId, observedAt: runtimeResult.payload.verifiedAt, error: message });
+        throw new Error(`Bounded-live publication side effect is unknown; manual reconciliation is required and automatic retry is forbidden; journal=${errorEvent.eventId}: ${message}`);
+      } catch (journalError) {
+        if (journalError instanceof Error && journalError.message.includes("manual reconciliation is required")) throw journalError;
+        throw new Error(`Bounded-live publication side effect is unknown and error persistence failed; manual reconciliation is required and automatic retry is forbidden: ${message}; journalError=${safeError(journalError)}`);
+      }
     }
-    assertSinkReceipt(sinkReceipt, this.sink.id, idempotencyKey, authorization.payload.liveAssignment, outputSha256);
+
     const publishedAt = prepareTimestamp(sinkReceipt.publishedAt, "Bounded-live publishedAt");
-    if (Date.parse(publishedAt) < Date.parse(runtimeResult.payload.verifiedAt)) {
-      throw new Error("Bounded-live publication timestamp cannot predate deterministic verification");
+    if (Date.parse(publishedAt) < Date.parse(runtimeResult.payload.verifiedAt)) throw new Error("Bounded-live publication timestamp cannot predate deterministic verification");
+    let commitEvent;
+    try {
+      commitEvent = await this.sideEffects.recordCommit({ operationId, externalReference: sinkReceipt.publicationReference, committedAt: publishedAt });
+    } catch (error) {
+      throw new Error(`Bounded-live publication sink accepted output but durable side-effect commit failed; external side effect may have occurred, manual reconciliation is required, and automatic retry is forbidden: ${safeError(error)}`);
     }
 
     const payload: BoundedLivePublicationReceiptPayload = deepFreeze({
@@ -249,6 +247,8 @@ export class BoundedLivePublicationCoordinator {
       sinkId: sinkReceipt.sinkId,
       publicationReference: prepareIdentity(sinkReceipt.publicationReference, "Bounded-live publication reference"),
       publicationIdempotencyKey: idempotencyKey,
+      sideEffectOperationId: operationId,
+      sideEffectCommitEventId: commitEvent.eventId,
       outputSha256,
       outputBytes,
       verifiedAt: runtimeResult.payload.verifiedAt,
@@ -266,24 +266,19 @@ export class BoundedLivePublicationCoordinator {
 }
 
 export async function verifyBoundedLivePublicationReceipt(receipt: BoundedLivePublicationReceipt): Promise<void> {
-  if (!receipt || typeof receipt !== "object" || receipt.schemaVersion !== BOUNDED_LIVE_PUBLICATION_RECEIPT_SCHEMA_VERSION || receipt.algorithm !== "sha256") {
-    throw new Error("Bounded-live publication receipt envelope is invalid");
-  }
+  if (!receipt || typeof receipt !== "object" || receipt.schemaVersion !== BOUNDED_LIVE_PUBLICATION_RECEIPT_SCHEMA_VERSION || receipt.algorithm !== "sha256") throw new Error("Bounded-live publication receipt envelope is invalid");
   const expected = await sha256Canonical(receipt.payload);
   if (receipt.receiptSha256 !== expected || receipt.receiptId !== `m5livepub:${expected.slice(0, 32).toLowerCase()}`) throw new Error("Bounded-live publication receipt digest is invalid");
-  if (receipt.payload.externallyVisible !== true || receipt.payload.rawOutputPersisted !== false || receipt.payload.automaticRetryAllowed !== false
-    || receipt.payload.automaticRollbackAllowed !== false || receipt.payload.productionRoutingMutationAllowed !== false) {
-    throw new Error("Bounded-live publication receipt safety flags are invalid");
-  }
+  if (receipt.payload.externallyVisible !== true || receipt.payload.rawOutputPersisted !== false || receipt.payload.automaticRetryAllowed !== false || receipt.payload.automaticRollbackAllowed !== false || receipt.payload.productionRoutingMutationAllowed !== false) throw new Error("Bounded-live publication receipt safety flags are invalid");
   if (receipt.payload.candidateOutputExternallyVisible !== (receipt.payload.selectedRole === "candidate")) throw new Error("Bounded-live candidate visibility flag does not match selected role");
+  prepareIdentity(receipt.payload.sideEffectOperationId, "Bounded-live side-effect operationId");
+  prepareIdentity(receipt.payload.sideEffectCommitEventId, "Bounded-live side-effect commit eventId");
   if (Date.parse(receipt.payload.publishedAt) < Date.parse(receipt.payload.verifiedAt)) throw new Error("Bounded-live publication receipt predates verification");
 }
 
 function assertSinkReceipt(receipt: Awaited<ReturnType<BoundedLivePublicationSink["publish"]>>, sinkId: string, idempotencyKey: string, role: BoundedLiveAssignment, outputSha256: string): void {
   if (!receipt || typeof receipt !== "object") throw new Error("Bounded-live publication sink returned invalid receipt");
-  if (receipt.sinkId !== sinkId || receipt.idempotencyKey !== idempotencyKey || receipt.selectedRole !== role || receipt.outputSha256 !== outputSha256 || receipt.externallyVisible !== true) {
-    throw new Error("Bounded-live publication sink receipt does not match exact requested publication");
-  }
+  if (receipt.sinkId !== sinkId || receipt.idempotencyKey !== idempotencyKey || receipt.selectedRole !== role || receipt.outputSha256 !== outputSha256 || receipt.externallyVisible !== true) throw new Error("Bounded-live publication sink receipt does not match exact requested publication");
   prepareIdentity(receipt.publicationReference, "Bounded-live publication reference");
   prepareTimestamp(receipt.publishedAt, "Bounded-live publication timestamp");
 }
@@ -306,14 +301,10 @@ function prepareTimestamp(value: unknown, label: string): string {
   return new Date(value).toISOString();
 }
 function containsSecretLikeMaterial(value: string): boolean {
-  return /\bBearer\s+[A-Za-z0-9._~+\/-]+=*/i.test(value)
-    || /(authorization|api[_-]?key|access[_-]?token|password|secret|credential|cookie)\s*[:=]/i.test(value)
-    || /\bghp_[A-Za-z0-9]{20,}\b/.test(value) || /\bgithub_pat_[A-Za-z0-9_]{20,}\b/.test(value) || /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/.test(value);
+  return /\bBearer\s+[A-Za-z0-9._~+\/-]+=*/i.test(value) || /(authorization|api[_-]?key|access[_-]?token|password|secret|credential|cookie)\s*[:=]/i.test(value) || /\bghp_[A-Za-z0-9]{20,}\b/.test(value) || /\bgithub_pat_[A-Za-z0-9_]{20,}\b/.test(value) || /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/.test(value);
 }
 function safeError(error: unknown): string {
-  return (error instanceof Error ? error.message : String(error))
-    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [redacted]")
-    .replace(/(authorization|api[_-]?key|access[_-]?token|password|secret|credential)\s*[:=]\s*(Bearer\s+)?[^\s,;]+/gi, "$1=[redacted]");
+  return (error instanceof Error ? error.message : String(error)).replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [redacted]").replace(/(authorization|api[_-]?key|access[_-]?token|password|secret|credential)\s*[:=]\s*(Bearer\s+)?[^\s,;]+/gi, "$1=[redacted]");
 }
 async function sha256Text(value: string): Promise<string> {
   if (!globalThis.crypto?.subtle) throw new Error("Web Crypto SHA-256 is unavailable in this runtime");
