@@ -53,48 +53,56 @@ export interface ControlledExperimentSampleCompletionInput {
   readonly candidateObservationId: string;
 }
 
+type ReservationPayload = {
+  readonly eventType: "sample_reserved";
+  readonly experimentId: string;
+  readonly sampleId: string;
+  readonly exposure: ControlledExperimentSampleExposure;
+  readonly liveAssignment: ControlledExperimentLiveAssignment;
+  readonly inputReference: string;
+  readonly reservedAt: string;
+  readonly automaticRedispatchAllowed: false;
+};
+
+type DispatchedPayload = {
+  readonly eventType: "sample_dispatched";
+  readonly experimentId: string;
+  readonly sampleId: string;
+  readonly adapterId: string;
+  readonly acceptedAt: string;
+  readonly referenceExecutionReference: string;
+  readonly candidateExecutionReference: string;
+  readonly candidateOutputExternallyVisible: boolean;
+  readonly automaticRedispatchAllowed: false;
+};
+
+type DispatchErrorPayload = {
+  readonly eventType: "dispatch_error";
+  readonly experimentId: string;
+  readonly sampleId: string;
+  readonly adapterId: string;
+  readonly observedAt: string;
+  readonly error: string;
+  readonly sideEffectState: "unknown";
+  readonly manualReconciliationRequired: true;
+  readonly automaticRedispatchAllowed: false;
+};
+
+type CompletionPayload = {
+  readonly eventType: "sample_completed";
+  readonly experimentId: string;
+  readonly sampleId: string;
+  readonly completedAt: string;
+  readonly referenceObservationId: string;
+  readonly candidateObservationId: string;
+  readonly automaticRedispatchAllowed: false;
+};
+
 export type ControlledExperimentExecutionEventPayload =
-  | {
-      readonly eventType: "sample_reserved";
-      readonly experimentId: string;
-      readonly sampleId: string;
-      readonly exposure: ControlledExperimentSampleExposure;
-      readonly liveAssignment: ControlledExperimentLiveAssignment;
-      readonly inputReference: string;
-      readonly reservedAt: string;
-      readonly automaticRedispatchAllowed: false;
-    }
-  | {
-      readonly eventType: "sample_dispatched";
-      readonly experimentId: string;
-      readonly sampleId: string;
-      readonly adapterId: string;
-      readonly acceptedAt: string;
-      readonly referenceExecutionReference: string;
-      readonly candidateExecutionReference: string;
-      readonly candidateOutputExternallyVisible: boolean;
-      readonly automaticRedispatchAllowed: false;
-    }
-  | {
-      readonly eventType: "dispatch_error";
-      readonly experimentId: string;
-      readonly sampleId: string;
-      readonly adapterId: string;
-      readonly observedAt: string;
-      readonly error: string;
-      readonly sideEffectState: "unknown";
-      readonly manualReconciliationRequired: true;
-      readonly automaticRedispatchAllowed: false;
-    }
-  | {
-      readonly eventType: "sample_completed";
-      readonly experimentId: string;
-      readonly sampleId: string;
-      readonly completedAt: string;
-      readonly referenceObservationId: string;
-      readonly candidateObservationId: string;
-      readonly automaticRedispatchAllowed: false;
-    };
+  | ReservationPayload
+  | DispatchedPayload
+  | DispatchErrorPayload
+  | CompletionPayload;
 
 export interface ControlledExperimentExecutionJournalEvent {
   readonly algorithm: "sha256";
@@ -136,11 +144,9 @@ interface PersistedExecutionJournalEntry {
 
 /**
  * Local append-only single-writer journal for bounded experiment dispatch.
- *
- * A reservation is persisted before the adapter call. Any process loss after
- * reservation therefore leaves an unresolved sample and automatic redispatch is
- * forbidden. Adapter exceptions are recorded as sideEffectState=unknown rather
- * than assumed safe failures. v1 intentionally allows only one in-flight sample.
+ * Reservation is persisted before adapter dispatch. Any unresolved reservation,
+ * dispatch, or dispatch error blocks further automatic execution. v1 permits only
+ * one in-flight sample and never assumes an adapter exception is side-effect free.
  */
 export class JsonlControlledExperimentExecutionJournal {
   readonly filePath: string;
@@ -150,16 +156,16 @@ export class JsonlControlledExperimentExecutionJournal {
   private readonly maxStringBytes: number;
   private readonly events: ControlledExperimentExecutionJournalEvent[] = [];
   private readonly latestBySample = new Map<string, ControlledExperimentExecutionJournalEvent>();
-  private readonly reservations = new Map<string, Extract<ControlledExperimentExecutionEventPayload, { eventType: "sample_reserved" }>>();
+  private readonly reservations = new Map<string, ReservationPayload>();
   private expectedFileSize = 0;
 
   private constructor(options: ControlledExperimentExecutionJournalOptions) {
     if (!options.filePath.trim()) throw new Error("Controlled experiment execution journal filePath must not be empty");
-    this.experimentId = prepareIdentity(options.experimentId, "Controlled experiment execution journal experimentId", options.maxStringBytes);
     assertPositiveInteger(options.maxFileBytes, "Controlled experiment execution journal maxFileBytes");
     assertPositiveInteger(options.maxEventBytes, "Controlled experiment execution journal maxEventBytes");
     assertPositiveInteger(options.maxStringBytes, "Controlled experiment execution journal maxStringBytes");
     if (options.maxEventBytes > options.maxFileBytes) throw new Error("Controlled experiment execution journal maxEventBytes must not exceed maxFileBytes");
+    this.experimentId = prepareIdentity(options.experimentId, "Controlled experiment execution journal experimentId", options.maxStringBytes);
     this.filePath = resolve(options.filePath);
     this.maxFileBytes = options.maxFileBytes;
     this.maxEventBytes = options.maxEventBytes;
@@ -175,13 +181,14 @@ export class JsonlControlledExperimentExecutionJournal {
 
   async reserveSample(input: ControlledExperimentSampleReservationInput): Promise<ControlledExperimentExecutionJournalEvent> {
     this.assertStorageUnchanged();
-    if (this.latestBySample.has(input.sampleId)) throw new Error(`Controlled experiment sample already exists: ${input.sampleId}`);
+    const sampleId = prepareIdentity(input.sampleId, "Controlled experiment sampleId", this.maxStringBytes);
+    if (this.latestBySample.has(sampleId)) throw new Error(`Controlled experiment sample already exists: ${sampleId}`);
     const unresolved = this.inspect().unresolvedSampleIds;
     if (unresolved.length > 0) throw new Error(`Controlled experiment has unresolved sample(s): ${unresolved.join(", ")}; automatic concurrent or recovery dispatch is forbidden`);
     const event = await prepareEvent({
       eventType: "sample_reserved",
       experimentId: this.experimentId,
-      sampleId: prepareIdentity(input.sampleId, "Controlled experiment sampleId", this.maxStringBytes),
+      sampleId,
       exposure: prepareExposure(input.exposure),
       liveAssignment: prepareLiveAssignment(input.exposure, input.liveAssignment),
       inputReference: prepareSafeReference(input.inputReference, "Controlled experiment inputReference", this.maxStringBytes),
@@ -195,10 +202,10 @@ export class JsonlControlledExperimentExecutionJournal {
   async recordDispatch(input: ControlledExperimentDispatchRecordInput): Promise<ControlledExperimentExecutionJournalEvent> {
     this.assertStorageUnchanged();
     const previous = this.requireLatest(input.sampleId, "sample_reserved");
-    const reservation = previous.payload as Extract<ControlledExperimentExecutionEventPayload, { eventType: "sample_reserved" }>;
-    const visible = Boolean(input.candidateOutputExternallyVisible);
+    const reservation = previous.payload as ReservationPayload;
+    if (typeof input.candidateOutputExternallyVisible !== "boolean") throw new Error("Controlled experiment dispatch visibility must be boolean");
     const expectedVisible = reservation.exposure === "bounded_live" && reservation.liveAssignment === "candidate";
-    if (visible !== expectedVisible) throw new Error("Controlled experiment dispatch visibility does not match reserved exposure/live assignment");
+    if (input.candidateOutputExternallyVisible !== expectedVisible) throw new Error("Controlled experiment dispatch visibility does not match reserved exposure/live assignment");
     const event = await prepareEvent({
       eventType: "sample_dispatched",
       experimentId: this.experimentId,
@@ -207,7 +214,7 @@ export class JsonlControlledExperimentExecutionJournal {
       acceptedAt: prepareTimestamp(input.acceptedAt, "Controlled experiment acceptedAt"),
       referenceExecutionReference: prepareSafeReference(input.referenceExecutionReference, "Controlled experiment reference execution reference", this.maxStringBytes),
       candidateExecutionReference: prepareSafeReference(input.candidateExecutionReference, "Controlled experiment candidate execution reference", this.maxStringBytes),
-      candidateOutputExternallyVisible: visible,
+      candidateOutputExternallyVisible: input.candidateOutputExternallyVisible,
       automaticRedispatchAllowed: false,
     }, this.maxEventBytes);
     await this.append(event);
@@ -217,7 +224,7 @@ export class JsonlControlledExperimentExecutionJournal {
   async recordDispatchError(input: ControlledExperimentDispatchErrorInput): Promise<ControlledExperimentExecutionJournalEvent> {
     this.assertStorageUnchanged();
     const previous = this.requireLatest(input.sampleId, "sample_reserved");
-    const reservation = previous.payload as Extract<ControlledExperimentExecutionEventPayload, { eventType: "sample_reserved" }>;
+    const reservation = previous.payload as ReservationPayload;
     const event = await prepareEvent({
       eventType: "dispatch_error",
       experimentId: this.experimentId,
@@ -236,18 +243,16 @@ export class JsonlControlledExperimentExecutionJournal {
   async recordCompletion(input: ControlledExperimentSampleCompletionInput): Promise<ControlledExperimentExecutionJournalEvent> {
     this.assertStorageUnchanged();
     const previous = this.requireLatest(input.sampleId, "sample_dispatched");
-    const sampleId = previous.payload.sampleId;
     const referenceObservationId = prepareSafeReference(input.referenceObservationId, "Controlled experiment reference observationId", this.maxStringBytes);
     const candidateObservationId = prepareSafeReference(input.candidateObservationId, "Controlled experiment candidate observationId", this.maxStringBytes);
     if (referenceObservationId === candidateObservationId) throw new Error("Controlled experiment reference/candidate observation IDs must be distinct");
     const state = this.inspect();
-    if (state.completedReferenceObservationIds.includes(referenceObservationId) || state.completedCandidateObservationIds.includes(candidateObservationId)) {
-      throw new Error("Controlled experiment completion reuses an existing observation ID");
-    }
+    const usedObservationIds = new Set([...state.completedReferenceObservationIds, ...state.completedCandidateObservationIds]);
+    if (usedObservationIds.has(referenceObservationId) || usedObservationIds.has(candidateObservationId)) throw new Error("Controlled experiment completion reuses an existing observation ID");
     const event = await prepareEvent({
       eventType: "sample_completed",
       experimentId: this.experimentId,
-      sampleId,
+      sampleId: previous.payload.sampleId,
       completedAt: prepareTimestamp(input.completedAt, "Controlled experiment completedAt"),
       referenceObservationId,
       candidateObservationId,
@@ -265,24 +270,26 @@ export class JsonlControlledExperimentExecutionJournal {
     return this.latestBySample.get(sampleId);
   }
 
-  reservation(sampleId: string): Extract<ControlledExperimentExecutionEventPayload, { eventType: "sample_reserved" }> | undefined {
+  reservation(sampleId: string): ReservationPayload | undefined {
     return this.reservations.get(sampleId);
   }
 
   inspect(): ControlledExperimentExecutionJournalState {
     const reservations = [...this.reservations.values()];
-    const completed = [...this.latestBySample.values()].filter((event) => event.payload.eventType === "sample_completed");
-    const completedIds = new Set(completed.map((event) => event.payload.sampleId));
+    const completedPayloads: CompletionPayload[] = [];
+    for (const event of this.latestBySample.values()) {
+      if (event.payload.eventType === "sample_completed") completedPayloads.push(event.payload);
+    }
+    const completedIds = new Set(completedPayloads.map((payload) => payload.sampleId));
     const completedReservations = reservations.filter((reservation) => completedIds.has(reservation.sampleId));
-    const unresolved = [...this.latestBySample.entries()]
+    const unresolvedSampleIds = [...this.latestBySample.entries()]
       .filter(([, event]) => event.payload.eventType !== "sample_completed")
       .map(([sampleId]) => sampleId)
       .sort();
-    const dispatchErrors = [...this.latestBySample.entries()]
+    const dispatchErrorSampleIds = [...this.latestBySample.entries()]
       .filter(([, event]) => event.payload.eventType === "dispatch_error")
       .map(([sampleId]) => sampleId)
       .sort();
-    const completedPayloads = completed.map((event) => event.payload as Extract<ControlledExperimentExecutionEventPayload, { eventType: "sample_completed" }>);
     return deepFreeze({
       experimentId: this.experimentId,
       eventCount: this.events.length,
@@ -293,8 +300,8 @@ export class JsonlControlledExperimentExecutionJournal {
       completedShadowSamples: completedReservations.filter((item) => item.exposure === "shadow").length,
       completedLiveSamples: completedReservations.filter((item) => item.exposure === "bounded_live").length,
       completedCandidateLiveSamples: completedReservations.filter((item) => item.exposure === "bounded_live" && item.liveAssignment === "candidate").length,
-      unresolvedSampleIds: unresolved,
-      dispatchErrorSampleIds: dispatchErrors,
+      unresolvedSampleIds,
+      dispatchErrorSampleIds,
       completedReferenceObservationIds: completedPayloads.map((item) => item.referenceObservationId).sort(),
       completedCandidateObservationIds: completedPayloads.map((item) => item.candidateObservationId).sort(),
       automaticRedispatchAllowed: false as const,
@@ -350,29 +357,35 @@ export class JsonlControlledExperimentExecutionJournal {
     switch (event.payload.eventType) {
       case "sample_reserved":
         if (previous) throw new Error(`${label} duplicates sample reservation: ${sampleId}`);
-        if ([...this.latestBySample.values()].some((item) => item.payload.eventType !== "sample_completed")) {
-          throw new Error(`${label} creates a concurrent sample while another sample is unresolved`);
-        }
+        if ([...this.latestBySample.values()].some((item) => item.payload.eventType !== "sample_completed")) throw new Error(`${label} creates a concurrent sample while another sample is unresolved`);
         break;
-      case "sample_dispatched":
+      case "sample_dispatched": {
+        if (!previous || previous.payload.eventType !== "sample_reserved") throw new Error(`${label} sample_dispatched requires prior sample_reserved`);
+        const expectedVisible = previous.payload.exposure === "bounded_live" && previous.payload.liveAssignment === "candidate";
+        if (event.payload.candidateOutputExternallyVisible !== expectedVisible) throw new Error(`${label} sample_dispatched visibility does not match reservation`);
+        break;
+      }
       case "dispatch_error":
-        if (!previous || previous.payload.eventType !== "sample_reserved") throw new Error(`${label} ${event.payload.eventType} requires prior sample_reserved`);
+        if (!previous || previous.payload.eventType !== "sample_reserved") throw new Error(`${label} dispatch_error requires prior sample_reserved`);
         break;
-      case "sample_completed":
+      case "sample_completed": {
         if (!previous || previous.payload.eventType !== "sample_dispatched") throw new Error(`${label} sample_completed requires prior sample_dispatched`);
-        if ([...this.latestBySample.values()].some((item) => item.payload.eventType === "sample_completed" && (item.payload as Extract<ControlledExperimentExecutionEventPayload, { eventType: "sample_completed" }>).referenceObservationId === event.payload.referenceObservationId)) {
-          throw new Error(`${label} reuses reference observation ID`);
+        const used = new Set<string>();
+        for (const existing of this.latestBySample.values()) {
+          if (existing.payload.eventType !== "sample_completed") continue;
+          used.add(existing.payload.referenceObservationId);
+          used.add(existing.payload.candidateObservationId);
         }
-        if ([...this.latestBySample.values()].some((item) => item.payload.eventType === "sample_completed" && (item.payload as Extract<ControlledExperimentExecutionEventPayload, { eventType: "sample_completed" }>).candidateObservationId === event.payload.candidateObservationId)) {
-          throw new Error(`${label} reuses candidate observation ID`);
-        }
+        if (used.has(event.payload.referenceObservationId) || used.has(event.payload.candidateObservationId)) throw new Error(`${label} reuses completed observation ID`);
         break;
+      }
     }
   }
 
   private admit(event: ControlledExperimentExecutionJournalEvent): void {
-    this.events.push(deepFreeze(deepClone(event)));
-    this.latestBySample.set(event.payload.sampleId, event);
+    const frozen = deepFreeze(event);
+    this.events.push(frozen);
+    this.latestBySample.set(event.payload.sampleId, frozen);
     if (event.payload.eventType === "sample_reserved") this.reservations.set(event.payload.sampleId, event.payload);
   }
 
@@ -397,9 +410,9 @@ export async function verifyControlledExperimentExecutionJournalEvent(
   if (!isRecord(event)) throw new Error("Controlled experiment execution event must be an object");
   assertExactFields(event, new Set(["algorithm", "eventId", "eventSha256", "payload"]), "Controlled experiment execution event");
   if (event.algorithm !== "sha256" || !isRecord(event.payload)) throw new Error("Controlled experiment execution event envelope is invalid");
-  const payload = normalizePayload(event.payload as unknown as ControlledExperimentExecutionEventPayload, maxStringBytes);
-  if (stableStringify(payload) !== stableStringify(event.payload)) throw new Error("Controlled experiment execution event payload is not canonically normalized");
-  const expected = await sha256Canonical(payload);
+  const normalized = normalizePayload(event.payload as unknown as ControlledExperimentExecutionEventPayload, maxStringBytes);
+  if (stableStringify(normalized) !== stableStringify(event.payload)) throw new Error("Controlled experiment execution event payload is not canonically normalized");
+  const expected = await sha256Canonical(normalized);
   if (event.eventSha256 !== expected) throw new Error("Controlled experiment execution event digest does not match canonical payload");
   if (event.eventId !== `m5execevent:${expected.slice(0, 32).toLowerCase()}`) throw new Error("Controlled experiment execution eventId does not match canonical payload");
   if (utf8ByteLength(stableStringify(event)) > maxEventBytes) throw new Error("Controlled experiment execution event exceeds maxEventBytes");
@@ -419,23 +432,65 @@ async function prepareEvent(payload: ControlledExperimentExecutionEventPayload, 
 
 function normalizePayload(payload: ControlledExperimentExecutionEventPayload, maxStringBytes: number): ControlledExperimentExecutionEventPayload {
   if (!isRecord(payload)) throw new Error("Controlled experiment execution event payload must be an object");
-  const commonExperimentId = prepareIdentity(payload.experimentId, "Controlled experiment execution event experimentId", maxStringBytes);
+  const experimentId = prepareIdentity(payload.experimentId, "Controlled experiment execution event experimentId", maxStringBytes);
   const sampleId = prepareIdentity(payload.sampleId, "Controlled experiment execution event sampleId", maxStringBytes);
   if (payload.automaticRedispatchAllowed !== false) throw new Error("Controlled experiment execution event cannot grant automatic redispatch authority");
   switch (payload.eventType) {
     case "sample_reserved":
       assertExactFields(payload, new Set(["eventType", "experimentId", "sampleId", "exposure", "liveAssignment", "inputReference", "reservedAt", "automaticRedispatchAllowed"]), "Controlled experiment reservation payload");
-      return deepFreeze({ eventType: "sample_reserved", experimentId: commonExperimentId, sampleId, exposure: prepareExposure(payload.exposure), liveAssignment: prepareLiveAssignment(payload.exposure, payload.liveAssignment), inputReference: prepareSafeReference(payload.inputReference, "Controlled experiment inputReference", maxStringBytes), reservedAt: prepareTimestamp(payload.reservedAt, "Controlled experiment reservedAt"), automaticRedispatchAllowed: false as const });
+      return deepFreeze({
+        eventType: "sample_reserved",
+        experimentId,
+        sampleId,
+        exposure: prepareExposure(payload.exposure),
+        liveAssignment: prepareLiveAssignment(payload.exposure, payload.liveAssignment),
+        inputReference: prepareSafeReference(payload.inputReference, "Controlled experiment inputReference", maxStringBytes),
+        reservedAt: prepareTimestamp(payload.reservedAt, "Controlled experiment reservedAt"),
+        automaticRedispatchAllowed: false as const,
+      });
     case "sample_dispatched":
       assertExactFields(payload, new Set(["eventType", "experimentId", "sampleId", "adapterId", "acceptedAt", "referenceExecutionReference", "candidateExecutionReference", "candidateOutputExternallyVisible", "automaticRedispatchAllowed"]), "Controlled experiment dispatched payload");
-      return deepFreeze({ eventType: "sample_dispatched", experimentId: commonExperimentId, sampleId, adapterId: prepareIdentity(payload.adapterId, "Controlled experiment adapterId", maxStringBytes), acceptedAt: prepareTimestamp(payload.acceptedAt, "Controlled experiment acceptedAt"), referenceExecutionReference: prepareSafeReference(payload.referenceExecutionReference, "Controlled experiment reference execution reference", maxStringBytes), candidateExecutionReference: prepareSafeReference(payload.candidateExecutionReference, "Controlled experiment candidate execution reference", maxStringBytes), candidateOutputExternallyVisible: Boolean(payload.candidateOutputExternallyVisible), automaticRedispatchAllowed: false as const });
+      if (typeof payload.candidateOutputExternallyVisible !== "boolean") throw new Error("Controlled experiment dispatched visibility must be boolean");
+      return deepFreeze({
+        eventType: "sample_dispatched",
+        experimentId,
+        sampleId,
+        adapterId: prepareIdentity(payload.adapterId, "Controlled experiment adapterId", maxStringBytes),
+        acceptedAt: prepareTimestamp(payload.acceptedAt, "Controlled experiment acceptedAt"),
+        referenceExecutionReference: prepareSafeReference(payload.referenceExecutionReference, "Controlled experiment reference execution reference", maxStringBytes),
+        candidateExecutionReference: prepareSafeReference(payload.candidateExecutionReference, "Controlled experiment candidate execution reference", maxStringBytes),
+        candidateOutputExternallyVisible: payload.candidateOutputExternallyVisible,
+        automaticRedispatchAllowed: false as const,
+      });
     case "dispatch_error":
       assertExactFields(payload, new Set(["eventType", "experimentId", "sampleId", "adapterId", "observedAt", "error", "sideEffectState", "manualReconciliationRequired", "automaticRedispatchAllowed"]), "Controlled experiment dispatch error payload");
       if (payload.sideEffectState !== "unknown" || payload.manualReconciliationRequired !== true) throw new Error("Controlled experiment dispatch error must remain manual-reconciliation unknown state");
-      return deepFreeze({ eventType: "dispatch_error", experimentId: commonExperimentId, sampleId, adapterId: prepareIdentity(payload.adapterId, "Controlled experiment adapterId", maxStringBytes), observedAt: prepareTimestamp(payload.observedAt, "Controlled experiment dispatch error observedAt"), error: prepareSanitizedText(payload.error, "Controlled experiment dispatch error", maxStringBytes), sideEffectState: "unknown" as const, manualReconciliationRequired: true as const, automaticRedispatchAllowed: false as const });
-    case "sample_completed":
+      return deepFreeze({
+        eventType: "dispatch_error",
+        experimentId,
+        sampleId,
+        adapterId: prepareIdentity(payload.adapterId, "Controlled experiment adapterId", maxStringBytes),
+        observedAt: prepareTimestamp(payload.observedAt, "Controlled experiment dispatch error observedAt"),
+        error: prepareSanitizedText(payload.error, "Controlled experiment dispatch error", maxStringBytes),
+        sideEffectState: "unknown" as const,
+        manualReconciliationRequired: true as const,
+        automaticRedispatchAllowed: false as const,
+      });
+    case "sample_completed": {
       assertExactFields(payload, new Set(["eventType", "experimentId", "sampleId", "completedAt", "referenceObservationId", "candidateObservationId", "automaticRedispatchAllowed"]), "Controlled experiment completion payload");
-      return deepFreeze({ eventType: "sample_completed", experimentId: commonExperimentId, sampleId, completedAt: prepareTimestamp(payload.completedAt, "Controlled experiment completedAt"), referenceObservationId: prepareSafeReference(payload.referenceObservationId, "Controlled experiment reference observationId", maxStringBytes), candidateObservationId: prepareSafeReference(payload.candidateObservationId, "Controlled experiment candidate observationId", maxStringBytes), automaticRedispatchAllowed: false as const });
+      const referenceObservationId = prepareSafeReference(payload.referenceObservationId, "Controlled experiment reference observationId", maxStringBytes);
+      const candidateObservationId = prepareSafeReference(payload.candidateObservationId, "Controlled experiment candidate observationId", maxStringBytes);
+      if (referenceObservationId === candidateObservationId) throw new Error("Controlled experiment reference/candidate observation IDs must be distinct");
+      return deepFreeze({
+        eventType: "sample_completed",
+        experimentId,
+        sampleId,
+        completedAt: prepareTimestamp(payload.completedAt, "Controlled experiment completedAt"),
+        referenceObservationId,
+        candidateObservationId,
+        automaticRedispatchAllowed: false as const,
+      });
+    }
     default:
       throw new Error(`Controlled experiment execution event type is invalid: ${String((payload as { eventType?: unknown }).eventType)}`);
   }
@@ -443,12 +498,20 @@ function normalizePayload(payload: ControlledExperimentExecutionEventPayload, ma
 
 function parsePersisted(line: string, lineNumber: number): PersistedExecutionJournalEntry {
   let value: unknown;
-  try { value = JSON.parse(line) as unknown; } catch (error) { throw new Error(`Controlled experiment execution journal contains invalid JSON at line ${lineNumber}: ${safeErrorMessage(error)}`); }
+  try {
+    value = JSON.parse(line) as unknown;
+  } catch (error) {
+    throw new Error(`Controlled experiment execution journal contains invalid JSON at line ${lineNumber}: ${safeErrorMessage(error)}`);
+  }
   if (!isRecord(value)) throw new Error(`Controlled experiment execution journal entry at line ${lineNumber} must be an object`);
   assertExactFields(value, new Set(["schemaVersion", "sequence", "event"]), `Controlled experiment execution journal entry at line ${lineNumber}`);
   if (value.schemaVersion !== CONTROLLED_EXPERIMENT_EXECUTION_JOURNAL_SCHEMA_VERSION) throw new Error(`Unsupported controlled experiment execution journal schema at line ${lineNumber}`);
   if (!Number.isInteger(value.sequence) || Number(value.sequence) <= 0) throw new Error(`Controlled experiment execution journal sequence at line ${lineNumber} is invalid`);
-  return { schemaVersion: CONTROLLED_EXPERIMENT_EXECUTION_JOURNAL_SCHEMA_VERSION, sequence: Number(value.sequence), event: value.event as ControlledExperimentExecutionJournalEvent };
+  return {
+    schemaVersion: CONTROLLED_EXPERIMENT_EXECUTION_JOURNAL_SCHEMA_VERSION,
+    sequence: Number(value.sequence),
+    event: value.event as ControlledExperimentExecutionJournalEvent,
+  };
 }
 
 function prepareExposure(value: unknown): ControlledExperimentSampleExposure {
@@ -479,7 +542,8 @@ function prepareSafeReference(value: unknown, label: string, maxBytes: number): 
 function prepareSanitizedText(value: unknown, label: string, maxBytes: number): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must not be empty`);
   const sanitized = sanitizeText(value).replace(/[\r\n]+/g, " ").trim();
-  return truncateUtf8(sanitized, maxBytes);
+  const output = truncateUtf8(sanitized, maxBytes);
+  return output || "x";
 }
 
 function prepareTimestamp(value: unknown, label: string): string {
@@ -509,7 +573,7 @@ function truncateUtf8(value: string, maxBytes: number): string {
     if (utf8ByteLength(`${output}${char}`) > maxBytes) break;
     output += char;
   }
-  return output || "[truncated]";
+  return output;
 }
 
 function safeErrorMessage(error: unknown): string {
@@ -533,11 +597,12 @@ function stableStringify(value: unknown): string {
 function sortJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortJson);
   if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([, child]) => child !== undefined).sort(([left], [right]) => left.localeCompare(right)).map(([key, child]) => [key, sortJson(child)]));
-}
-
-function deepClone<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, child]) => child !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, sortJson(child)]),
+  );
 }
 
 function deepFreeze<T>(value: T): T {
