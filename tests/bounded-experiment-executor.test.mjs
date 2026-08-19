@@ -178,13 +178,14 @@ test("bounded executor enforces candidate traffic ceiling before adapter dispatc
   }
 
   const before = ctx.adapter.requests.length;
+  const threeSampleProgress = await progress(ctx, 3);
   await assert.rejects(
-    () => ctx.executor.dispatchSample(dispatchInput(ctx, "live-candidate-too-early", "bounded_live", "candidate", await progress(ctx, 3))),
+    () => ctx.executor.dispatchSample(dispatchInput(ctx, "live-candidate-too-early", "bounded_live", "candidate", threeSampleProgress)),
     /candidate live traffic ceiling would be exceeded/,
   );
   assert.equal(ctx.adapter.requests.length, before);
 
-  await ctx.executor.dispatchSample(dispatchInput(ctx, "live-reference", "bounded_live", "reference", await progress(ctx, 3)));
+  await ctx.executor.dispatchSample(dispatchInput(ctx, "live-reference", "bounded_live", "reference", threeSampleProgress));
   await complete(ctx, "live-reference", 3);
   const candidate = await ctx.executor.dispatchSample(dispatchInput(ctx, "live-candidate", "bounded_live", "candidate", await progress(ctx, 4)));
   assert.equal(candidate.receipt.candidateOutputExternallyVisible, true);
