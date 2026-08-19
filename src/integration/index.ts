@@ -5,3 +5,4 @@ export * from "./shadow-provenance-runtime-binding-seal.js";
 export * from "./bounded-live-publication.js";
 export * from "./bounded-live-reference-restore.js";
 export * from "./deferred-bounded-live-execution.js";
+export * from "./bounded-live-side-effect-journal.js";
