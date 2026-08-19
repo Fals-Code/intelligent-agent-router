@@ -7,7 +7,6 @@ import {
   BoundedLiveReferenceRestoreCoordinator,
   DurableWorkflowStateMachine,
   JsonlWorkflowCheckpointStore,
-  evaluateControlledExperimentGuardrails,
   prepareBoundedLiveRollbackAuthorization,
   prepareBoundedLiveSampleAuthorization,
   prepareControlledExperimentAuthorization,
@@ -20,44 +19,111 @@ import {
 } from "../dist/index.js";
 import {
   authorizationInput,
-  buildExperimentCohort,
   controlledExperimentFixture,
   durableApprovedExperimentWorkflow,
   experimentDefinitionInput,
 } from "./controlled-experiment-fixture.mjs";
 
-let liveWorkflowSequence = 0;
+let workflowSequence = 0;
+
+function stable(value) {
+  if (Array.isArray(value)) return value.map(stable);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([, child]) => child !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, child]) => [key, stable(child)]));
+}
+
+function sha256Canonical(value) {
+  return createHash("sha256").update(JSON.stringify(stable(value))).digest("hex").toUpperCase();
+}
+
+function distinctAdmissionDecision(source) {
+  const payload = {
+    ...source.payload,
+    referenceSubjectId: "opencode:9router/hemat",
+    candidateSubjectId: "opencode:9router/smart",
+  };
+  const decisionSha256 = sha256Canonical(payload);
+  return {
+    schemaVersion: source.schemaVersion,
+    algorithm: "sha256",
+    decisionId: `m5admit:${decisionSha256.slice(0, 32).toLowerCase()}`,
+    decisionSha256,
+    payload,
+  };
+}
+
+function guardrailDecision(ctx, { classification = "ELIGIBLE_FOR_BOUNDED_LIVE", shadowSamples = 3, liveSamples = 0, candidateLiveSamples = 0 } = {}) {
+  const candidateTrafficBasisPoints = liveSamples === 0 ? 0 : (candidateLiveSamples / liveSamples) * 10000;
+  const payload = {
+    experimentId: ctx.experiment.experimentId,
+    experimentSha256: ctx.experiment.experimentSha256,
+    authorizationId: ctx.experimentAuthorization.authorizationId,
+    authorizationSha256: ctx.experimentAuthorization.authorizationSha256,
+    admissionDecisionId: ctx.admissionDecision.decisionId,
+    admissionDecisionSha256: ctx.admissionDecision.decisionSha256,
+    workflowRunId: ctx.experimentWorkflow.id,
+    observedAt: classification === "ROLLBACK_REQUIRED" ? "2026-08-19T06:40:00.000Z" : "2026-08-19T06:32:00.000Z",
+    referenceEvalSummaryId: "evalsummary:bounded-live-reference",
+    candidateEvalSummaryId: "evalsummary:bounded-live-candidate",
+    referenceExecutionSummaryId: "execrel:bounded-live-reference",
+    candidateExecutionSummaryId: "execrel:bounded-live-candidate",
+    completedSamples: shadowSamples + liveSamples,
+    shadowSamples,
+    liveSamples,
+    candidateLiveSamples,
+    candidateTrafficBasisPoints,
+    evalDeltas: {
+      weightedScoreMean: classification === "ROLLBACK_REQUIRED" ? -1 : 0,
+      taskPassRateMean: classification === "ROLLBACK_REQUIRED" ? -1 : 0,
+      criticalPassRateMean: classification === "ROLLBACK_REQUIRED" ? -1 : 0,
+      baselinePassRate: classification === "ROLLBACK_REQUIRED" ? -1 : 0,
+      latencyMeanMs: 0,
+      costMeanUsd: 0,
+    },
+    executionDeltas: {
+      successRateExcludingCancelled: classification === "ROLLBACK_REQUIRED" ? -1 : 0,
+      failureRateExcludingCancelled: classification === "ROLLBACK_REQUIRED" ? 1 : 0,
+      cancellationRate: 0,
+    },
+    classification,
+    reasons: [classification === "ROLLBACK_REQUIRED" ? "bounded_live_regression_requires_reference_restore" : "shadow_evidence_clear_for_bounded_live"],
+    guardrailActionRequired: classification === "ROLLBACK_REQUIRED",
+    boundedLiveAdmissionEligible: classification === "ELIGIBLE_FOR_BOUNDED_LIVE",
+    automaticDispatchAllowed: false,
+    productionRoutingMutationAllowed: false,
+    automaticRollbackAllowed: false,
+  };
+  const decisionSha256 = sha256Canonical(payload);
+  return {
+    schemaVersion: 1,
+    algorithm: "sha256",
+    decisionId: `m5expguard:${decisionSha256.slice(0, 32).toLowerCase()}`,
+    decisionSha256,
+    payload,
+  };
+}
 
 async function authorityContext(t, overrides = {}) {
   const fixture = await controlledExperimentFixture(t);
-  const experiment = await prepareControlledExperimentDefinition(
-    fixture.admissionDecision,
-    experimentDefinitionInput(overrides),
-  );
+  const admissionDecision = distinctAdmissionDecision(fixture.admissionDecision);
+  const experiment = await prepareControlledExperimentDefinition(admissionDecision, experimentDefinitionInput(overrides));
   const { run: experimentWorkflow } = await durableApprovedExperimentWorkflow(fixture.root, { riskClass: experiment.payload.riskClass });
-  const experimentAuthorization = await prepareControlledExperimentAuthorization(
-    experiment,
-    fixture.admissionDecision,
-    experimentWorkflow,
-    authorizationInput(),
-  );
-  return { ...fixture, experiment, experimentWorkflow, experimentAuthorization };
+  const experimentAuthorization = await prepareControlledExperimentAuthorization(experiment, admissionDecision, experimentWorkflow, authorizationInput());
+  return { ...fixture, admissionDecision, experiment, experimentWorkflow, experimentAuthorization };
 }
 
 async function approvedWorkflow(root, projectId, riskClass, approvalId, prefix) {
-  liveWorkflowSequence += 1;
+  workflowSequence += 1;
   const store = new JsonlWorkflowCheckpointStore({
-    filePath: join(root, `${prefix}-${liveWorkflowSequence}.jsonl`),
+    filePath: join(root, `${prefix}-${workflowSequence}.jsonl`),
     maxFileBytes: 512 * 1024,
     maxCheckpointBytes: 32 * 1024,
   });
   const machine = new DurableWorkflowStateMachine(store);
-  let run = machine.create({
-    id: `${prefix}-${liveWorkflowSequence}`,
-    projectId,
-    riskClass,
-    now: "2026-08-19T06:30:00.000Z",
-  });
+  let run = machine.create({ id: `${prefix}-${workflowSequence}`, projectId, riskClass, now: "2026-08-19T06:30:00.000Z" });
   run = machine.start(run, "2026-08-19T06:30:01.000Z");
   run = machine.advance(run, "2026-08-19T06:30:02.000Z");
   run = machine.advance(run, "2026-08-19T06:30:03.000Z");
@@ -66,25 +132,6 @@ async function approvedWorkflow(root, projectId, riskClass, approvalId, prefix) 
   run = machine.requestApproval(run, "2026-08-19T06:30:06.000Z");
   run = machine.approve(run, approvalId, "2026-08-19T06:31:00.000Z");
   return run;
-}
-
-async function eligibleGuardrail(ctx) {
-  return evaluateControlledExperimentGuardrails({
-    experiment: ctx.experiment,
-    authorization: ctx.experimentAuthorization,
-    admissionDecision: ctx.admissionDecision,
-    workflow: ctx.experimentWorkflow,
-    progress: {
-      observedAt: "2026-08-19T06:32:00.000Z",
-      shadowSamples: 3,
-      liveSamples: 0,
-      candidateLiveSamples: 0,
-      referenceEvalSummary: ctx.reference.evalSummary,
-      candidateEvalSummary: ctx.candidate.evalSummary,
-      referenceExecutionSummary: ctx.reference.executionSummary,
-      candidateExecutionSummary: ctx.candidate.executionSummary,
-    },
-  });
 }
 
 function liveAuthorizationInput(workflow, assignment = "candidate") {
@@ -99,7 +146,7 @@ function liveAuthorizationInput(workflow, assignment = "candidate") {
   };
 }
 
-test("bounded-live sample authorization is single-sample, R3/R4, shadow-first, and traffic-ceiling aware", async (t) => {
+test("bounded-live sample authorization is single-sample, distinct-subject, shadow-first, and traffic-ceiling aware", async (t) => {
   const ctx = await authorityContext(t, {
     budget: {
       maxTotalSamples: 5,
@@ -109,67 +156,50 @@ test("bounded-live sample authorization is single-sample, R3/R4, shadow-first, a
       maxCandidateTrafficBasisPoints: 5000,
     },
   });
-  const guardrail = await eligibleGuardrail(ctx);
-  assert.equal(guardrail.payload.classification, "ELIGIBLE_FOR_BOUNDED_LIVE");
-  const liveWorkflow = await approvedWorkflow(
-    ctx.root,
-    ctx.experiment.payload.projectId,
-    ctx.experiment.payload.riskClass,
-    "approval:bounded-live-sample-1",
-    "live-workflow",
-  );
+  const guardrail = guardrailDecision(ctx);
+  const liveWorkflow = await approvedWorkflow(ctx.root, ctx.experiment.payload.projectId, ctx.experiment.payload.riskClass, "approval:bounded-live-sample-1", "live-workflow");
 
-  await assert.rejects(
-    () => prepareBoundedLiveSampleAuthorization({
-      experiment: ctx.experiment,
-      experimentAuthorization: ctx.experimentAuthorization,
-      admissionDecision: ctx.admissionDecision,
-      experimentWorkflow: ctx.experimentWorkflow,
-      guardrailDecision: guardrail,
-      liveWorkflow,
-      authorization: liveAuthorizationInput(liveWorkflow, "candidate"),
-    }),
-    /traffic basis-point ceiling/,
-  );
-
-  const authorizationInput = liveAuthorizationInput(liveWorkflow, "reference");
-  const authorization = await prepareBoundedLiveSampleAuthorization({
+  await assert.rejects(() => prepareBoundedLiveSampleAuthorization({
     experiment: ctx.experiment,
     experimentAuthorization: ctx.experimentAuthorization,
     admissionDecision: ctx.admissionDecision,
     experimentWorkflow: ctx.experimentWorkflow,
     guardrailDecision: guardrail,
     liveWorkflow,
-    authorization: authorizationInput,
-  });
+    authorization: liveAuthorizationInput(liveWorkflow, "candidate"),
+  }), /traffic basis-point ceiling/);
+
+  const authorizationInputValue = liveAuthorizationInput(liveWorkflow, "reference");
+  const sources = {
+    experiment: ctx.experiment,
+    experimentAuthorization: ctx.experimentAuthorization,
+    admissionDecision: ctx.admissionDecision,
+    experimentWorkflow: ctx.experimentWorkflow,
+    guardrailDecision: guardrail,
+    liveWorkflow,
+    authorization: authorizationInputValue,
+  };
+  const authorization = await prepareBoundedLiveSampleAuthorization(sources);
   assert.match(authorization.authorizationId, /^m5liveauth:[a-f0-9]{32}$/);
   assert.equal(authorization.payload.riskClass, "R3");
   assert.equal(authorization.payload.liveAssignment, "reference");
+  assert.equal(authorization.payload.selectedSubjectId, "opencode:9router/hemat");
   assert.equal(authorization.payload.candidateTrafficAfterDispatchBasisPoints, 0);
   assert.equal(authorization.payload.singleSampleAuthority, true);
   assert.equal(authorization.payload.automaticDispatchAllowed, false);
-  await assert.doesNotReject(() => verifyBoundedLiveSampleAuthorization(authorization, {
-    experiment: ctx.experiment,
-    experimentAuthorization: ctx.experimentAuthorization,
-    admissionDecision: ctx.admissionDecision,
-    experimentWorkflow: ctx.experimentWorkflow,
-    guardrailDecision: guardrail,
-    liveWorkflow,
-    authorization: authorizationInput,
-  }));
+  await assert.doesNotReject(() => verifyBoundedLiveSampleAuthorization(authorization, sources));
+
+  await assert.rejects(() => prepareBoundedLiveSampleAuthorization({
+    ...sources,
+    authorization: { ...authorizationInputValue, approvedAt: "2026-08-19T06:20:00.000Z" },
+  }), /cannot predate the guardrail evidence/);
 });
 
-test("bounded-live publication requires verified succeeded Run Ledger, exact binding, and matching ephemeral output hash", async (t) => {
+test("bounded-live publication requires selected subject, verified Run Ledger, exact binding, and matching ephemeral output", async (t) => {
   const ctx = await authorityContext(t);
-  const guardrail = await eligibleGuardrail(ctx);
-  const liveWorkflow = await approvedWorkflow(
-    ctx.root,
-    ctx.experiment.payload.projectId,
-    ctx.experiment.payload.riskClass,
-    "approval:bounded-live-candidate-1",
-    "candidate-live-workflow",
-  );
-  const authorizationInput = liveAuthorizationInput(liveWorkflow, "candidate");
+  const guardrail = guardrailDecision(ctx);
+  const liveWorkflow = await approvedWorkflow(ctx.root, ctx.experiment.payload.projectId, ctx.experiment.payload.riskClass, "approval:bounded-live-candidate-1", "candidate-live-workflow");
+  const authorizationInputValue = liveAuthorizationInput(liveWorkflow, "candidate");
   const authorization = await prepareBoundedLiveSampleAuthorization({
     experiment: ctx.experiment,
     experimentAuthorization: ctx.experimentAuthorization,
@@ -177,7 +207,7 @@ test("bounded-live publication requires verified succeeded Run Ledger, exact bin
     experimentWorkflow: ctx.experimentWorkflow,
     guardrailDecision: guardrail,
     liveWorkflow,
-    authorization: authorizationInput,
+    authorization: authorizationInputValue,
   });
 
   const output = "verified candidate output";
@@ -197,13 +227,7 @@ test("bounded-live publication requires verified succeeded Run Ledger, exact bin
     policyDecisions: ["R0 zero-tool verified live candidate"],
     approvalIds: [],
     changeReferences: [],
-    evidence: [{
-      kind: "deterministic_check",
-      status: "passed",
-      reference: verificationReference,
-      producer: "bounded-live-verifier",
-      collectedAt: "2026-08-19T06:34:00.000Z",
-    }],
+    evidence: [{ kind: "deterministic_check", status: "passed", reference: verificationReference, producer: "bounded-live-verifier", collectedAt: "2026-08-19T06:34:00.000Z" }],
     resourceMetrics: { "runtime.total_ms": 100 },
     traceId: "trace:bounded-live-candidate-run",
     outcome: "succeeded",
@@ -260,13 +284,21 @@ test("bounded-live publication requires verified succeeded Run Ledger, exact bin
     { async read() { return `${output}-drift`; } },
     { id: "sink:bounded-live-test", async publish() { throw new Error("must not publish"); } },
   );
-  await assert.rejects(
-    () => badCoordinator.publish({ authorization, runtimeResult }),
-    /does not match verified runtime result hash\/size/,
-  );
+  await assert.rejects(() => badCoordinator.publish({ authorization, runtimeResult }), /does not match verified runtime result hash\/size/);
+
+  await assert.rejects(() => prepareVerifiedBoundedLiveRuntimeResult({
+    role: "candidate",
+    authorization,
+    run: { ...run, modelRoute: [ctx.experiment.payload.referenceSubjectId] },
+    binding,
+    verificationReference,
+    outputSha256,
+    outputBytes: Buffer.byteLength(output),
+    verifiedAt: "2026-08-19T06:34:01.000Z",
+  }), /modelRoute does not contain the authorized selected subject/);
 });
 
-test("reference restore requires ROLLBACK_REQUIRED plus separate durable R3/R4 approval", async (t) => {
+test("reference restore requires exact ROLLBACK_REQUIRED evidence plus separate durable R3/R4 approval", async (t) => {
   const ctx = await authorityContext(t, {
     budget: {
       maxTotalSamples: 6,
@@ -276,48 +308,15 @@ test("reference restore requires ROLLBACK_REQUIRED plus separate durable R3/R4 a
       maxCandidateTrafficBasisPoints: 10000,
     },
   });
-  const badCandidate = await buildExperimentCohort({
-    history: ctx.history,
-    report: ctx.failReport,
-    baseline: ctx.baseline,
-    prefix: "rollback-bad-candidate",
-    count: 3,
-    latencyBase: 200,
-    costBase: 0.1,
-    minuteBase: 30,
-  });
-  const rollbackGuardrail = await evaluateControlledExperimentGuardrails({
-    experiment: ctx.experiment,
-    authorization: ctx.experimentAuthorization,
-    admissionDecision: ctx.admissionDecision,
-    workflow: ctx.experimentWorkflow,
-    progress: {
-      observedAt: "2026-08-19T06:40:00.000Z",
-      shadowSamples: 2,
-      liveSamples: 1,
-      candidateLiveSamples: 1,
-      referenceEvalSummary: ctx.reference.evalSummary,
-      candidateEvalSummary: badCandidate.evalSummary,
-      referenceExecutionSummary: ctx.reference.executionSummary,
-      candidateExecutionSummary: badCandidate.executionSummary,
-    },
-  });
-  assert.equal(rollbackGuardrail.payload.classification, "ROLLBACK_REQUIRED");
-
-  const rollbackWorkflow = await approvedWorkflow(
-    ctx.root,
-    ctx.experiment.payload.projectId,
-    ctx.experiment.payload.riskClass,
-    "approval:reference-restore-1",
-    "rollback-workflow",
-  );
+  const rollbackGuardrail = guardrailDecision(ctx, { classification: "ROLLBACK_REQUIRED", shadowSamples: 2, liveSamples: 1, candidateLiveSamples: 1 });
+  const rollbackWorkflow = await approvedWorkflow(ctx.root, ctx.experiment.payload.projectId, ctx.experiment.payload.riskClass, "approval:reference-restore-1", "rollback-workflow");
   const rollbackInput = {
     actor: "operator:rollback-test",
     approvedAt: "2026-08-19T06:41:00.000Z",
     policyReferences: [ctx.experiment.payload.rollback.policyReference],
     approvalIds: rollbackWorkflow.approvalIds,
   };
-  const rollbackAuthorization = await prepareBoundedLiveRollbackAuthorization({
+  const sources = {
     experiment: ctx.experiment,
     experimentAuthorization: ctx.experimentAuthorization,
     admissionDecision: ctx.admissionDecision,
@@ -325,16 +324,9 @@ test("reference restore requires ROLLBACK_REQUIRED plus separate durable R3/R4 a
     guardrailDecision: rollbackGuardrail,
     rollbackWorkflow,
     authorization: rollbackInput,
-  });
-  await assert.doesNotReject(() => verifyBoundedLiveRollbackAuthorization(rollbackAuthorization, {
-    experiment: ctx.experiment,
-    experimentAuthorization: ctx.experimentAuthorization,
-    admissionDecision: ctx.admissionDecision,
-    experimentWorkflow: ctx.experimentWorkflow,
-    guardrailDecision: rollbackGuardrail,
-    rollbackWorkflow,
-    authorization: rollbackInput,
-  }));
+  };
+  const rollbackAuthorization = await prepareBoundedLiveRollbackAuthorization(sources);
+  await assert.doesNotReject(() => verifyBoundedLiveRollbackAuthorization(rollbackAuthorization, sources));
 
   const restoreCalls = [];
   const coordinator = new BoundedLiveReferenceRestoreCoordinator({
@@ -352,9 +344,14 @@ test("reference restore requires ROLLBACK_REQUIRED plus separate durable R3/R4 a
   });
   const receipt = await coordinator.restore(rollbackAuthorization);
   assert.equal(restoreCalls.length, 1);
-  assert.equal(receipt.payload.targetSubjectId, ctx.experiment.payload.referenceSubjectId);
+  assert.equal(receipt.payload.targetSubjectId, "opencode:9router/hemat");
   assert.equal(receipt.payload.referenceSubjectRestored, true);
   assert.equal(receipt.payload.automaticRollbackAllowed, false);
   assert.equal(receipt.payload.generalProductionRoutingMutationAllowed, false);
   await assert.doesNotReject(() => verifyBoundedLiveReferenceRestoreReceipt(receipt));
+
+  await assert.rejects(() => prepareBoundedLiveRollbackAuthorization({
+    ...sources,
+    authorization: { ...rollbackInput, approvedAt: "2026-08-19T06:20:00.000Z" },
+  }), /cannot predate ROLLBACK_REQUIRED evidence/);
 });
