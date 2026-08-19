@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JsonlBoundedLiveSideEffectJournal } from "../dist/index.js";
 
 async function openJournal(t, name = "effects.jsonl") {
-  const root = t.mock?.root ?? process.env.TMPDIR ?? process.env.TEMP ?? ".";
-  const path = join(root, `9router-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}-${name}`);
+  const root = await mkdtemp(join(tmpdir(), "9router-live-effect-test-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  const path = join(root, name);
   const options = { filePath: path, maxFileBytes: 512 * 1024, maxEventBytes: 32 * 1024, maxStringBytes: 2048 };
   return { journal: await JsonlBoundedLiveSideEffectJournal.open(options), options };
 }
