@@ -167,14 +167,22 @@ export class BoundedExperimentExecutor {
       }
     }
 
-    const dispatchEvent = await this.journal.recordDispatch({
-      sampleId: request.sampleId,
-      adapterId: receipt.adapterId,
-      acceptedAt: receipt.acceptedAt,
-      referenceExecutionReference: receipt.referenceExecutionReference,
-      candidateExecutionReference: receipt.candidateExecutionReference,
-      candidateOutputExternallyVisible: receipt.candidateOutputExternallyVisible,
-    });
+    let dispatchEvent: ControlledExperimentExecutionJournalEvent;
+    try {
+      dispatchEvent = await this.journal.recordDispatch({
+        sampleId: request.sampleId,
+        adapterId: receipt.adapterId,
+        acceptedAt: receipt.acceptedAt,
+        referenceExecutionReference: receipt.referenceExecutionReference,
+        candidateExecutionReference: receipt.candidateExecutionReference,
+        candidateOutputExternallyVisible: receipt.candidateOutputExternallyVisible,
+      });
+    } catch (error) {
+      throw new Error(
+        `Bounded experiment adapter accepted sample ${request.sampleId} but durable sample_dispatched persistence failed: ${safeErrorMessage(error)}; external side effect may have occurred, manual reconciliation is required, and automatic redispatch is forbidden`,
+      );
+    }
+
     const evidence = await controlledExperimentExecutionEventToEvidence(dispatchEvent, receipt.acceptedAt);
     return Object.freeze({
       reservationEvent,
