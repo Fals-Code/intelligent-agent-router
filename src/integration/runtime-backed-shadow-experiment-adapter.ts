@@ -176,7 +176,7 @@ function sanitizeText(value: string): string {
 }
 
 function normalizePath(value: string): string {
-  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return value.replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
 function sameArray(left: readonly string[], right: readonly string[]): boolean {
