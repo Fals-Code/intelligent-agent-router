@@ -1,18 +1,11 @@
-import type { RiskClass, WorkflowRun } from "../control-plane/contracts.js";
+import type { WorkflowRun } from "../control-plane/contracts.js";
 import type { ControlledExperimentGuardrailDecision } from "./controlled-experiment-guardrails.js";
 import { verifyControlledExperimentGuardrailDecision } from "./controlled-experiment-guardrails.js";
 import type { M5AdmissionDecision } from "./m5-admission-gate.js";
-import type {
-  ControlledExperimentAuthorization,
-  ControlledExperimentDefinition,
-} from "./controlled-experiment.js";
-import {
-  verifyControlledExperimentAuthorization,
-  verifyControlledExperimentDefinition,
-} from "./controlled-experiment.js";
+import type { ControlledExperimentAuthorization, ControlledExperimentDefinition } from "./controlled-experiment.js";
+import { verifyControlledExperimentAuthorization, verifyControlledExperimentDefinition } from "./controlled-experiment.js";
 
 export const BOUNDED_LIVE_SAMPLE_AUTHORIZATION_SCHEMA_VERSION = 1 as const;
-
 export type BoundedLiveAssignment = "reference" | "candidate";
 
 export interface BoundedLiveSampleAuthorizationInput {
@@ -85,15 +78,19 @@ export async function prepareBoundedLiveSampleAuthorization(input: {
   assertLiveWorkflow(experiment, liveWorkflow);
 
   const authorization = normalizeInput(input.authorization);
+  if (Date.parse(authorization.approvedAt) < Date.parse(guardrailDecision.payload.observedAt)) {
+    throw new Error("Bounded-live sample approval cannot predate the guardrail evidence it authorizes");
+  }
+  if (Date.parse(authorization.approvedAt) < Date.parse(liveWorkflow.updatedAt)) {
+    throw new Error("Bounded-live sample approval timestamp cannot predate durable live workflow approval state");
+  }
   const durableApprovals = normalizeSafeSet(liveWorkflow.approvalIds, "Bounded-live durable approvalId", true);
   if (!sameArray(authorization.approvalIds, durableApprovals)) {
     throw new Error("Bounded-live sample approvalIds do not match durable live workflow approvals");
   }
 
   const counters = nextCounters(experiment, guardrailDecision, authorization.liveAssignment);
-  const selectedSubjectId = authorization.liveAssignment === "candidate"
-    ? experiment.payload.candidateSubjectId
-    : experiment.payload.referenceSubjectId;
+  const selectedSubjectId = authorization.liveAssignment === "candidate" ? experiment.payload.candidateSubjectId : experiment.payload.referenceSubjectId;
   const payload: BoundedLiveSampleAuthorizationPayload = deepFreeze({
     ...authorization,
     experimentId: experiment.experimentId,
@@ -128,10 +125,7 @@ export async function prepareBoundedLiveSampleAuthorization(input: {
   });
 }
 
-export async function verifyBoundedLiveSampleAuthorization(
-  authorization: BoundedLiveSampleAuthorization,
-  sources: Parameters<typeof prepareBoundedLiveSampleAuthorization>[0],
-): Promise<void> {
+export async function verifyBoundedLiveSampleAuthorizationEnvelope(authorization: BoundedLiveSampleAuthorization): Promise<void> {
   if (!isRecord(authorization)) throw new Error("Bounded-live sample authorization must be an object");
   assertExactFields(authorization, ENVELOPE_FIELDS, "Bounded-live sample authorization");
   if (authorization.schemaVersion !== BOUNDED_LIVE_SAMPLE_AUTHORIZATION_SCHEMA_VERSION || authorization.algorithm !== "sha256") {
@@ -139,12 +133,42 @@ export async function verifyBoundedLiveSampleAuthorization(
   }
   if (!isRecord(authorization.payload)) throw new Error("Bounded-live sample authorization payload is invalid");
   assertExactFields(authorization.payload, PAYLOAD_FIELDS, "Bounded-live sample authorization payload");
-  const expected = await prepareBoundedLiveSampleAuthorization(sources);
-  if (authorization.authorizationId !== expected.authorizationId || authorization.authorizationSha256 !== expected.authorizationSha256) {
-    throw new Error("Bounded-live sample authorization digest does not match authoritative sources");
+  const payload = authorization.payload;
+  if (payload.liveAssignment !== "reference" && payload.liveAssignment !== "candidate") throw new Error("Bounded-live sample authorization liveAssignment is invalid");
+  if (payload.riskClass !== "R3" && payload.riskClass !== "R4") throw new Error("Bounded-live sample authorization riskClass is invalid");
+  if (payload.singleSampleAuthority !== true
+    || payload.automaticDispatchAllowed !== false
+    || payload.automaticRedispatchAllowed !== false
+    || payload.productionRoutingMutationAllowed !== false
+    || payload.automaticRollbackAllowed !== false) {
+    throw new Error("Bounded-live sample authorization safety flags are invalid");
   }
-  if (stableStringify(authorization.payload) !== stableStringify(expected.payload)) {
-    throw new Error("Bounded-live sample authorization payload does not match authoritative sources");
+  if (payload.candidateOutputMayBeExternallyVisible !== (payload.liveAssignment === "candidate")) {
+    throw new Error("Bounded-live sample authorization candidate visibility flag mismatch");
+  }
+  for (const value of [payload.shadowSamplesBeforeLive, payload.liveSamplesBeforeDispatch, payload.candidateLiveSamplesBeforeDispatch]) {
+    if (!Number.isInteger(value) || value < 0) throw new Error("Bounded-live sample authorization counters are invalid");
+  }
+  if (!Number.isFinite(payload.candidateTrafficAfterDispatchBasisPoints)
+    || payload.candidateTrafficAfterDispatchBasisPoints < 0
+    || payload.candidateTrafficAfterDispatchBasisPoints > 10000) {
+    throw new Error("Bounded-live sample authorization candidate traffic basis points are invalid");
+  }
+  const expected = await sha256Canonical(payload);
+  if (authorization.authorizationSha256 !== expected || authorization.authorizationId !== `m5liveauth:${expected.slice(0, 32).toLowerCase()}`) {
+    throw new Error("Bounded-live sample authorization digest is invalid");
+  }
+}
+
+export async function verifyBoundedLiveSampleAuthorization(
+  authorization: BoundedLiveSampleAuthorization,
+  sources: Parameters<typeof prepareBoundedLiveSampleAuthorization>[0],
+): Promise<void> {
+  await verifyBoundedLiveSampleAuthorizationEnvelope(authorization);
+  const expected = await prepareBoundedLiveSampleAuthorization(sources);
+  if (authorization.authorizationId !== expected.authorizationId || authorization.authorizationSha256 !== expected.authorizationSha256
+    || stableStringify(authorization.payload) !== stableStringify(expected.payload)) {
+    throw new Error("Bounded-live sample authorization does not match authoritative sources");
   }
 }
 
@@ -157,11 +181,10 @@ function assertExperimentAuthority(
   if (authorization.payload.decision !== "allow" || authorization.payload.experimentContractAuthorized !== true) {
     throw new Error("Bounded-live sample requires an explicit allow experiment authorization");
   }
-  if (experiment.payload.exposureMode !== "shadow_then_bounded_live") {
-    throw new Error("Bounded-live sample requires shadow_then_bounded_live experiment mode");
-  }
-  if (experiment.payload.riskClass !== "R3" && experiment.payload.riskClass !== "R4") {
-    throw new Error("Bounded-live sample requires R3 or R4 experiment risk class");
+  if (experiment.payload.exposureMode !== "shadow_then_bounded_live") throw new Error("Bounded-live sample requires shadow_then_bounded_live experiment mode");
+  if (experiment.payload.riskClass !== "R3" && experiment.payload.riskClass !== "R4") throw new Error("Bounded-live sample requires R3 or R4 experiment risk class");
+  if (experiment.payload.referenceSubjectId === experiment.payload.candidateSubjectId) {
+    throw new Error("Bounded-live sample requires distinct reference and candidate subjects");
   }
   if (guardrail.payload.experimentId !== experiment.experimentId
     || guardrail.payload.experimentSha256 !== experiment.experimentSha256
@@ -170,9 +193,7 @@ function assertExperimentAuthority(
     || guardrail.payload.workflowRunId !== workflow.id) {
     throw new Error("Bounded-live guardrail decision does not match exact experiment authority");
   }
-  const expectedClassification = guardrail.payload.liveSamples === 0
-    ? "ELIGIBLE_FOR_BOUNDED_LIVE"
-    : "CONTINUE_BOUNDED_LIVE";
+  const expectedClassification = guardrail.payload.liveSamples === 0 ? "ELIGIBLE_FOR_BOUNDED_LIVE" : "CONTINUE_BOUNDED_LIVE";
   if (guardrail.payload.classification !== expectedClassification) {
     throw new Error(`Bounded-live sample requires ${expectedClassification}; received ${guardrail.payload.classification}`);
   }
@@ -191,48 +212,39 @@ function assertLiveWorkflow(experiment: ControlledExperimentDefinition, workflow
   if (workflow.projectId !== experiment.payload.projectId) throw new Error("Bounded-live live workflow projectId mismatch");
   if (workflow.riskClass !== experiment.payload.riskClass) throw new Error("Bounded-live live workflow riskClass mismatch");
   if (workflow.riskClass !== "R3" && workflow.riskClass !== "R4") throw new Error("Bounded-live live workflow must be R3 or R4");
-  if (workflow.phase !== "publish" || workflow.status !== "running") {
-    throw new Error("Bounded-live live workflow must be active in publish phase after durable approval");
-  }
+  if (workflow.phase !== "publish" || workflow.status !== "running") throw new Error("Bounded-live live workflow must be active in publish phase after durable approval");
+  prepareTimestamp(workflow.updatedAt, "Bounded-live live workflow updatedAt");
   normalizeSafeSet(workflow.approvalIds, "Bounded-live durable approvalId", true);
 }
 
-function nextCounters(
-  experiment: ControlledExperimentDefinition,
-  guardrail: ControlledExperimentGuardrailDecision,
-  assignment: BoundedLiveAssignment,
-): { readonly liveSamples: number; readonly candidateLiveSamples: number; readonly candidateTrafficBasisPoints: number } {
+function nextCounters(experiment: ControlledExperimentDefinition, guardrail: ControlledExperimentGuardrailDecision, assignment: BoundedLiveAssignment) {
   const liveSamples = guardrail.payload.liveSamples + 1;
   const candidateLiveSamples = guardrail.payload.candidateLiveSamples + (assignment === "candidate" ? 1 : 0);
   const budget = experiment.payload.budget;
   if (liveSamples > budget.maxLiveSamples) throw new Error("Bounded-live sample would exceed maxLiveSamples");
   if (candidateLiveSamples > budget.maxCandidateLiveSamples) throw new Error("Bounded-live sample would exceed maxCandidateLiveSamples");
   const candidateTrafficBasisPoints = (candidateLiveSamples / liveSamples) * 10000;
-  if (candidateTrafficBasisPoints > budget.maxCandidateTrafficBasisPoints) {
-    throw new Error("Bounded-live sample would exceed candidate traffic basis-point ceiling");
-  }
-  if (guardrail.payload.completedSamples + 1 > budget.maxTotalSamples) {
-    throw new Error("Bounded-live sample would exceed total experiment sample budget");
-  }
+  if (candidateTrafficBasisPoints > budget.maxCandidateTrafficBasisPoints) throw new Error("Bounded-live sample would exceed candidate traffic basis-point ceiling");
+  if (guardrail.payload.completedSamples + 1 > budget.maxTotalSamples) throw new Error("Bounded-live sample would exceed total experiment sample budget");
   return { liveSamples, candidateLiveSamples, candidateTrafficBasisPoints };
 }
 
 function normalizeInput(input: BoundedLiveSampleAuthorizationInput): BoundedLiveSampleAuthorizationInput {
-  if (input.liveAssignment !== "reference" && input.liveAssignment !== "candidate") {
-    throw new Error("Bounded-live assignment must be reference or candidate");
-  }
-  const sampleId = prepareIdentity(input.sampleId, "Bounded-live sampleId");
-  const inputReference = prepareSafeReference(input.inputReference, "Bounded-live inputReference");
-  const actor = prepareIdentity(input.actor, "Bounded-live actor");
-  const approvedAt = prepareTimestamp(input.approvedAt, "Bounded-live approvedAt");
-  const policyReferences = normalizeSafeSet(input.policyReferences, "Bounded-live policy reference", true);
-  const approvalIds = normalizeSafeSet(input.approvalIds, "Bounded-live approvalId", true);
-  return deepFreeze({ sampleId, inputReference, liveAssignment: input.liveAssignment, actor, approvedAt, policyReferences, approvalIds });
+  if (input.liveAssignment !== "reference" && input.liveAssignment !== "candidate") throw new Error("Bounded-live assignment must be reference or candidate");
+  return deepFreeze({
+    sampleId: prepareIdentity(input.sampleId, "Bounded-live sampleId"),
+    inputReference: prepareIdentity(input.inputReference, "Bounded-live inputReference"),
+    liveAssignment: input.liveAssignment,
+    actor: prepareIdentity(input.actor, "Bounded-live actor"),
+    approvedAt: prepareTimestamp(input.approvedAt, "Bounded-live approvedAt"),
+    policyReferences: normalizeSafeSet(input.policyReferences, "Bounded-live policy reference", true),
+    approvalIds: normalizeSafeSet(input.approvalIds, "Bounded-live approvalId", true),
+  });
 }
 
 function normalizeSafeSet(values: readonly string[], label: string, requireNonEmpty: boolean): readonly string[] {
   if (!Array.isArray(values)) throw new Error(`${label}s must be an array`);
-  const normalized = [...new Set(values.map((value) => prepareSafeReference(value, label)))].sort();
+  const normalized = [...new Set(values.map((value) => prepareIdentity(value, label)))].sort();
   if (normalized.length !== values.length) throw new Error(`${label}s must not contain duplicates`);
   if (requireNonEmpty && normalized.length === 0) throw new Error(`${label}s must not be empty`);
   return deepFreeze(normalized);
@@ -244,10 +256,6 @@ function prepareIdentity(value: unknown, label: string): string {
   if (/\r|\n/.test(prepared)) throw new Error(`${label} must be single-line`);
   if (containsSecretLikeMaterial(prepared)) throw new Error(`${label} contains secret-like material`);
   return prepared;
-}
-
-function prepareSafeReference(value: unknown, label: string): string {
-  return prepareIdentity(value, label);
 }
 
 function prepareTimestamp(value: unknown, label: string): string {
