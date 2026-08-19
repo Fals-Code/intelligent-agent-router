@@ -123,8 +123,9 @@ test("legacy immediate bounded-live dispatch fails closed before reservation or 
   }
   const beforeRequests = ctx.adapter.requests.length;
   const beforeReservations = ctx.executor.inspect().reservedSampleCount;
+  const liveProgress = await progress(ctx, 3);
   await assert.rejects(
-    () => ctx.executor.dispatchSample(dispatchInput(ctx, "legacy-live", "bounded_live", "candidate", await progress(ctx, 3))),
+    () => ctx.executor.dispatchSample(dispatchInput(ctx, "legacy-live", "bounded_live", "candidate", liveProgress)),
     /Immediate bounded-live dispatch is disabled; use DeferredBoundedLiveExecutor verify-before-visibility path/,
   );
   assert.equal(ctx.adapter.requests.length, beforeRequests);
