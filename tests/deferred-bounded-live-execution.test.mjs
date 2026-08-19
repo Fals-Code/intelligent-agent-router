@@ -48,7 +48,7 @@ function runRecord(runId, subjectId, verificationReference) { return { runId, pr
 function binding(runId, sessionId) { return { workflowRunId: runId, projectId: "project-controlled-experiment", workflowAttempt: 1, runtimeId: "opencode", sessionId, workspace: "C:/isolated/deferred-live", boundAt: "2026-08-19T07:00:11.000Z" }; }
 
 test("deferred bounded-live keeps candidate invisible until paired verification and durably committed publication", async (t) => {
-  const ctx = await context(t); const deferred = new DeferredBoundedLiveExecutor(ctx.journal);
+  const ctx = await context(t); const deferred = new DeferredBoundedLiveExecutor(ctx.journal, ctx.sideEffects);
   await deferred.reserve({ experiment: ctx.experiment, authorization: ctx.sampleAuthorization, requestedAt: "2026-08-19T07:00:12.000Z" });
   assert.equal(ctx.journal.latest(ctx.sampleAuthorization.payload.sampleId).payload.eventType, "sample_reserved");
   const referenceRun = runRecord("deferred-reference-run", ctx.experiment.payload.referenceSubjectId, "verify:deferred-reference"); const candidateRun = runRecord("deferred-candidate-run", ctx.experiment.payload.candidateSubjectId, "verify:deferred-candidate");
@@ -67,6 +67,6 @@ test("deferred bounded-live keeps candidate invisible until paired verification 
 });
 
 test("deferred bounded-live reservation fails when sample authorization counters drift from durable journal", async (t) => {
-  const ctx = await context(t); const deferred = new DeferredBoundedLiveExecutor(ctx.journal); const badAuthorization = { ...ctx.sampleAuthorization, payload: { ...ctx.sampleAuthorization.payload, shadowSamplesBeforeLive: 2 } };
+  const ctx = await context(t); const deferred = new DeferredBoundedLiveExecutor(ctx.journal, ctx.sideEffects); const badAuthorization = { ...ctx.sampleAuthorization, payload: { ...ctx.sampleAuthorization.payload, shadowSamplesBeforeLive: 2 } };
   await assert.rejects(() => deferred.reserve({ experiment: ctx.experiment, authorization: badAuthorization, requestedAt: "2026-08-19T07:00:12.000Z" }), /authorization digest is invalid|counters do not match durable completed journal state/);
 });
