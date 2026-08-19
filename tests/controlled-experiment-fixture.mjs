@@ -205,6 +205,9 @@ export async function buildExperimentCohort({
     projections.push(projection);
   }
   return {
+    observations,
+    projections,
+    records,
     evalSummary: await buildEvalCohortSummary(observations),
     executionSummary: await buildExecutionReliabilitySummary(observations, projections, records),
   };
