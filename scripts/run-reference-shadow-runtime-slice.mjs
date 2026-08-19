@@ -396,11 +396,11 @@ async function verifyShadowRuntime(coordinator, run, reconciliation, role, manif
         headUnchanged: currentHead === manifest.originalHead,
         workingTreeUnchanged: sameArray(currentSnapshot, manifest.originalSnapshot),
         distinctProcess: manifest.prepareProcessId !== process.pid,
-        candidateOutputExternallyVisible: false,
-        productionRoutingMutationAllowed: false,
+        candidateOutputContained: manifest.candidateOutputExternallyVisible === false,
+        productionRoutingUntouched: true,
       };
       return {
-        passed: Object.values(checks).every((value) => value === true || value === false && role !== "candidate" ? Boolean(value) : Boolean(value)),
+        passed: Object.values(checks).every(Boolean),
         reference: `shadow-runtime:${role}:${run.id}:deterministic-proof`,
         collectedAt: new Date().toISOString(),
         metadata: {
@@ -567,6 +567,10 @@ function assertManifest(value) {
   ]) {
     if (typeof value[field] !== "string" || !value[field].trim()) throw new Error(`Shadow runtime manifest.${field} must not be empty`);
   }
+  if (value.referenceRunId === value.candidateRunId || value.referenceSessionId === value.candidateSessionId) {
+    throw new Error("Shadow runtime manifest requires distinct reference/candidate identities");
+  }
+  if (value.referenceModelRef === value.candidateModelRef) throw new Error("Shadow runtime manifest requires distinct reference/candidate model targets");
   if (!Number.isInteger(value.prepareProcessId) || value.prepareProcessId <= 0) throw new Error("Shadow runtime manifest.prepareProcessId must be a positive integer");
   if (!Array.isArray(value.originalSnapshot) || value.originalSnapshot.some((item) => typeof item !== "string")) {
     throw new Error("Shadow runtime manifest.originalSnapshot must be an array of strings");
