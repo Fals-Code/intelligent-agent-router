@@ -63,6 +63,9 @@ export class IsolatedLoopbackBoundedLiveSinkClient implements BoundedLivePublica
       const publications = asRecordArray(state.publications, "isolated sink publications");
       const entry = publications.find((item) => item.idempotencyKey === request.idempotencyKey);
       if (!entry) return { status: "absent", kind: request.kind, idempotencyKey: request.idempotencyKey, sinkId: this.id, authoritative: true, observedAt };
+      if (entry.sampleAuthorizationId !== request.authorityId) {
+        throw new Error("Isolated recovery publication sampleAuthorizationId does not match durable authorityId");
+      }
       return {
         status: "applied",
         kind: request.kind,

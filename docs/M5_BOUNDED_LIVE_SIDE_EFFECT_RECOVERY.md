@@ -34,7 +34,7 @@ The `verifyBoundedLiveSideEffectRecoveryReport` function enforces exact envelope
 1. `consistent_committed`: requires `operation_committed` event type, `externalReference`, `explicitOperatorActionRequired=false`, and forbids probe fields (`probeId`, `probeStatus`).
 2. `external_commit_observed`: forbids `operation_committed` event type, requires `probeId`, `probeStatus=applied`, `externalReference`, and `explicitOperatorActionRequired=true`.
 3. `explicit_retry_eligible`: requires `operation_reserved` event type, `probeId`, `probeStatus=absent`, forbids `externalReference`, and requires `explicitOperatorActionRequired=true`.
-4. `manual_reconciliation_required`: cannot encode `operation_committed`, and requires `explicitOperatorActionRequired=true`.
+4. `manual_reconciliation_required`: cannot encode `operation_committed`; requires `probeId`, `probeStatus`, and `explicitOperatorActionRequired=true`; forbids `externalReference`; and cannot encode `operation_reserved` + authoritative `absent`, which must instead classify as `explicit_retry_eligible`.
 
 Digest or SHA-256 validity alone will never make a semantically forged report pass validation.
 
@@ -44,7 +44,7 @@ Before a sink probe can emit `status=absent` with `authoritative=true`, `Isolate
 - Top-level schema version and flags (`rawOutputPersisted=false`).
 - Structural completeness of all publication and restore entries.
 - Validation of required identities, SHA-256 hashes, timestamps, and references.
-- Strict uniqueness of idempotency keys per side-effect type.
+- Strict uniqueness of idempotency keys and external references per side-effect type, plus restore active-subject consistency.
 - Absolute prohibition of raw provider output persistence.
 
 Any structural drift, malformed entity, duplicate idempotency key, or raw output persistence causes probe failure, placing recovery into `manual_reconciliation_required`.
@@ -68,10 +68,14 @@ A proof PASS outputs machine-readable evidence asserting:
 - `journalReopened == true`
 - `publicationDuplicateCount == 0`
 - `restoreDuplicateCount == 0`
-- `allAutomaticRetryAllowed == false`
-- `allAutomaticMutationAllowed == false`
+- `automaticRetryAllowed == false`
+- `automaticMutationAllowed == false`
 - `recoveryPostSideEffectCalls == 0`
+- `committedPathProbes == 0`
 - `rawProviderOutputPersisted == false`
+- `productionRoutingMutationAllowed == false`
+- `automaticRedispatchAllowed == false`
+- `isolatedSinkLoopbackOnly == true`
 - `gitHeadUnchanged == true`
 - `workingTreeUnchanged == true`
 - SHA-256 hashes of durable state evidence files.

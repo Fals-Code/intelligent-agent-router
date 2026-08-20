@@ -359,6 +359,62 @@ test("malformed or duplicate persisted sink state fails manual and never becomes
     });
   }
 });
+test("publication recovery rejects authority drift and fails closed to manual reconciliation", async (t) => {
+  const idempotencyKey = "idem:authority-drift";
+
+  const client = await isolatedStateClient(
+    t,
+    validSinkState({
+      publications: [
+        validPublicationStateEntry({
+          idempotencyKey,
+          sampleAuthorizationId: "auth:wrong-authority",
+          sampleId: "sample-recovery-1",
+          selectedSubjectId: "opencode:9router/smart",
+          outputSha256: "A".repeat(64),
+          publicationReference: "isolated-publication:authority-drift-1",
+        }),
+      ],
+    })
+  );
+
+  const { journal } = await fixture(t);
+
+  const reservation = publicationReservation({
+    operationId: "publication:authority-drift",
+    idempotencyKey,
+    sinkId: client.id,
+    authorityId: "m5liveauth:recovery",
+  });
+
+  await journal.reserve(reservation);
+
+  const report =
+    await new BoundedLiveSideEffectRecoveryCoordinator().reconcile({
+      journal,
+      operationId: reservation.operationId,
+      probe: client,
+    });
+
+  assert.equal(
+    report.payload.classification,
+    "manual_reconciliation_required"
+  );
+  assert.equal(report.payload.probeStatus, "unknown");
+  assert.equal(report.payload.externalReference, undefined);
+  assert.equal(report.payload.automaticRetryAllowed, false);
+  assert.equal(report.payload.automaticMutationAllowed, false);
+  assert.equal(
+    report.payload.explicitOperatorActionRequired,
+    true
+  );
+  assert.match(
+    report.payload.reason,
+    /sampleAuthorizationId does not match durable authorityId/
+  );
+
+  await verifyBoundedLiveSideEffectRecoveryReport(report);
+});
 test("semantic forgery: valid report modified into impossible combination fails verification despite valid hash", async () => {
   const basePayload = {
     operationId: "publication:forgery-1",
