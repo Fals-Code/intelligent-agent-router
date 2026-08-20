@@ -51,17 +51,18 @@ export class OpenCodeBoundedLiveOutputReader implements BoundedLiveOutputReader 
       path: `/session/${encodeURIComponent(input.sessionId)}/message`,
       directory: this.workspace,
     });
-    const messages = Array.isArray(raw) ? raw : [];
-    const assistants = messages.filter((message) => stringValue(message.info?.role) === "assistant");
+    const messages: readonly OpenCodeMessage[] = Array.isArray(raw) ? raw : [];
+    const assistants = messages.filter((message: OpenCodeMessage) => stringValue(message.info?.role) === "assistant");
     if (assistants.length === 0) throw new Error("OpenCode bounded-live output reader found no assistant message");
 
-    const completed = assistants.filter((message) => timestamp(message.info?.time?.completed) !== undefined || terminalFinish(message.info?.finish));
+    const completed = assistants.filter((message: OpenCodeMessage) => timestamp(message.info?.time?.completed) !== undefined || terminalFinish(message.info?.finish));
     const selected = (completed.length > 0 ? completed : assistants).at(-1);
     if (!selected) throw new Error("OpenCode bounded-live output reader could not select assistant output");
-    const text = (Array.isArray(selected.parts) ? selected.parts : [])
-      .filter((part) => stringValue(part?.type) === "text")
-      .map((part) => stringValue(part?.text))
-      .filter((value): value is string => Boolean(value))
+    const parts: readonly OpenCodeMessagePart[] = Array.isArray(selected.parts) ? selected.parts : [];
+    const text = parts
+      .filter((part: OpenCodeMessagePart) => stringValue(part.type) === "text")
+      .map((part: OpenCodeMessagePart) => stringValue(part.text))
+      .filter((value: string | undefined): value is string => Boolean(value))
       .join("\n")
       .trim();
     if (!text) throw new Error("OpenCode bounded-live output reader selected assistant message has no text output");
@@ -78,8 +79,9 @@ function terminalFinish(value: unknown): boolean {
 
 function timestamp(value: unknown): string | undefined {
   if (typeof value !== "number" && typeof value !== "string") return undefined;
-  const parsed = typeof value === "number" ? new Date(value).toISOString() : new Date(value).toISOString();
-  return Number.isFinite(Date.parse(parsed)) ? parsed : undefined;
+  const parsed = typeof value === "number" ? value : Date.parse(value);
+  if (!Number.isFinite(parsed)) return undefined;
+  return new Date(parsed).toISOString();
 }
 
 function stringValue(value: unknown): string | undefined {
