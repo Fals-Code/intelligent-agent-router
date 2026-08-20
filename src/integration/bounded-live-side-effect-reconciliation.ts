@@ -101,7 +101,6 @@ export class BoundedLiveSideEffectRecoveryCoordinator {
     readonly probe: BoundedLiveSideEffectReconciliationProbe;
   }): Promise<BoundedLiveSideEffectRecoveryReport> {
     const operationId = prepareIdentity(input.operationId, "Bounded-live recovery operationId");
-    const probeId = prepareIdentity(input.probe.id, "Bounded-live recovery probe id");
     const latest = input.journal.latest(operationId);
     if (!latest) throw new Error(`Bounded-live recovery operation is not present in durable journal: ${operationId}`);
 
@@ -116,6 +115,7 @@ export class BoundedLiveSideEffectRecoveryCoordinator {
       });
     }
 
+    const probeId = prepareIdentity(input.probe.id, "Bounded-live recovery probe id");
     const request = requestFromEvent(latest);
     let observation: BoundedLiveSideEffectProbeObservation;
     try {
@@ -195,6 +195,11 @@ export class BoundedLiveSideEffectRecoveryCoordinator {
 
 export async function verifyBoundedLiveSideEffectRecoveryReport(report: BoundedLiveSideEffectRecoveryReport): Promise<void> {
   if (!report || typeof report !== "object") throw new Error("Bounded-live recovery report must be an object");
+  assertExactFields(
+    report as unknown as Record<string, unknown>,
+    new Set(["schemaVersion", "algorithm", "reconciliationId", "reconciliationSha256", "payload"]),
+    "Bounded-live recovery report envelope"
+  );
   if (report.schemaVersion !== BOUNDED_LIVE_SIDE_EFFECT_RECONCILIATION_SCHEMA_VERSION || report.algorithm !== "sha256") {
     throw new Error("Bounded-live recovery report envelope is invalid");
   }
@@ -289,6 +294,31 @@ async function prepareReport(input: {
 }
 
 function validatePayload(payload: BoundedLiveSideEffectRecoveryPayload): void {
+  assertExactFields(
+    payload as unknown as Record<string, unknown>,
+    new Set([
+      "operationId",
+      "kind",
+      "journalEventId",
+      "journalEventType",
+      "idempotencyKey",
+      "sinkId",
+      "authorityId",
+      "subjectId",
+      "sampleId",
+      "outputSha256",
+      "probeId",
+      "probeStatus",
+      "externalReference",
+      "classification",
+      "automaticRetryAllowed",
+      "automaticMutationAllowed",
+      "explicitOperatorActionRequired",
+      "observedAt",
+      "reason",
+    ]),
+    "Bounded-live recovery payload"
+  );
   prepareIdentity(payload.operationId, "Bounded-live recovery payload operationId");
   if (payload.kind !== "publication" && payload.kind !== "reference_restore") throw new Error("Bounded-live recovery payload kind is invalid");
   prepareIdentity(payload.journalEventId, "Bounded-live recovery payload journalEventId");
@@ -299,6 +329,15 @@ function validatePayload(payload: BoundedLiveSideEffectRecoveryPayload): void {
   prepareIdentity(payload.subjectId, "Bounded-live recovery payload subjectId");
   if (payload.sampleId !== undefined) prepareIdentity(payload.sampleId, "Bounded-live recovery payload sampleId");
   if (payload.outputSha256 !== undefined) prepareSha256(payload.outputSha256, "Bounded-live recovery payload outputSha256");
+
+  if (payload.kind === "publication") {
+    if (payload.sampleId === undefined || payload.outputSha256 === undefined) {
+      throw new Error("Bounded-live recovery publication payload requires sampleId and outputSha256");
+    }
+  } else if (payload.sampleId !== undefined || payload.outputSha256 !== undefined) {
+    throw new Error("Bounded-live recovery reference_restore payload forbids sampleId and outputSha256");
+  }
+
   if (payload.probeId !== undefined) prepareIdentity(payload.probeId, "Bounded-live recovery payload probeId");
   if (payload.probeStatus !== undefined && !["applied", "absent", "unknown"].includes(payload.probeStatus)) throw new Error("Bounded-live recovery payload probeStatus is invalid");
   if (payload.externalReference !== undefined) prepareIdentity(payload.externalReference, "Bounded-live recovery payload externalReference");
@@ -307,6 +346,45 @@ function validatePayload(payload: BoundedLiveSideEffectRecoveryPayload): void {
   if (typeof payload.explicitOperatorActionRequired !== "boolean") throw new Error("Bounded-live recovery explicitOperatorActionRequired must be boolean");
   prepareTimestamp(payload.observedAt, "Bounded-live recovery payload observedAt");
   prepareText(payload.reason, "Bounded-live recovery payload reason");
+
+  // Semantic matrix enforcement:
+  if (payload.classification === "consistent_committed") {
+    if (payload.journalEventType !== "operation_committed") throw new Error("consistent_committed requires journalEventType operation_committed");
+    if (!payload.externalReference) throw new Error("consistent_committed requires externalReference");
+    if (payload.probeId !== undefined || payload.probeStatus !== undefined) throw new Error("consistent_committed forbids probe fields");
+    if (payload.explicitOperatorActionRequired !== false) throw new Error("consistent_committed explicitOperatorActionRequired must be false");
+  } else if (payload.classification === "external_commit_observed") {
+    if (payload.journalEventType === "operation_committed") throw new Error("external_commit_observed cannot have journalEventType operation_committed");
+    if (!payload.probeId) throw new Error("external_commit_observed requires probeId");
+    if (payload.probeStatus !== "applied") throw new Error("external_commit_observed requires probeStatus applied");
+    if (!payload.externalReference) throw new Error("external_commit_observed requires externalReference");
+    if (payload.explicitOperatorActionRequired !== true) throw new Error("external_commit_observed explicitOperatorActionRequired must be true");
+  } else if (payload.classification === "explicit_retry_eligible") {
+    if (payload.journalEventType !== "operation_reserved") throw new Error("explicit_retry_eligible requires journalEventType operation_reserved");
+    if (!payload.probeId) throw new Error("explicit_retry_eligible requires probeId");
+    if (payload.probeStatus !== "absent") throw new Error("explicit_retry_eligible requires probeStatus absent");
+    if (payload.externalReference !== undefined) throw new Error("explicit_retry_eligible forbids externalReference");
+    if (payload.explicitOperatorActionRequired !== true) throw new Error("explicit_retry_eligible explicitOperatorActionRequired must be true");
+  } else if (payload.classification === "manual_reconciliation_required") {
+    if (payload.journalEventType === "operation_committed") {
+      throw new Error("manual_reconciliation_required cannot encode consistent operation_committed");
+    }
+    if (!payload.probeId) {
+      throw new Error("manual_reconciliation_required requires probeId");
+    }
+    if (payload.probeStatus === undefined) {
+      throw new Error("manual_reconciliation_required requires probeStatus");
+    }
+    if (payload.externalReference !== undefined) {
+      throw new Error("manual_reconciliation_required forbids externalReference");
+    }
+    if (payload.journalEventType === "operation_reserved" && payload.probeStatus === "absent") {
+      throw new Error("operation_reserved with authoritative absence must be explicit_retry_eligible");
+    }
+    if (payload.explicitOperatorActionRequired !== true) {
+      throw new Error("manual_reconciliation_required explicitOperatorActionRequired must be true");
+    }
+  }
 }
 
 function normalizeOptionalSha(value: string | undefined): string | undefined {
@@ -328,6 +406,12 @@ function prepareText(value: unknown, label: string): string {
   const prepared = value.replace(/[\r\n]+/g, " ").trim();
   if (new TextEncoder().encode(prepared).byteLength > 4096) throw new Error(`${label} exceeds 4096 bytes`);
   return prepared;
+}
+function assertExactFields(value: Record<string, unknown>, allowed: ReadonlySet<string>, label: string): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
+  const keys = Object.keys(value);
+  for (const key of keys) if (!allowed.has(key)) throw new Error(`${label}.${key} is not allowed`);
+  for (const key of allowed) if (!Object.prototype.hasOwnProperty.call(value, key) && !["sampleId", "outputSha256", "probeId", "probeStatus", "externalReference"].includes(key)) throw new Error(`${label}.${key} is required`);
 }
 function prepareTimestamp(value: unknown, label: string): string {
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) throw new Error(`${label} must be a valid timestamp`);

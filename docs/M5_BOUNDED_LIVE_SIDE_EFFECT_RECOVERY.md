@@ -12,51 +12,80 @@ It is a reliability/recovery gate only. It does not add production traffic, a pr
 
 A recovery decision must correlate the durable bounded-live side-effect journal with sink-owned authoritative observation. The recovery layer is read-only: it emits content-addressed evidence and never publishes, restores, retries, or mutates the journal by itself.
 
-## Recovery classifications
+## Crash / Restart Uncertainty Model & Recovery Classification Matrix
 
-- `consistent_committed` — the durable journal already contains an exact `operation_committed` event; no sink probe is needed.
-- `external_commit_observed` — the journal is unresolved, but the sink proves the exact reserved side effect already occurred. Do not repeat it. Explicit durable journal closure is required later.
-- `explicit_retry_eligible` — an unresolved reservation exists and authoritative sink state proves the effect is absent. Retry is still an explicit operator action; `automaticRetryAllowed=false`.
-- `manual_reconciliation_required` — sink state is unknown, drifted, unavailable, or a prior `operation_error` left uncertainty that cannot be cleared automatically.
+| Journal Event Type | Sink Probe Status | Subject / Hash Matching | Classification | Explicit Operator Action | Automatic Actions Allowed |
+| --- | --- | --- | --- | --- | --- |
+| `operation_committed` | Not Probed | N/A | `consistent_committed` | `false` | `false` |
+| `operation_reserved` | `applied` | Match | `external_commit_observed` | `true` | `false` |
+| `operation_reserved` | `applied` | Drift | `manual_reconciliation_required` | `true` | `false` |
+| `operation_reserved` | `absent` (Authoritative) | N/A | `explicit_retry_eligible` | `true` | `false` |
+| `operation_error` | `absent` (Authoritative) | N/A | `manual_reconciliation_required` | `true` | `false` |
+| `operation_reserved` / `operation_error` | `unknown` / Probe Error | N/A | `manual_reconciliation_required` | `true` | `false` |
 
 All reports hard-code:
 
 - `automaticRetryAllowed=false`
 - `automaticMutationAllowed=false`
 
-## Content-addressed report
+## Semantic Verifier Invariants
 
-`BoundedLiveSideEffectRecoveryCoordinator` emits `m5livereconcile:<sha-prefix>` bound to:
+The `verifyBoundedLiveSideEffectRecoveryReport` function enforces exact envelope and payload structure alongside strict semantic combination validation:
+1. `consistent_committed`: requires `operation_committed` event type, `externalReference`, `explicitOperatorActionRequired=false`, and forbids probe fields (`probeId`, `probeStatus`).
+2. `external_commit_observed`: forbids `operation_committed` event type, requires `probeId`, `probeStatus=applied`, `externalReference`, and `explicitOperatorActionRequired=true`.
+3. `explicit_retry_eligible`: requires `operation_reserved` event type, `probeId`, `probeStatus=absent`, forbids `externalReference`, and requires `explicitOperatorActionRequired=true`.
+4. `manual_reconciliation_required`: cannot encode `operation_committed`, and requires `explicitOperatorActionRequired=true`.
 
-- exact durable journal event ID/type;
-- operation ID and idempotency key;
-- sink/authority/subject identities;
-- sample/output hash when publication-specific;
-- probe identity/status when used;
-- external reference only when the sink proves the side effect;
-- recovery classification and operator-action requirement.
+Digest or SHA-256 validity alone will never make a semantically forged report pass validation.
 
-The report can be independently re-verified with `verifyBoundedLiveSideEffectRecoveryReport`.
+## Authoritative Absence Trust Boundary
 
-## Isolated sink probe
+Before a sink probe can emit `status=absent` with `authoritative=true`, `IsolatedLoopbackBoundedLiveSinkClient` verifies the complete durable state of the sink:
+- Top-level schema version and flags (`rawOutputPersisted=false`).
+- Structural completeness of all publication and restore entries.
+- Validation of required identities, SHA-256 hashes, timestamps, and references.
+- Strict uniqueness of idempotency keys per side-effect type.
+- Absolute prohibition of raw provider output persistence.
 
-`IsolatedLoopbackBoundedLiveSinkClient` now also implements the recovery probe interface using GET-only `/state` inspection.
+Any structural drift, malformed entity, duplicate idempotency key, or raw output persistence causes probe failure, placing recovery into `manual_reconciliation_required`.
 
-It remains restricted to `http://127.0.0.1`, validates that sink state contains no raw provider output, and returns only durable publication/restore facts. The probe never invokes `/publish` or `/restore`.
+## Two-Process Crash/Restart Topology & Proof
 
-## Conservative error rule
+The isolated recovery proof scripts (`scripts/run-isolated-bounded-live-side-effect-recovery-proof.mjs` and `scripts/windows-isolated-bounded-live-side-effect-recovery-proof.ps1`) run distinct Node processes Process A (the crashing control plane) and Process B (the recovery inspector):
 
-A plain unresolved reservation plus authoritative absence may be `explicit_retry_eligible`.
+1. **Scenario 1 — Reserved Before Call**: Process A persists `operation_reserved` and crashes. Process B inspects sink state (`absent`), classifying `explicit_retry_eligible` with zero automatic actions or mutations.
+2. **Scenario 2 — Publication Applied, Journal Commit Lost**: Process A applies publication to loopback sink and crashes before writing `operation_committed`. Process B probes sink (`applied`), classifies `external_commit_observed`, proving publication count remains exactly 1 with zero duplicate side effects.
+3. **Scenario 3 — Reference Restore Applied, Journal Commit Lost**: Process A applies restore to loopback sink and crashes before writing `operation_committed`. Process B probes sink (`applied`), classifies `external_commit_observed`, proving restore count remains exactly 1.
+4. **Scenario 4 — Operation Error / Unknown**: Process A records `operation_error` with unknown state. Process B probes sink (`absent`), but classifies `manual_reconciliation_required` due to prior recorded error uncertainty.
+5. **Control Case — Already Committed**: Process B inspects `operation_committed`, returning `consistent_committed` with zero probe calls executed.
 
-A prior `operation_error` remains `manual_reconciliation_required` even when a later probe reports absence. The error means a side-effecting call was attempted and the control plane previously recorded its state as unknown; clearing that uncertainty requires a stronger explicit reconciliation step rather than automatic retry.
+Sink durable state is preserved and proven across process restarts.
 
-## Next proof gate
+## Generated Evidence Invariants
 
-After CI and contract review, add a two-process isolated recovery harness that injects crash windows around:
+A proof PASS outputs machine-readable evidence asserting:
+- `processRestartProven == true`
+- `journalReopened == true`
+- `publicationDuplicateCount == 0`
+- `restoreDuplicateCount == 0`
+- `allAutomaticRetryAllowed == false`
+- `allAutomaticMutationAllowed == false`
+- `recoveryPostSideEffectCalls == 0`
+- `rawProviderOutputPersisted == false`
+- `gitHeadUnchanged == true`
+- `workingTreeUnchanged == true`
+- SHA-256 hashes of durable state evidence files.
 
-1. durable reservation before sink call;
-2. sink publication success before journal commit;
-3. sink restore success before journal commit;
-4. operation error / unknown state.
+## Retained Non-Goals
 
-Process B must reopen state and prove that recovery does not duplicate publication or restore. Durable reconciliation closure should be a separate explicit authority, not an implicit side effect of inspection.
+- No production-facing sink
+- No production traffic
+- No global production routing mutation
+- No permanent candidate promotion
+- No automatic retry or redispatch
+- No automatic rollback
+- No raw provider-output persistence
+
+## Next Gate
+
+`INDEPENDENT_BOUNDED_LIVE_SIDE_EFFECT_RECOVERY_REVIEW`

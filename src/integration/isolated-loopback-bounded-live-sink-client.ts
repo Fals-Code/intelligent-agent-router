@@ -98,10 +98,50 @@ export class IsolatedLoopbackBoundedLiveSinkClient implements BoundedLivePublica
 
   private async getState(): Promise<Record<string, unknown>> {
     const state = await this.get("/state");
+    assertExactFields(state, new Set(["schemaVersion", "activeSubjectId", "publications", "restores", "rawOutputPersisted"]), "isolated sink state");
     if (state.schemaVersion !== 1 || state.rawOutputPersisted !== false) throw new Error("Isolated bounded-live sink state is invalid");
+    prepareIdentity(state.activeSubjectId, "isolated sink activeSubjectId");
     if (JSON.stringify(state).includes('"output"')) throw new Error("Isolated bounded-live sink state appears to persist raw provider output");
-    asRecordArray(state.publications, "isolated sink publications");
-    asRecordArray(state.restores, "isolated sink restores");
+
+    const publications = asRecordArray(state.publications, "isolated sink publications");
+    const publicationKeys = new Set<string>();
+    const publicationReferences = new Set<string>();
+    for (const pub of publications) {
+      assertExactFields(pub, new Set(["idempotencyKey", "sampleAuthorizationId", "sampleId", "selectedSubjectId", "selectedRole", "outputSha256", "outputBytes", "publicationReference", "publishedAt", "externallyVisible"]), "isolated sink publication entry");
+      const key = prepareIdentity(pub.idempotencyKey, "isolated sink publication idempotencyKey");
+      if (publicationKeys.has(key)) throw new Error(`Duplicate publication idempotency key: ${key}`);
+      publicationKeys.add(key);
+      prepareIdentity(pub.sampleAuthorizationId, "isolated sink publication sampleAuthorizationId");
+      prepareIdentity(pub.sampleId, "isolated sink publication sampleId");
+      prepareIdentity(pub.selectedSubjectId, "isolated sink publication selectedSubjectId");
+      if (pub.selectedRole !== "reference" && pub.selectedRole !== "candidate") throw new Error("isolated sink publication selectedRole is invalid");
+      prepareSha256(pub.outputSha256, "isolated sink publication outputSha256");
+      if (typeof pub.outputBytes !== "number" || !Number.isInteger(pub.outputBytes) || pub.outputBytes <= 0) throw new Error("isolated sink publication outputBytes is invalid");
+      const publicationReference = prepareIdentity(pub.publicationReference, "isolated sink publication reference");
+      if (publicationReferences.has(publicationReference)) throw new Error(`Duplicate publication reference: ${publicationReference}`);
+      publicationReferences.add(publicationReference);
+      prepareTimestamp(pub.publishedAt, "isolated sink publication publishedAt");
+      if (pub.externallyVisible !== true) throw new Error("isolated sink publication externallyVisible must be true");
+    }
+
+    const restores = asRecordArray(state.restores, "isolated sink restores");
+    const restoreKeys = new Set<string>();
+    const restoreReferences = new Set<string>();
+    for (const res of restores) {
+      assertExactFields(res, new Set(["idempotencyKey", "experimentId", "targetSubjectId", "restoreReference", "restoredAt", "activeSubjectId"]), "isolated sink restore entry");
+      const key = prepareIdentity(res.idempotencyKey, "isolated sink restore idempotencyKey");
+      if (restoreKeys.has(key)) throw new Error(`Duplicate restore idempotency key: ${key}`);
+      restoreKeys.add(key);
+      prepareIdentity(res.experimentId, "isolated sink restore experimentId");
+      prepareIdentity(res.targetSubjectId, "isolated sink restore targetSubjectId");
+      const restoreReference = prepareIdentity(res.restoreReference, "isolated sink restore reference");
+      if (restoreReferences.has(restoreReference)) throw new Error(`Duplicate restore reference: ${restoreReference}`);
+      restoreReferences.add(restoreReference);
+      prepareTimestamp(res.restoredAt, "isolated sink restore restoredAt");
+      prepareIdentity(res.activeSubjectId, "isolated sink restore activeSubjectId");
+      if (res.activeSubjectId !== res.targetSubjectId) throw new Error("isolated sink restore activeSubjectId must equal targetSubjectId");
+    }
+
     return state;
   }
 
