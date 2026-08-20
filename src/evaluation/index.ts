@@ -13,3 +13,4 @@ export * from "./controlled-experiment-execution-adapter.js";
 export * from "./controlled-experiment-execution-journal.js";
 export * from "./bounded-experiment-executor.js";
 export * from "./shadow-experiment-provenance.js";
+export * from "./bounded-live-sample-authorization.js";

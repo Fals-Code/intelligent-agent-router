@@ -42,6 +42,10 @@ jobs:
         run: |
           node --check scripts/run-end-to-end-shadow-executor-provenance.mjs
           node --check scripts/verify-end-to-end-shadow-runtime-binding-seal.mjs
+      - name: Validate bounded-live proof script syntax
+        run: |
+          node --check scripts/isolated-bounded-live-sink.mjs
+          node --check scripts/run-isolated-bounded-live-runtime-proof.mjs
       - name: Validate Windows preflight PowerShell syntax
         if: runner.os == 'Windows'
         shell: powershell
@@ -51,6 +55,7 @@ jobs:
           $null = [ScriptBlock]::Create((Get-Content -Raw "scripts/windows-reference-restart-recovery-slice.ps1"))
           $null = [ScriptBlock]::Create((Get-Content -Raw "scripts/windows-reference-shadow-runtime-slice.ps1"))
           $null = [ScriptBlock]::Create((Get-Content -Raw "scripts/windows-end-to-end-shadow-executor-provenance.ps1"))
+          $null = [ScriptBlock]::Create((Get-Content -Raw "scripts/windows-isolated-bounded-live-runtime-proof.ps1"))
           Write-Host "PowerShell syntax PASS"
       - run: npm install
       - run: npm run check

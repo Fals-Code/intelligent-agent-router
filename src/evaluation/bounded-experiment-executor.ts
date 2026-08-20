@@ -91,12 +91,15 @@ export interface BoundedExperimentExecutorOptions {
 
 /**
  * Sequential, bounded executor for one explicitly requested controlled-experiment
- * sample at a time.
+ * shadow sample at a time.
  *
- * It never chooses a production route, never loops autonomously, and never retries
- * an uncertain dispatch. Reservation is fsync'd before the injected adapter call.
- * The adapter is product/runtime-specific and is expected to reuse canonical
- * runtime binding/reconciliation rather than introducing a provider side channel.
+ * Immediate bounded-live dispatch is intentionally disabled. Live samples must
+ * use the deferred verify-before-visibility boundary so provider output cannot
+ * become externally visible before reconciliation and deterministic verification.
+ *
+ * This executor never chooses a production route, never loops autonomously, and
+ * never retries an uncertain dispatch. Reservation is fsync'd before the injected
+ * adapter call.
  */
 export class BoundedExperimentExecutor {
   private readonly maxStringBytes: number;
@@ -133,7 +136,7 @@ export class BoundedExperimentExecutor {
       reservedAt: request.requestedAt,
     });
 
-    const candidateVisible = request.exposure === "bounded_live" && request.liveAssignment === "candidate";
+    const candidateVisible = false;
     let receipt: ControlledExperimentExecutionReceipt;
     try {
       receipt = await this.adapter.dispatch({
@@ -241,10 +244,11 @@ export class BoundedExperimentExecutor {
   private prepareRequest(input: ControlledExperimentDispatchSampleInput): ControlledExperimentDispatchSampleInput {
     const exposure = input.exposure;
     if (exposure !== "shadow" && exposure !== "bounded_live") throw new Error("Bounded experiment sample exposure is invalid");
+    if (exposure === "bounded_live") {
+      throw new Error("Immediate bounded-live dispatch is disabled; use DeferredBoundedLiveExecutor verify-before-visibility path");
+    }
     const liveAssignment = input.liveAssignment;
-    if (liveAssignment !== "none" && liveAssignment !== "reference" && liveAssignment !== "candidate") throw new Error("Bounded experiment live assignment is invalid");
-    if (exposure === "shadow" && liveAssignment !== "none") throw new Error("Shadow sample requires liveAssignment=none");
-    if (exposure === "bounded_live" && liveAssignment === "none") throw new Error("Bounded-live sample requires reference or candidate live assignment");
+    if (liveAssignment !== "none") throw new Error("Shadow sample requires liveAssignment=none");
     return deepFreeze({
       sampleId: prepareIdentity(input.sampleId, "Bounded experiment sampleId", this.maxStringBytes),
       inputReference: prepareSafeReference(input.inputReference, "Bounded experiment inputReference", this.maxStringBytes),
@@ -307,28 +311,8 @@ export class BoundedExperimentExecutor {
     if (guardrailDecision && ["STOP_REQUIRED", "ROLLBACK_REQUIRED", "COMPLETE"].includes(guardrailDecision.payload.classification)) {
       throw new Error(`Bounded experiment guardrail classification ${guardrailDecision.payload.classification} forbids new dispatch`);
     }
-
-    if (state.reservedLiveSamples > 0 && request.exposure !== "bounded_live") {
-      throw new Error("Bounded experiment exposure cannot return to shadow after live exposure has started");
-    }
-    if (request.exposure === "shadow") {
-      if (state.reservedLiveSamples > 0) throw new Error("Bounded experiment cannot dispatch shadow after live reservation");
-      return;
-    }
-
-    if (experiment.payload.exposureMode !== "shadow_then_bounded_live") throw new Error("Bounded-live dispatch is forbidden for shadow-only experiment");
-    if (state.completedShadowSamples < budget.minimumShadowSamplesBeforeLive) throw new Error("Bounded-live dispatch requires minimum completed shadow samples");
-    if (!guardrailDecision) throw new Error("Bounded-live dispatch requires a verified guardrail decision");
-    const requiredClassification = state.reservedLiveSamples === 0 ? "ELIGIBLE_FOR_BOUNDED_LIVE" : "CONTINUE_BOUNDED_LIVE";
-    if (guardrailDecision.payload.classification !== requiredClassification) {
-      throw new Error(`Bounded-live dispatch requires ${requiredClassification}; received ${guardrailDecision.payload.classification}`);
-    }
-    const nextLive = state.reservedLiveSamples + 1;
-    const nextCandidateLive = state.reservedCandidateLiveSamples + (request.liveAssignment === "candidate" ? 1 : 0);
-    if (nextLive > budget.maxLiveSamples) throw new Error("Bounded experiment live reservation budget would be exceeded");
-    if (nextCandidateLive > budget.maxCandidateLiveSamples) throw new Error("Bounded experiment candidate live reservation budget would be exceeded");
-    const candidateBasisPoints = (nextCandidateLive / nextLive) * 10000;
-    if (candidateBasisPoints > budget.maxCandidateTrafficBasisPoints) throw new Error("Bounded experiment candidate live traffic ceiling would be exceeded");
+    if (state.reservedLiveSamples > 0) throw new Error("Bounded experiment cannot dispatch shadow after live reservation");
+    if (request.exposure !== "shadow") throw new Error("Immediate bounded-live dispatch is disabled");
   }
 
   private assertReceipt(
