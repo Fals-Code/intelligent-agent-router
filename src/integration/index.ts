@@ -6,6 +6,7 @@ export * from "./bounded-live-publication.js";
 export * from "./bounded-live-reference-restore.js";
 export * from "./deferred-bounded-live-execution.js";
 export * from "./bounded-live-side-effect-journal.js";
+export * from "./bounded-live-side-effect-reconciliation.js";
 export * from "./runtime-backed-deferred-bounded-live-execution.js";
 export * from "./opencode-bounded-live-output-reader.js";
 export * from "./isolated-loopback-bounded-live-sink-client.js";
