@@ -6,11 +6,13 @@ import { join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 import {
-  BoundedLiveSideEffectRecoveryCoordinator,
   IsolatedLoopbackBoundedLiveSinkClient,
   JsonlBoundedLiveSideEffectJournal,
-  verifyBoundedLiveSideEffectRecoveryReport,
 } from "../dist/index.js";
+import {
+  BoundedLiveSideEffectRecoveryCoordinator,
+  verifyBoundedLiveSideEffectRecoveryReport,
+} from "../dist/integration/bounded-live-side-effect-reconciliation.js";
 
 const execFile = promisify(execFileCallback);
 

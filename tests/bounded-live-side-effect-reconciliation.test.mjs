@@ -5,11 +5,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  BoundedLiveSideEffectRecoveryCoordinator,
   IsolatedLoopbackBoundedLiveSinkClient,
   JsonlBoundedLiveSideEffectJournal,
-  verifyBoundedLiveSideEffectRecoveryReport,
 } from "../dist/index.js";
+import {
+  BoundedLiveSideEffectRecoveryCoordinator,
+  verifyBoundedLiveSideEffectRecoveryReport,
+} from "../dist/integration/bounded-live-side-effect-reconciliation.js";
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), "9router-live-recovery-test-"));
