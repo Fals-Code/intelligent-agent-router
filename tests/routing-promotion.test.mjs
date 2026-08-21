@@ -9,6 +9,7 @@ import {
   assessM5ControlledExperimentAdmission,
   buildCanonicalMetricTaxonomy,
   evaluateControlledExperimentGuardrails,
+  prepareBoundedLiveSampleAuthorization,
   prepareControlledExperimentAuthorization,
   prepareControlledExperimentDefinition,
   prepareGoldenTaskSuite,
@@ -30,31 +31,40 @@ import {
 
 let workflowSequence = 0;
 
-test("promotion proposal is evidence-bound and separate approval authorizes only the exact proposal", async (t) => {
+test("promotion proposal derives canonical Run Ledger/Eval evidence and separate approval authorizes only the exact proposal", async (t) => {
   const fixture = await promotionFixture(t);
 
   assert.equal(fixture.proposal.payload.classification, "PROMOTION_ELIGIBLE");
-  assert.equal(fixture.proposal.payload.beforeSubjectId, fixture.experiment.payload.referenceSubjectId);
-  assert.equal(fixture.proposal.payload.afterSubjectId, fixture.experiment.payload.candidateSubjectId);
-  assert.equal(fixture.proposal.payload.rollbackTargetSubjectId, fixture.experiment.payload.referenceSubjectId);
   assert.equal(fixture.proposal.payload.automaticRoutingMutationAllowed, false);
   assert.equal(fixture.proposal.payload.automaticRollbackAllowed, false);
+  assert.ok(fixture.proposal.payload.runLedgerEvidenceReferences.length >= 2);
+  assert.equal(fixture.proposal.payload.evalEvidenceReferences.length, 4);
+  assert.equal(fixture.proposal.payload.boundedLiveEvidenceReferences.length, 3);
+  assert.ok(
+    fixture.proposal.payload.runLedgerEvidenceReferences.every((item) =>
+      /:(?:run-ledger):[^:]+:[0-9A-F]{64}$/.test(item),
+    ),
+  );
 
-  const promotionWorkflow = await approvedPromotionWorkflow(
+  const promotionWorkflow = await approvedPublishWorkflow(
     fixture.root,
     fixture.experiment.payload.projectId,
+    "promotion",
+    "2026-08-21T03:03:00.000Z",
   );
   const authorization = await prepareRoutingPromotionAuthorization({
     proposal: fixture.proposal,
     proposalContext: fixture.context,
     currentPreconditionSnapshot: fixture.snapshot,
     workflow: promotionWorkflow,
-    authorization: promotionAuthorizationInput(promotionWorkflow.approvalIds),
+    authorization: promotionAuthorizationInput(
+      promotionWorkflow.approvalIds,
+      "2026-08-21T03:06:00.000Z",
+    ),
   });
 
   assert.equal(authorization.payload.routingMutationAuthorized, true);
   assert.equal(authorization.payload.automaticRoutingMutationAllowed, false);
-  assert.equal(authorization.payload.automaticRollbackAllowed, false);
   assert.notEqual(authorization.payload.workflowRunId, fixture.experimentWorkflow.id);
 
   await verifyRoutingPromotionAuthorization(
@@ -68,7 +78,7 @@ test("promotion proposal is evidence-bound and separate approval authorizes only
   const proposalEvidence = await verifiedRoutingPromotionProposalToEvidence(
     fixture.proposal,
     fixture.context,
-    "2026-08-21T03:10:00.000Z",
+    "2026-08-21T03:07:00.000Z",
   );
   const authorizationEvidence = await verifiedRoutingPromotionAuthorizationToEvidence(
     authorization,
@@ -76,74 +86,112 @@ test("promotion proposal is evidence-bound and separate approval authorizes only
     fixture.context,
     fixture.snapshot,
     promotionWorkflow,
-    "2026-08-21T03:11:00.000Z",
+    "2026-08-21T03:08:00.000Z",
   );
   assert.equal(proposalEvidence.status, "passed");
   assert.equal(authorizationEvidence.status, "passed");
 });
 
+test("unrelated Eval evidence cannot satisfy promotion provenance even when content-addressed", async (t) => {
+  const fixture = await promotionFixture(t);
+  const driftedContext = {
+    ...fixture.context,
+    candidateCohort: {
+      ...fixture.context.candidateCohort,
+      evalSummary: fixture.context.referenceCohort.evalSummary,
+    },
+  };
+  await assert.rejects(
+    verifyRoutingPromotionProposal(fixture.proposal, driftedContext),
+    /candidate Eval summary does not match canonical observations|canonical Eval\/Run Ledger identity drift/,
+  );
+});
+
+test("unrelated canonical Run Ledger evidence cannot satisfy promotion provenance", async (t) => {
+  const fixture = await promotionFixture(t);
+  const candidateRecords = [...fixture.context.candidateCohort.runLedgerRecords];
+  candidateRecords[0] = fixture.context.referenceCohort.runLedgerRecords[0];
+  const driftedContext = {
+    ...fixture.context,
+    candidateCohort: {
+      ...fixture.context.candidateCohort,
+      runLedgerRecords: candidateRecords,
+    },
+  };
+  await assert.rejects(
+    verifyRoutingPromotionProposal(fixture.proposal, driftedContext),
+    /Run Ledger|execution summary/,
+  );
+});
+
+test("same candidate subject with unrelated bounded-live authority is rejected", async (t) => {
+  const fixture = await promotionFixture(t);
+  const original = fixture.context.publicationEvidence[0];
+  const forgedRecovery = await rehashRecovery({
+    ...original.recoveryReport.payload,
+    authorityId: "m5liveauth:unrelated-authority",
+  });
+  const driftedContext = {
+    ...fixture.context,
+    publicationEvidence: [
+      {
+        ...original,
+        recoveryReport: forgedRecovery,
+      },
+    ],
+  };
+  await assert.rejects(
+    verifyRoutingPromotionProposal(fixture.proposal, driftedContext),
+    /exact publication authority\/operation/,
+  );
+});
+
 test("non-COMPLETE experiment evidence cannot become promotion-eligible", async (t) => {
-  const fixture = await promotionFixture(t, { maxTotalSamples: 4, liveSamples: 0, shadowSamples: 3, candidateLiveSamples: 0 });
-  assert.notEqual(fixture.guardrail.payload.classification, "COMPLETE");
+  const fixture = await promotionFixture(t, {
+    maxTotalSamples: 4,
+    finalProgress: {
+      shadowSamples: 1,
+      liveSamples: 1,
+      candidateLiveSamples: 1,
+    },
+  });
+  assert.notEqual(fixture.finalGuardrail.payload.classification, "COMPLETE");
   assert.equal(fixture.proposal.payload.classification, "PROMOTION_NOT_ELIGIBLE");
 
-  const promotionWorkflow = await approvedPromotionWorkflow(
+  const workflow = await approvedPublishWorkflow(
     fixture.root,
     fixture.experiment.payload.projectId,
+    "ineligible",
+    "2026-08-21T03:03:00.000Z",
   );
   await assert.rejects(
     prepareRoutingPromotionAuthorization({
       proposal: fixture.proposal,
       proposalContext: fixture.context,
       currentPreconditionSnapshot: fixture.snapshot,
-      workflow: promotionWorkflow,
-      authorization: promotionAuthorizationInput(promotionWorkflow.approvalIds),
+      workflow,
+      authorization: promotionAuthorizationInput(
+        workflow.approvalIds,
+        "2026-08-21T03:06:00.000Z",
+      ),
     }),
     /eligible proposal/,
   );
 });
 
-test("unresolved bounded-live recovery evidence fails closed to manual reconciliation", async (t) => {
-  const fixture = await promotionFixture(t, {
-    recoveryReports: async (experiment) => [
-      await recoveryReport({
-        subjectId: experiment.payload.candidateSubjectId,
-        classification: "manual_reconciliation_required",
-        journalEventType: "operation_error",
-        probeId: "probe:recovery",
-        probeStatus: "unknown",
-        externalReference: undefined,
-        explicitOperatorActionRequired: true,
-        reason: "Unknown side-effect state requires operator reconciliation.",
-      }),
-    ],
+test("reference restore evidence for the exact experiment prevents permanent candidate promotion", async (t) => {
+  const fixture = await promotionFixture(t);
+  const restoreEvidence = await referenceRestoreEvidence(fixture);
+  const context = {
+    ...fixture.context,
+    referenceRestoreEvidence: [restoreEvidence],
+  };
+  const proposal = await prepareRoutingPromotionProposal({
+    context,
+    proposal: proposalInput(),
   });
-
-  assert.equal(
-    fixture.proposal.payload.classification,
-    "MANUAL_RECONCILIATION_REQUIRED",
-  );
-  assert.equal(fixture.proposal.payload.automaticRoutingMutationAllowed, false);
-});
-
-test("reference restore evidence prevents permanent candidate promotion", async (t) => {
-  const fixture = await promotionFixture(t, {
-    recoveryReports: async (experiment) => [
-      await recoveryReport({ subjectId: experiment.payload.candidateSubjectId }),
-      await recoveryReport({
-        kind: "reference_restore",
-        operationId: "operation:restore-1",
-        idempotencyKey: "idem:restore-1",
-        authorityId: "m5liveauth:restore-1",
-        subjectId: experiment.payload.referenceSubjectId,
-        sampleId: undefined,
-        outputSha256: undefined,
-        externalReference: "isolated-restore:1",
-      }),
-    ],
-  });
-  assert.equal(fixture.proposal.payload.classification, "PROMOTION_NOT_ELIGIBLE");
-  assert.match(fixture.proposal.payload.reasons.join(","), /reference_restore_observed/);
+  assert.equal(proposal.payload.classification, "PROMOTION_NOT_ELIGIBLE");
+  assert.match(proposal.payload.reasons.join(","), /reference_restore_observed/);
 });
 
 test("stale route snapshot invalidates promotion authorization", async (t) => {
@@ -154,12 +202,14 @@ test("stale route snapshot invalidates promotion authorization", async (t) => {
     capability: fixture.snapshot.payload.capability,
     currentSubjectId: fixture.snapshot.payload.currentSubjectId,
     routeRevision: "route-revision:2",
-    capturedAt: "2026-08-21T03:03:00.000Z",
+    capturedAt: "2026-08-21T03:01:00.000Z",
     policyReferences: ["policy:route-precondition-v1"],
   });
-  const workflow = await approvedPromotionWorkflow(
+  const workflow = await approvedPublishWorkflow(
     fixture.root,
     fixture.experiment.payload.projectId,
+    "stale",
+    "2026-08-21T03:03:00.000Z",
   );
   await assert.rejects(
     prepareRoutingPromotionAuthorization({
@@ -167,7 +217,10 @@ test("stale route snapshot invalidates promotion authorization", async (t) => {
       proposalContext: fixture.context,
       currentPreconditionSnapshot: stale,
       workflow,
-      authorization: promotionAuthorizationInput(workflow.approvalIds),
+      authorization: promotionAuthorizationInput(
+        workflow.approvalIds,
+        "2026-08-21T03:06:00.000Z",
+      ),
     }),
     /stale|drifted/,
   );
@@ -181,14 +234,19 @@ test("promotion authorization requires a distinct R3/R4 publish workflow and exa
       proposalContext: fixture.context,
       currentPreconditionSnapshot: fixture.snapshot,
       workflow: fixture.experimentWorkflow,
-      authorization: promotionAuthorizationInput(fixture.experimentWorkflow.approvalIds),
+      authorization: promotionAuthorizationInput(
+        fixture.experimentWorkflow.approvalIds,
+        "2026-08-21T03:06:00.000Z",
+      ),
     }),
     /separate workflow/,
   );
 
-  const workflow = await approvedPromotionWorkflow(
+  const workflow = await approvedPublishWorkflow(
     fixture.root,
     fixture.experiment.payload.projectId,
+    "approval",
+    "2026-08-21T03:03:00.000Z",
   );
   await assert.rejects(
     prepareRoutingPromotionAuthorization({
@@ -196,7 +254,10 @@ test("promotion authorization requires a distinct R3/R4 publish workflow and exa
       proposalContext: fixture.context,
       currentPreconditionSnapshot: fixture.snapshot,
       workflow,
-      authorization: promotionAuthorizationInput(["approval:wrong"]),
+      authorization: promotionAuthorizationInput(
+        ["approval:wrong"],
+        "2026-08-21T03:06:00.000Z",
+      ),
     }),
     /do not match durable WorkflowRun approvals/,
   );
@@ -207,7 +268,10 @@ test("promotion authorization requires a distinct R3/R4 publish workflow and exa
       proposalContext: fixture.context,
       currentPreconditionSnapshot: fixture.snapshot,
       workflow: { ...workflow, phase: "review" },
-      authorization: promotionAuthorizationInput(workflow.approvalIds),
+      authorization: promotionAuthorizationInput(
+        workflow.approvalIds,
+        "2026-08-21T03:06:00.000Z",
+      ),
     }),
     /phase=publish/,
   );
@@ -251,7 +315,7 @@ test("reference/candidate identity swap is rejected even with a valid recomputed
   };
   await assert.rejects(
     verifyRoutingPromotionProposal(forged, fixture.context),
-    /source binding drift|before\/after\/rollback/,
+    /canonical source binding drift|before\/after\/rollback/,
   );
 });
 
@@ -263,7 +327,7 @@ test("secret-like route state is rejected before persistence", async () => {
       capability: "code.interactive",
       currentSubjectId: "router-controlled-experiment",
       routeRevision: "authorization=Bearer abcdefghijklmnopqrstuvwxyz",
-      capturedAt: "2026-08-21T03:00:00.000Z",
+      capturedAt: "2026-08-21T03:01:00.000Z",
       policyReferences: ["policy:route-precondition-v1"],
     }),
     /secret-like material/,
@@ -403,15 +467,7 @@ async function routingAdmissionFixture(t) {
     reference,
     candidate,
   });
-  return {
-    root,
-    history,
-    taxonomy,
-    policy,
-    reference,
-    candidate,
-    admissionDecision,
-  };
+  return { root, reference, candidate, admissionDecision };
 }
 
 async function promotionFixture(t, overrides = {}) {
@@ -438,19 +494,19 @@ async function promotionFixture(t, overrides = {}) {
     authorizationInput(),
   );
 
-  const shadowSamples = overrides.shadowSamples ?? 1;
-  const liveSamples = overrides.liveSamples ?? 2;
-  const candidateLiveSamples = overrides.candidateLiveSamples ?? 2;
-  const guardrail = await evaluateControlledExperimentGuardrails({
+  const finalProgress = overrides.finalProgress ?? {
+    shadowSamples: 1,
+    liveSamples: 2,
+    candidateLiveSamples: 2,
+  };
+  const finalGuardrail = await evaluateControlledExperimentGuardrails({
     experiment,
     authorization: experimentAuthorization,
     admissionDecision: base.admissionDecision,
     workflow: experimentWorkflow,
     progress: {
       observedAt: "2026-08-21T03:00:00.000Z",
-      shadowSamples,
-      liveSamples,
-      candidateLiveSamples,
+      ...finalProgress,
       referenceEvalSummary: base.reference.evalSummary,
       candidateEvalSummary: base.candidate.evalSummary,
       referenceExecutionSummary: base.reference.executionSummary,
@@ -458,11 +514,18 @@ async function promotionFixture(t, overrides = {}) {
     },
   });
 
-  const recoveryReports =
-    typeof overrides.recoveryReports === "function"
-      ? await overrides.recoveryReports(experiment)
-      : overrides.recoveryReports ??
-        [await recoveryReport({ subjectId: experiment.payload.candidateSubjectId })];
+  const publicationEvidence = [
+    await candidatePublicationEvidence({
+      root: base.root,
+      admissionDecision: base.admissionDecision,
+      experiment,
+      experimentAuthorization,
+      experimentWorkflow,
+      reference: base.reference,
+      candidate: base.candidate,
+    }),
+  ];
+
   const snapshot = await prepareRoutingPreconditionSnapshot({
     projectId: experiment.payload.projectId,
     routeId: "route:code-interactive",
@@ -472,57 +535,235 @@ async function promotionFixture(t, overrides = {}) {
     capturedAt: "2026-08-21T03:01:00.000Z",
     policyReferences: ["policy:route-precondition-v1"],
   });
-  const runLedgerEvidenceReferences = [
-    `run-ledger:${base.reference.records[0].runId}`,
-    `run-ledger:${base.candidate.records[0].runId}`,
-  ];
-  const evalEvidenceReferences = [
-    `eval-summary:${base.reference.evalSummary.summaryId}`,
-    `eval-summary:${base.candidate.evalSummary.summaryId}`,
-  ];
-  const proposal = await prepareRoutingPromotionProposal({
-    admissionDecision: base.admissionDecision,
-    experiment,
-    experimentAuthorization,
-    experimentWorkflow,
-    proposal: {
-      routeId: snapshot.payload.routeId,
-      capability: snapshot.payload.capability,
-      proposedAt: "2026-08-21T03:02:00.000Z",
-      policyReferences: ["policy:routing-promotion-v1"],
-      preconditionSnapshot: snapshot,
-      finalGuardrailDecision: guardrail,
-      recoveryReports,
-      runLedgerEvidenceReferences,
-      evalEvidenceReferences,
-    },
-  });
   const context = {
     admissionDecision: base.admissionDecision,
     experiment,
     experimentAuthorization,
     experimentWorkflow,
-    finalGuardrailDecision: guardrail,
-    recoveryReports,
+    finalGuardrailDecision: finalGuardrail,
     preconditionSnapshot: snapshot,
-    runLedgerEvidenceReferences,
-    evalEvidenceReferences,
+    referenceCohort: cohortEvidence(base.reference),
+    candidateCohort: cohortEvidence(base.candidate),
+    publicationEvidence,
+    referenceRestoreEvidence: [],
   };
+  const proposal = await prepareRoutingPromotionProposal({
+    context,
+    proposal: proposalInput(),
+  });
   await verifyRoutingPromotionProposal(proposal, context);
   return {
     ...base,
     experiment,
     experimentWorkflow,
     experimentAuthorization,
-    guardrail,
+    finalGuardrail,
     snapshot,
-    recoveryReports,
-    proposal,
     context,
+    proposal,
   };
 }
 
-async function approvedPromotionWorkflow(root, projectId) {
+function cohortEvidence(cohort) {
+  return {
+    evalSummary: cohort.evalSummary,
+    executionSummary: cohort.executionSummary,
+    observations: cohort.observations,
+    projections: cohort.projections,
+    runLedgerRecords: cohort.records,
+  };
+}
+
+async function candidatePublicationEvidence(input) {
+  const preDispatchGuardrail = await evaluateControlledExperimentGuardrails({
+    experiment: input.experiment,
+    authorization: input.experimentAuthorization,
+    admissionDecision: input.admissionDecision,
+    workflow: input.experimentWorkflow,
+    progress: {
+      observedAt: "2026-08-21T02:50:00.000Z",
+      shadowSamples: 1,
+      liveSamples: 1,
+      candidateLiveSamples: 1,
+      referenceEvalSummary: input.reference.evalSummary,
+      candidateEvalSummary: input.candidate.evalSummary,
+      referenceExecutionSummary: input.reference.executionSummary,
+      candidateExecutionSummary: input.candidate.executionSummary,
+    },
+  });
+  const liveWorkflow = await approvedPublishWorkflow(
+    input.root,
+    input.experiment.payload.projectId,
+    "live",
+    "2026-08-21T02:51:00.000Z",
+  );
+  const authorizationInputValue = {
+    sampleId: "sample:promotion-candidate-2",
+    inputReference: "input:promotion-candidate-2",
+    liveAssignment: "candidate",
+    actor: "operator:bounded-live",
+    approvedAt: "2026-08-21T02:55:00.000Z",
+    policyReferences: ["policy:bounded-live-v1"],
+    approvalIds: liveWorkflow.approvalIds,
+  };
+  const authorization = await prepareBoundedLiveSampleAuthorization({
+    experiment: input.experiment,
+    experimentAuthorization: input.experimentAuthorization,
+    admissionDecision: input.admissionDecision,
+    experimentWorkflow: input.experimentWorkflow,
+    guardrailDecision: preDispatchGuardrail,
+    liveWorkflow,
+    authorization: authorizationInputValue,
+  });
+  const receipt = await publicationReceipt(authorization);
+  const recoveryReport = await recoveryReportForPublication(authorization, receipt);
+  return {
+    guardrailDecision: preDispatchGuardrail,
+    liveWorkflow,
+    authorizationInput: authorizationInputValue,
+    authorization,
+    receipt,
+    recoveryReport,
+  };
+}
+
+async function publicationReceipt(authorization) {
+  const payload = {
+    sampleAuthorizationId: authorization.authorizationId,
+    sampleAuthorizationSha256: authorization.authorizationSha256,
+    runtimeResultId: "m5liveresult:promotion-candidate-2",
+    runtimeResultSha256:
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    sampleId: authorization.payload.sampleId,
+    selectedSubjectId: authorization.payload.selectedSubjectId,
+    selectedRole: "candidate",
+    sinkId: "isolated-loopback",
+    publicationReference: "isolated-publication:promotion-candidate-2",
+    publicationIdempotencyKey: `${authorization.authorizationId}:m5liveresult:promotion-candidate-2`,
+    sideEffectOperationId: `publication:${authorization.authorizationId}:m5liveresult:promotion-candidate-2`,
+    sideEffectCommitEventId: "m5liveeffect:promotion-candidate-2",
+    outputSha256:
+      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    outputBytes: 128,
+    verifiedAt: "2026-08-21T02:56:00.000Z",
+    publishedAt: "2026-08-21T02:57:00.000Z",
+    externallyVisible: true,
+    candidateOutputExternallyVisible: true,
+    rawOutputPersisted: false,
+    automaticRetryAllowed: false,
+    automaticRollbackAllowed: false,
+    productionRoutingMutationAllowed: false,
+  };
+  const receiptSha256 = await sha256Canonical(payload);
+  return {
+    schemaVersion: 1,
+    algorithm: "sha256",
+    receiptId: `m5livepub:${receiptSha256.slice(0, 32).toLowerCase()}`,
+    receiptSha256,
+    payload,
+  };
+}
+
+async function recoveryReportForPublication(authorization, receipt) {
+  return rehashRecovery({
+    operationId: receipt.payload.sideEffectOperationId,
+    kind: "publication",
+    journalEventId: receipt.payload.sideEffectCommitEventId,
+    journalEventType: "operation_committed",
+    idempotencyKey: receipt.payload.publicationIdempotencyKey,
+    sinkId: receipt.payload.sinkId,
+    authorityId: authorization.authorizationId,
+    subjectId: authorization.payload.selectedSubjectId,
+    sampleId: authorization.payload.sampleId,
+    outputSha256: receipt.payload.outputSha256,
+    externalReference: receipt.payload.publicationReference,
+    classification: "consistent_committed",
+    automaticRetryAllowed: false,
+    automaticMutationAllowed: false,
+    explicitOperatorActionRequired: false,
+    observedAt: receipt.payload.publishedAt,
+    reason: "Durable side-effect journal contains committed terminal evidence.",
+  });
+}
+
+async function referenceRestoreEvidence(fixture) {
+  const authorizationPayload = {
+    actor: "operator:rollback",
+    approvedAt: "2026-08-21T02:40:00.000Z",
+    policyReferences: ["policy:rollback-v1"],
+    approvalIds: ["approval:rollback-1"],
+    experimentId: fixture.experiment.experimentId,
+    experimentSha256: fixture.experiment.experimentSha256,
+    experimentAuthorizationId: fixture.experimentAuthorization.authorizationId,
+    experimentAuthorizationSha256: fixture.experimentAuthorization.authorizationSha256,
+    guardrailDecisionId: "guardrail:rollback-prior",
+    guardrailDecisionSha256:
+      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    experimentWorkflowRunId: fixture.experimentWorkflow.id,
+    rollbackWorkflowRunId: "workflow:rollback-prior",
+    projectId: fixture.experiment.payload.projectId,
+    riskClass: "R3",
+    strategy: "restore_reference_subject",
+    targetSubjectId: fixture.experiment.payload.referenceSubjectId,
+    guardrailClassification: "ROLLBACK_REQUIRED",
+    explicitReferenceRestoreAuthorized: true,
+    automaticRollbackAllowed: false,
+    generalProductionRoutingMutationAllowed: false,
+  };
+  const authorizationSha256 = await sha256Canonical(authorizationPayload);
+  const authorization = {
+    schemaVersion: 1,
+    algorithm: "sha256",
+    authorizationId: `m5rollbackauth:${authorizationSha256.slice(0, 32).toLowerCase()}`,
+    authorizationSha256,
+    payload: authorizationPayload,
+  };
+  const receiptPayload = {
+    rollbackAuthorizationId: authorization.authorizationId,
+    rollbackAuthorizationSha256: authorization.authorizationSha256,
+    experimentId: fixture.experiment.experimentId,
+    targetSubjectId: fixture.experiment.payload.referenceSubjectId,
+    sinkId: "isolated-loopback",
+    restoreReference: "isolated-restore:prior",
+    restoreIdempotencyKey: `${authorization.authorizationId}:${fixture.experiment.payload.referenceSubjectId}`,
+    sideEffectOperationId: `restore:${authorization.authorizationId}`,
+    sideEffectCommitEventId: "m5liveeffect:restore-prior",
+    restoredAt: "2026-08-21T02:41:00.000Z",
+    activeSubjectId: fixture.experiment.payload.referenceSubjectId,
+    referenceSubjectRestored: true,
+    automaticRollbackAllowed: false,
+    automaticRetryAllowed: false,
+    generalProductionRoutingMutationAllowed: false,
+  };
+  const receiptSha256 = await sha256Canonical(receiptPayload);
+  const receipt = {
+    schemaVersion: 1,
+    algorithm: "sha256",
+    receiptId: `m5restore:${receiptSha256.slice(0, 32).toLowerCase()}`,
+    receiptSha256,
+    payload: receiptPayload,
+  };
+  const recoveryReport = await rehashRecovery({
+    operationId: receipt.payload.sideEffectOperationId,
+    kind: "reference_restore",
+    journalEventId: receipt.payload.sideEffectCommitEventId,
+    journalEventType: "operation_committed",
+    idempotencyKey: receipt.payload.restoreIdempotencyKey,
+    sinkId: receipt.payload.sinkId,
+    authorityId: authorization.authorizationId,
+    subjectId: fixture.experiment.payload.referenceSubjectId,
+    externalReference: receipt.payload.restoreReference,
+    classification: "consistent_committed",
+    automaticRetryAllowed: false,
+    automaticMutationAllowed: false,
+    explicitOperatorActionRequired: false,
+    observedAt: receipt.payload.restoredAt,
+    reason: "Durable side-effect journal contains committed terminal evidence.",
+  });
+  return { authorization, receipt, recoveryReport };
+}
+
+async function approvedPublishWorkflow(root, projectId, prefix, now) {
   workflowSequence += 1;
   const store = new JsonlWorkflowCheckpointStore({
     filePath: join(root, `routing-promotion-workflow-${workflowSequence}.jsonl`),
@@ -530,73 +771,48 @@ async function approvedPromotionWorkflow(root, projectId) {
     maxCheckpointBytes: 32 * 1024,
   });
   const durable = new DurableWorkflowStateMachine(store);
+  const base = Date.parse(now);
+  const at = (seconds) => new Date(base + seconds * 1000).toISOString();
   let run = durable.create({
-    id: `workflow-routing-promotion-${workflowSequence}`,
+    id: `workflow-${prefix}-${workflowSequence}`,
     projectId,
     riskClass: "R3",
-    now: "2026-08-21T03:03:00.000Z",
+    now: at(0),
   });
-  run = durable.start(run, "2026-08-21T03:03:01.000Z");
-  run = durable.advance(run, "2026-08-21T03:03:02.000Z");
-  run = durable.advance(run, "2026-08-21T03:03:03.000Z");
-  run = durable.advance(run, "2026-08-21T03:03:04.000Z");
-  run = durable.advance(run, "2026-08-21T03:03:05.000Z");
-  run = durable.requestApproval(run, "2026-08-21T03:03:06.000Z");
+  run = durable.start(run, at(1));
+  run = durable.advance(run, at(2));
+  run = durable.advance(run, at(3));
+  run = durable.advance(run, at(4));
+  run = durable.advance(run, at(5));
+  run = durable.requestApproval(run, at(6));
   run = durable.approve(
     run,
-    `approval:routing-promotion-${workflowSequence}`,
-    "2026-08-21T03:04:00.000Z",
+    `approval:${prefix}-${workflowSequence}`,
+    at(60),
   );
   return run;
 }
 
-function promotionAuthorizationInput(approvalIds) {
+function proposalInput() {
+  return {
+    routeId: "route:code-interactive",
+    capability: "code.interactive",
+    proposedAt: "2026-08-21T03:02:00.000Z",
+    policyReferences: ["policy:routing-promotion-v2"],
+  };
+}
+
+function promotionAuthorizationInput(approvalIds, decidedAt) {
   return {
     decision: "allow",
     actor: "operator:routing-promotion",
-    decidedAt: "2026-08-21T03:05:00.000Z",
+    decidedAt,
     policyReferences: ["policy:routing-promotion-authorization-v1"],
     approvalIds,
   };
 }
 
-async function recoveryReport(overrides = {}) {
-  const kind = overrides.kind ?? "publication";
-  const payload = {
-    operationId: overrides.operationId ?? "operation:publication-1",
-    kind,
-    journalEventId: overrides.journalEventId ?? "m5sideeffect:event-1",
-    journalEventType: overrides.journalEventType ?? "operation_committed",
-    idempotencyKey: overrides.idempotencyKey ?? "idem:publication-1",
-    sinkId: "isolated-loopback",
-    authorityId: overrides.authorityId ?? "m5liveauth:publication-1",
-    subjectId: overrides.subjectId ?? "router-controlled-experiment",
-    ...(kind === "publication"
-      ? {
-          sampleId: overrides.sampleId ?? "sample:publication-1",
-          outputSha256:
-            overrides.outputSha256 ??
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        }
-      : {}),
-    ...(overrides.probeId !== undefined ? { probeId: overrides.probeId } : {}),
-    ...(overrides.probeStatus !== undefined
-      ? { probeStatus: overrides.probeStatus }
-      : {}),
-    ...(overrides.externalReference === undefined &&
-    (overrides.classification ?? "consistent_committed") === "consistent_committed"
-      ? { externalReference: kind === "publication" ? "isolated-publication:1" : "isolated-restore:1" }
-      : overrides.externalReference !== undefined
-        ? { externalReference: overrides.externalReference }
-        : {}),
-    classification: overrides.classification ?? "consistent_committed",
-    automaticRetryAllowed: false,
-    automaticMutationAllowed: false,
-    explicitOperatorActionRequired:
-      overrides.explicitOperatorActionRequired ?? false,
-    observedAt: "2026-08-21T03:00:30.000Z",
-    reason: overrides.reason ?? "Durable side-effect journal contains committed terminal evidence.",
-  };
+async function rehashRecovery(payload) {
   const reconciliationSha256 = await sha256Canonical(payload);
   return {
     schemaVersion: 1,
