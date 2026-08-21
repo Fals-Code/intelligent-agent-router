@@ -138,7 +138,55 @@ test("same candidate subject with unrelated bounded-live authority is rejected",
   };
   await assert.rejects(
     verifyRoutingPromotionProposal(fixture.proposal, driftedContext),
-    /exact publication authority\/operation/,
+    /exact candidate publication authority\/sample|exact publication authority\/operation/,
+  );
+});
+
+test("unresolved exact bounded-live recovery blocks promotion for manual reconciliation", async (t) => {
+  const fixture = await promotionFixture(t);
+  const original = fixture.context.publicationEvidence[0];
+  const unresolved = await rehashRecovery({
+    ...original.recoveryReport.payload,
+    journalEventId: "m5liveeffect:unresolved-candidate",
+    journalEventType: "operation_error",
+    probeId: "probe:unresolved-candidate",
+    probeStatus: "unknown",
+    externalReference: undefined,
+    classification: "manual_reconciliation_required",
+    explicitOperatorActionRequired: true,
+    observedAt: "2026-08-21T02:58:00.000Z",
+    reason: "Exact candidate publication side effect remains unresolved.",
+  });
+  const context = {
+    ...fixture.context,
+    publicationEvidence: [{ ...original, receipt: undefined, recoveryReport: unresolved }],
+  };
+  const proposal = await prepareRoutingPromotionProposal({
+    context,
+    proposal: proposalInput(),
+  });
+  assert.equal(proposal.payload.classification, "MANUAL_RECONCILIATION_REQUIRED");
+  assert.equal(proposal.payload.automaticRoutingMutationAllowed, false);
+  assert.equal(proposal.payload.automaticRetryAllowed, false);
+
+  const workflow = await approvedPublishWorkflow(
+    fixture.root,
+    fixture.experiment.payload.projectId,
+    "unresolved",
+    "2026-08-21T03:03:00.000Z",
+  );
+  await assert.rejects(
+    prepareRoutingPromotionAuthorization({
+      proposal,
+      proposalContext: context,
+      currentPreconditionSnapshot: fixture.snapshot,
+      workflow,
+      authorization: promotionAuthorizationInput(
+        workflow.approvalIds,
+        "2026-08-21T03:06:00.000Z",
+      ),
+    }),
+    /eligible proposal/,
   );
 });
 
