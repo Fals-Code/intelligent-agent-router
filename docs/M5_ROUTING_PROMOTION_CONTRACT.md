@@ -10,7 +10,7 @@ The contract is provider-neutral. It does not know provider credentials, provide
 
 The accepted chain is:
 
-`verified M5 admission -> exact controlled experiment -> exact experiment authorization -> final guardrail evidence -> bounded-live side-effect recovery evidence -> Run Ledger/Eval references -> route precondition snapshot -> routing promotion proposal -> separate R3/R4 promotion workflow approval -> routing promotion authorization`
+`verified M5 admission -> exact controlled experiment -> exact experiment authorization -> final guardrail evidence -> canonical Eval observations + execution projections + Run Ledger records -> exact bounded-live sample authorization/publication/recovery evidence -> route precondition snapshot -> routing promotion proposal -> separate R3/R4 promotion workflow approval -> routing promotion authorization`
 
 No earlier artifact can be reinterpreted as mutation authority:
 
@@ -41,6 +41,44 @@ The snapshot explicitly records:
 
 The known-good current subject must be the experiment reference subject before a candidate promotion can be proposed. A future mutation adapter must re-check this exact snapshot immediately before mutation.
 
+## Canonical Eval and Run Ledger provenance
+
+Run Ledger and Eval evidence are **not caller-supplied string authority**.
+
+For both reference and candidate cohorts, the promotion verifier consumes the canonical evidence objects used by M5 admission:
+
+- exact `EvalHistoryObservation[]`;
+- exact `ExecutionMetricProjection[]`;
+- exact canonical `RunLedgerRecord[]`;
+- the content-addressed `EvalCohortSummary`;
+- the content-addressed `ExecutionReliabilitySummary`.
+
+The verifier rebuilds the Eval summary from the exact observations and rebuilds the execution-reliability summary from the exact observations, projections, and Run Ledger records. Those rebuilt artifacts must exactly match the supplied summaries and the summary IDs already frozen into the verified M5 admission decision.
+
+Suite ID, suite SHA-256, baseline ID, subject identity, project identity, observation identities, and execution-summary identity must remain consistent. Only after those checks pass are promotion evidence references derived. Run Ledger references also include a SHA-256 of the canonical `RunLedgerRecord`, so unrelated but well-formed `run-ledger:*` or `eval-summary:*` strings cannot create promotion authority.
+
+## Exact bounded-live authority provenance
+
+A candidate publication is accepted only through an exact bounded-live authority chain. The promotion context carries the full bounded-live sample authorization evidence, not merely a candidate subject ID.
+
+For every candidate publication relied upon by promotion, verification re-runs `verifyBoundedLiveSampleAuthorization` against the exact:
+
+- admission decision;
+- controlled experiment;
+- controlled-experiment authorization;
+- experiment workflow;
+- pre-dispatch guardrail decision;
+- separate live R3/R4 workflow;
+- authorization input and durable approvals.
+
+The recovery report must then bind to that exact authorization ID, candidate subject, sample ID, publication operation ID, idempotency identity, and output hash.
+
+For `consistent_committed`, an exact content-addressed publication receipt is additionally required. Its authorization ID/SHA, sample, selected candidate subject, operation ID, idempotency key, sink, output SHA-256, and external publication reference must match the recovery report. A same-subject publication produced under an unrelated bounded-live authorization is rejected.
+
+Unresolved exact-authority recovery remains representable without pretending a committed receipt exists. Any such state remains fail-closed as `MANUAL_RECONCILIATION_REQUIRED`; it cannot be used for an `allow` promotion authorization.
+
+A completed reference restore is separately content-addressed and must bind the exact rollback authorization, experiment, reference subject, restore operation, idempotency key, sink, and recovery report. Its presence makes permanent candidate promotion ineligible.
+
 ## Promotion proposal
 
 `RoutingPromotionProposal` binds the exact:
@@ -50,9 +88,9 @@ The known-good current subject must be the experiment reference subject before a
 - controlled-experiment authorization ID + SHA-256;
 - experiment workflow;
 - final guardrail decision ID + SHA-256;
-- bounded-live recovery report IDs + SHA-256 values;
-- Run Ledger evidence references;
-- Eval evidence references;
+- derived canonical Run Ledger evidence references;
+- derived canonical Eval/execution evidence references;
+- exact bounded-live authorization/publication/recovery evidence references;
 - route/capability/precondition snapshot;
 - reference -> candidate intent;
 - rollback target equal to the reference subject;
@@ -67,14 +105,15 @@ Classifications:
 Promotion eligibility requires:
 
 1. final experiment guardrail classification `COMPLETE`;
-2. bounded-live recovery evidence is present;
-3. every relied-upon side effect is durably `consistent_committed` with no pending operator action;
-4. at least one committed candidate publication is present;
-5. no committed reference-restore evidence is present;
-6. required Run Ledger/Eval evidence references are present;
-7. exact route precondition still points to the known-good reference subject.
+2. canonical reference and candidate Eval summaries rebuild exactly from their observations;
+3. canonical execution summaries rebuild exactly from projections + Run Ledger records;
+4. those canonical summaries match the exact identities frozen into M5 admission;
+5. at least one exact-authority candidate publication is durably `consistent_committed` and has its matching publication receipt;
+6. no relied-upon bounded-live recovery state remains unresolved;
+7. no completed reference-restore evidence is present;
+8. exact route precondition still points to the known-good reference subject.
 
-Any unresolved side effect becomes `MANUAL_RECONCILIATION_REQUIRED`. A completed reference restore makes the candidate `PROMOTION_NOT_ELIGIBLE`.
+Any unresolved relied-upon side effect becomes `MANUAL_RECONCILIATION_REQUIRED`. A completed reference restore makes the candidate `PROMOTION_NOT_ELIGIBLE`.
 
 ## Separate promotion authorization
 
@@ -89,7 +128,8 @@ An `allow` decision requires:
 - exact proposal ID + SHA-256;
 - exact project/route/capability/reference/candidate scope;
 - exact precondition snapshot ID + SHA-256;
-- unchanged route revision.
+- unchanged route revision;
+- authorization timestamp not older than the proposal or durable workflow approval state.
 
 If the current precondition snapshot differs from the proposal snapshot, authorization fails closed as stale.
 
@@ -110,10 +150,14 @@ No second Run Ledger or evidence database is introduced.
 
 ## Fail-closed invariants
 
-- No recovery evidence -> no proposal.
-- Missing Run Ledger or Eval references -> no proposal.
-- Non-`COMPLETE` guardrail -> not eligible.
-- Any unresolved recovery state -> manual reconciliation.
+- Caller-provided Run Ledger/Eval reference strings cannot create authority.
+- Unrelated canonical Run Ledger records fail summary reconstruction or identity binding.
+- Unrelated Eval summaries fail reconstruction/admission identity binding.
+- Same candidate subject under unrelated bounded-live authorization is rejected.
+- A committed candidate publication without its exact publication receipt is rejected.
+- Any unresolved relied-upon recovery state -> manual reconciliation.
+- Non-`COMPLETE` final guardrail -> not eligible.
+- Completed exact reference restore -> not eligible.
 - Reference/candidate/project/route/capability drift -> reject.
 - Stale route snapshot -> reject authorization.
 - Re-using the experiment authorization workflow -> reject.
@@ -140,4 +184,4 @@ This slice does not:
 
 ## Next gate
 
-After this contract passes required CI and independent review, the next separate gate is an **isolated/local bounded routing-mutation adapter with restart/recovery proof**. That future adapter must consume the exact promotion authorization and re-check the precondition snapshot immediately before any side effect.
+After this contract passes required CI and fresh independent review, the next separate gate is an **isolated/local bounded routing-mutation adapter with restart/recovery proof**. That future adapter must consume the exact promotion authorization and re-check the precondition snapshot immediately before any side effect.
