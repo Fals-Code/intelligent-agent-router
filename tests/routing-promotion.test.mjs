@@ -3,6 +3,7 @@ import test from "node:test";
 import { join } from "node:path";
 import {
   DurableWorkflowStateMachine,
+  JsonlBoundedLiveSideEffectJournal,
   JsonlEvalHistory,
   JsonlWorkflowCheckpointStore,
   RoutingEvalPlane,
@@ -32,23 +33,26 @@ import {
 } from "./controlled-experiment-fixture.mjs";
 
 let workflowSequence = 0;
+let journalSequence = 0;
 
-test("promotion proposal derives canonical Run Ledger/Eval evidence and exact bounded-live authority", async (t) => {
+const SHA_A = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const SHA_B = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const SHA_C = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+
+test("promotion proposal derives canonical Eval/Run Ledger, final progress, and durable bounded-live evidence", async (t) => {
   const fixture = await promotionFixture(t);
-
   assert.equal(fixture.proposal.payload.classification, "PROMOTION_ELIGIBLE");
   assert.equal(fixture.proposal.payload.automaticRoutingMutationAllowed, false);
   assert.equal(fixture.proposal.payload.automaticRollbackAllowed, false);
+  assert.match(fixture.proposal.payload.finalProgressSha256, /^[0-9A-F]{64}$/);
   assert.ok(fixture.proposal.payload.runLedgerEvidenceReferences.length >= 2);
   assert.equal(fixture.proposal.payload.evalEvidenceReferences.length, 4);
-  assert.equal(fixture.proposal.payload.boundedLiveEvidenceReferences.length, 3);
+  assert.equal(fixture.proposal.payload.boundedLiveEvidenceReferences.length, 4);
   assert.ok(
-    fixture.proposal.payload.runLedgerEvidenceReferences.every((item) =>
-      /:run-ledger:[^:]+:[0-9A-F]{64}$/.test(item),
-    ),
+    fixture.proposal.payload.boundedLiveEvidenceReferences.some((item) => item.startsWith("m5liveeffect-ref:")),
   );
 
-  const promotionWorkflow = await approvedPublishWorkflow(
+  const workflow = await approvedPublishWorkflow(
     fixture.root,
     fixture.experiment.payload.projectId,
     "promotion",
@@ -58,13 +62,9 @@ test("promotion proposal derives canonical Run Ledger/Eval evidence and exact bo
     proposal: fixture.proposal,
     proposalContext: fixture.context,
     currentPreconditionSnapshot: fixture.snapshot,
-    workflow: promotionWorkflow,
-    authorization: promotionAuthorizationInput(
-      promotionWorkflow.approvalIds,
-      "2026-08-21T03:06:00.000Z",
-    ),
+    workflow,
+    authorization: promotionAuthorizationInput(workflow.approvalIds, "2026-08-21T03:06:00.000Z"),
   });
-
   assert.equal(authorization.payload.routingMutationAuthorized, true);
   assert.equal(authorization.payload.automaticRoutingMutationAllowed, false);
   assert.notEqual(authorization.payload.workflowRunId, fixture.experimentWorkflow.id);
@@ -73,7 +73,7 @@ test("promotion proposal derives canonical Run Ledger/Eval evidence and exact bo
     fixture.proposal,
     fixture.context,
     fixture.snapshot,
-    promotionWorkflow,
+    workflow,
   );
 
   const proposalEvidence = await verifiedRoutingPromotionProposalToEvidence(
@@ -86,16 +86,45 @@ test("promotion proposal derives canonical Run Ledger/Eval evidence and exact bo
     fixture.proposal,
     fixture.context,
     fixture.snapshot,
-    promotionWorkflow,
+    workflow,
     "2026-08-21T03:08:00.000Z",
   );
   assert.equal(proposalEvidence.status, "passed");
   assert.equal(authorizationEvidence.status, "passed");
 });
 
-test("unrelated Eval evidence cannot satisfy promotion provenance even when content-addressed", async (t) => {
+test("re-hashed COMPLETE guardrail forgery is rejected when final progress does not derive it", async (t) => {
+  const fixture = await promotionFixture(t, {
+    maxTotalSamples: 4,
+    finalProgress: { shadowSamples: 2, liveSamples: 1, candidateLiveSamples: 1 },
+  });
+  assert.notEqual(fixture.finalGuardrail.payload.classification, "COMPLETE");
+  const forgedGuardrail = await rehashGuardrail({
+    ...fixture.finalGuardrail.payload,
+    classification: "COMPLETE",
+    guardrailActionRequired: false,
+    boundedLiveAdmissionEligible: false,
+  });
+  const context = { ...fixture.context, finalGuardrailDecision: forgedGuardrail };
+  await assert.rejects(
+    prepareRoutingPromotionProposal({ context, proposal: proposalInput() }),
+    /re-derived authoritative final progress/,
+  );
+});
+
+test("auth-matching receipt/recovery without durable journal provenance is rejected", async (t) => {
   const fixture = await promotionFixture(t);
-  const driftedContext = {
+  const emptyJournal = await openSideEffectJournal(fixture.root, "empty");
+  const context = { ...fixture.context, sideEffectJournal: emptyJournal };
+  await assert.rejects(
+    verifyRoutingPromotionProposal(fixture.proposal, context),
+    /no canonical durable side-effect journal event/,
+  );
+});
+
+test("unrelated Eval evidence cannot satisfy promotion provenance", async (t) => {
+  const fixture = await promotionFixture(t);
+  const context = {
     ...fixture.context,
     candidateCohort: {
       ...fixture.context.candidateCohort,
@@ -103,24 +132,21 @@ test("unrelated Eval evidence cannot satisfy promotion provenance even when cont
     },
   };
   await assert.rejects(
-    verifyRoutingPromotionProposal(fixture.proposal, driftedContext),
-    /candidate Eval summary does not match canonical observations|canonical Eval\/Run Ledger identity drift/,
+    verifyRoutingPromotionProposal(fixture.proposal, context),
+    /candidate Eval summary|canonical Eval\/Run Ledger identity drift|final progress summaries drift/,
   );
 });
 
 test("unrelated canonical Run Ledger evidence cannot satisfy promotion provenance", async (t) => {
   const fixture = await promotionFixture(t);
-  const candidateRecords = [...fixture.context.candidateCohort.runLedgerRecords];
-  candidateRecords[0] = fixture.context.referenceCohort.runLedgerRecords[0];
-  const driftedContext = {
+  const records = [...fixture.context.candidateCohort.runLedgerRecords];
+  records[0] = fixture.context.referenceCohort.runLedgerRecords[0];
+  const context = {
     ...fixture.context,
-    candidateCohort: {
-      ...fixture.context.candidateCohort,
-      runLedgerRecords: candidateRecords,
-    },
+    candidateCohort: { ...fixture.context.candidateCohort, runLedgerRecords: records },
   };
   await assert.rejects(
-    verifyRoutingPromotionProposal(fixture.proposal, driftedContext),
+    verifyRoutingPromotionProposal(fixture.proposal, context),
     /Run Ledger|execution summary/,
   );
 });
@@ -132,39 +158,51 @@ test("same candidate subject with unrelated bounded-live authority is rejected",
     ...original.recoveryReport.payload,
     authorityId: "m5liveauth:unrelated-authority",
   });
-  const driftedContext = {
+  const context = {
     ...fixture.context,
     publicationEvidence: [{ ...original, recoveryReport: forgedRecovery }],
   };
   await assert.rejects(
-    verifyRoutingPromotionProposal(fixture.proposal, driftedContext),
-    /exact candidate publication authority\/sample|exact publication authority\/operation/,
+    verifyRoutingPromotionProposal(fixture.proposal, context),
+    /durable side-effect journal event|candidate publication authority/,
   );
 });
 
-test("unresolved exact bounded-live recovery blocks promotion for manual reconciliation", async (t) => {
+test("unresolved exact bounded-live recovery blocks promotion and automatic retry", async (t) => {
   const fixture = await promotionFixture(t);
   const original = fixture.context.publicationEvidence[0];
-  const unresolved = await rehashRecovery({
-    ...original.recoveryReport.payload,
-    journalEventId: "m5liveeffect:unresolved-candidate",
-    journalEventType: "operation_error",
-    probeId: "probe:unresolved-candidate",
-    probeStatus: "unknown",
-    externalReference: undefined,
+  const journal = await openSideEffectJournal(fixture.root, "unresolved");
+  const auth = original.authorization;
+  const operationId = original.receipt.payload.sideEffectOperationId;
+  await journal.reserve({
+    kind: "publication",
+    operationId,
+    idempotencyKey: original.receipt.payload.publicationIdempotencyKey,
+    sinkId: original.receipt.payload.sinkId,
+    authorityId: auth.authorizationId,
+    subjectId: auth.payload.selectedSubjectId,
+    sampleId: auth.payload.sampleId,
+    outputSha256: original.receipt.payload.outputSha256,
+    reservedAt: "2026-08-21T02:56:00.000Z",
+  });
+  const errorEvent = await journal.recordError({
+    operationId,
+    observedAt: "2026-08-21T02:58:00.000Z",
+    error: "synthetic unresolved side effect",
+  });
+  const recoveryReport = await recoveryReportFromEvent(errorEvent, {
     classification: "manual_reconciliation_required",
     explicitOperatorActionRequired: true,
-    observedAt: "2026-08-21T02:58:00.000Z",
+    probeId: "probe:unresolved-candidate",
+    probeStatus: "unknown",
     reason: "Exact candidate publication side effect remains unresolved.",
   });
   const context = {
     ...fixture.context,
-    publicationEvidence: [{ ...original, receipt: undefined, recoveryReport: unresolved }],
+    sideEffectJournal: journal,
+    publicationEvidence: [{ ...original, receipt: undefined, recoveryReport }],
   };
-  const proposal = await prepareRoutingPromotionProposal({
-    context,
-    proposal: proposalInput(),
-  });
+  const proposal = await prepareRoutingPromotionProposal({ context, proposal: proposalInput() });
   assert.equal(proposal.payload.classification, "MANUAL_RECONCILIATION_REQUIRED");
   assert.equal(proposal.payload.automaticRoutingMutationAllowed, false);
   assert.equal(proposal.payload.automaticRetryAllowed, false);
@@ -181,91 +219,62 @@ test("unresolved exact bounded-live recovery blocks promotion for manual reconci
       proposalContext: context,
       currentPreconditionSnapshot: fixture.snapshot,
       workflow,
-      authorization: promotionAuthorizationInput(
-        workflow.approvalIds,
-        "2026-08-21T03:06:00.000Z",
-      ),
+      authorization: promotionAuthorizationInput(workflow.approvalIds, "2026-08-21T03:06:00.000Z"),
     }),
     /eligible proposal/,
   );
 });
 
-test("non-COMPLETE experiment evidence cannot become promotion-eligible", async (t) => {
+test("non-COMPLETE experiment evidence cannot become promotion eligible", async (t) => {
   const fixture = await promotionFixture(t, {
     maxTotalSamples: 4,
-    finalProgress: {
-      shadowSamples: 2,
-      liveSamples: 1,
-      candidateLiveSamples: 1,
-    },
+    finalProgress: { shadowSamples: 2, liveSamples: 1, candidateLiveSamples: 1 },
   });
   assert.notEqual(fixture.finalGuardrail.payload.classification, "COMPLETE");
   assert.equal(fixture.proposal.payload.classification, "PROMOTION_NOT_ELIGIBLE");
-
-  const workflow = await approvedPublishWorkflow(
-    fixture.root,
-    fixture.experiment.payload.projectId,
-    "ineligible",
-    "2026-08-21T03:03:00.000Z",
-  );
-  await assert.rejects(
-    prepareRoutingPromotionAuthorization({
-      proposal: fixture.proposal,
-      proposalContext: fixture.context,
-      currentPreconditionSnapshot: fixture.snapshot,
-      workflow,
-      authorization: promotionAuthorizationInput(
-        workflow.approvalIds,
-        "2026-08-21T03:06:00.000Z",
-      ),
-    }),
-    /eligible proposal/,
-  );
 });
 
-test("reference restore evidence for the exact experiment prevents permanent candidate promotion", async (t) => {
+test("reference restore durable evidence prevents permanent candidate promotion", async (t) => {
   const fixture = await promotionFixture(t);
   const restoreEvidence = await referenceRestoreEvidence(fixture);
-  const context = {
-    ...fixture.context,
-    referenceRestoreEvidence: [restoreEvidence],
-  };
-  const proposal = await prepareRoutingPromotionProposal({
-    context,
-    proposal: proposalInput(),
-  });
+  const context = { ...fixture.context, referenceRestoreEvidence: [restoreEvidence] };
+  const proposal = await prepareRoutingPromotionProposal({ context, proposal: proposalInput() });
   assert.equal(proposal.payload.classification, "PROMOTION_NOT_ELIGIBLE");
   assert.match(proposal.payload.reasons.join(","), /reference_restore_observed/);
 });
 
-test("stale route snapshot invalidates promotion authorization", async (t) => {
+test("stale or different route snapshot cannot reuse promotion authorization", async (t) => {
   const fixture = await promotionFixture(t);
-  const stale = await prepareRoutingPreconditionSnapshot({
-    projectId: fixture.snapshot.payload.projectId,
-    routeId: fixture.snapshot.payload.routeId,
-    capability: fixture.snapshot.payload.capability,
-    currentSubjectId: fixture.snapshot.payload.currentSubjectId,
-    routeRevision: "route-revision:2",
-    capturedAt: "2026-08-21T03:01:00.000Z",
-    policyReferences: ["policy:route-precondition-v1"],
-  });
   const workflow = await approvedPublishWorkflow(
     fixture.root,
     fixture.experiment.payload.projectId,
-    "stale",
+    "route-reuse",
     "2026-08-21T03:03:00.000Z",
   );
+  const authorization = await prepareRoutingPromotionAuthorization({
+    proposal: fixture.proposal,
+    proposalContext: fixture.context,
+    currentPreconditionSnapshot: fixture.snapshot,
+    workflow,
+    authorization: promotionAuthorizationInput(workflow.approvalIds, "2026-08-21T03:06:00.000Z"),
+  });
+  const anotherRoute = await prepareRoutingPreconditionSnapshot({
+    projectId: fixture.snapshot.payload.projectId,
+    routeId: "route:another-code-interactive",
+    capability: fixture.snapshot.payload.capability,
+    currentSubjectId: fixture.snapshot.payload.currentSubjectId,
+    routeRevision: fixture.snapshot.payload.routeRevision,
+    capturedAt: fixture.snapshot.payload.capturedAt,
+    policyReferences: fixture.snapshot.payload.policyReferences,
+  });
   await assert.rejects(
-    prepareRoutingPromotionAuthorization({
-      proposal: fixture.proposal,
-      proposalContext: fixture.context,
-      currentPreconditionSnapshot: stale,
+    verifyRoutingPromotionAuthorization(
+      authorization,
+      fixture.proposal,
+      fixture.context,
+      anotherRoute,
       workflow,
-      authorization: promotionAuthorizationInput(
-        workflow.approvalIds,
-        "2026-08-21T03:06:00.000Z",
-      ),
-    }),
+    ),
     /stale|drifted/,
   );
 });
@@ -298,10 +307,7 @@ test("promotion authorization requires distinct R3/R4 publish workflow and exact
       proposalContext: fixture.context,
       currentPreconditionSnapshot: fixture.snapshot,
       workflow,
-      authorization: promotionAuthorizationInput(
-        ["approval:wrong"],
-        "2026-08-21T03:06:00.000Z",
-      ),
+      authorization: promotionAuthorizationInput(["approval:wrong"], "2026-08-21T03:06:00.000Z"),
     }),
     /do not match durable WorkflowRun approvals/,
   );
@@ -311,37 +317,66 @@ test("promotion authorization requires distinct R3/R4 publish workflow and exact
       proposalContext: fixture.context,
       currentPreconditionSnapshot: fixture.snapshot,
       workflow: { ...workflow, phase: "review" },
-      authorization: promotionAuthorizationInput(
-        workflow.approvalIds,
-        "2026-08-21T03:06:00.000Z",
-      ),
+      authorization: promotionAuthorizationInput(workflow.approvalIds, "2026-08-21T03:06:00.000Z"),
     }),
     /phase=publish/,
   );
+  await assert.rejects(
+    prepareRoutingPromotionAuthorization({
+      proposal: fixture.proposal,
+      proposalContext: fixture.context,
+      currentPreconditionSnapshot: fixture.snapshot,
+      workflow: { ...workflow, riskClass: "R2" },
+      authorization: promotionAuthorizationInput(workflow.approvalIds, "2026-08-21T03:06:00.000Z"),
+    }),
+    /riskClass R3 or R4/,
+  );
 });
 
-test("re-hashed semantic forgery cannot grant automatic routing mutation", async (t) => {
+test("re-hashed semantic forgery cannot grant automatic routing mutation in proposal", async (t) => {
   const fixture = await promotionFixture(t);
-  const forgedPayload = {
-    ...fixture.proposal.payload,
-    automaticRoutingMutationAllowed: true,
-  };
-  const proposalSha256 = await sha256Canonical(forgedPayload);
-  const forged = {
-    ...fixture.proposal,
-    proposalSha256,
-    proposalId: `m5routeproposal:${proposalSha256.slice(0, 32).toLowerCase()}`,
-    payload: forgedPayload,
-  };
+  const payload = { ...fixture.proposal.payload, automaticRoutingMutationAllowed: true };
+  const forged = await rehashProposal(payload);
   await assert.rejects(
     verifyRoutingPromotionProposal(forged, fixture.context),
     /cannot grant automatic authority/,
   );
 });
 
+test("re-hashed authorization cannot forge automatic authority flags", async (t) => {
+  const fixture = await promotionFixture(t);
+  const workflow = await approvedPublishWorkflow(
+    fixture.root,
+    fixture.experiment.payload.projectId,
+    "auth-forgery",
+    "2026-08-21T03:03:00.000Z",
+  );
+  const authorization = await prepareRoutingPromotionAuthorization({
+    proposal: fixture.proposal,
+    proposalContext: fixture.context,
+    currentPreconditionSnapshot: fixture.snapshot,
+    workflow,
+    authorization: promotionAuthorizationInput(workflow.approvalIds, "2026-08-21T03:06:00.000Z"),
+  });
+  const forged = await rehashRoutingAuthorization({
+    ...authorization.payload,
+    automaticRoutingMutationAllowed: true,
+  });
+  await assert.rejects(
+    verifyRoutingPromotionAuthorization(
+      forged,
+      fixture.proposal,
+      fixture.context,
+      fixture.snapshot,
+      workflow,
+    ),
+    /authority flags are invalid/,
+  );
+});
+
 test("reference/candidate identity swap is rejected despite recomputed digest", async (t) => {
   const fixture = await promotionFixture(t);
-  const forgedPayload = {
+  const payload = {
     ...fixture.proposal.payload,
     referenceSubjectId: fixture.proposal.payload.candidateSubjectId,
     candidateSubjectId: fixture.proposal.payload.referenceSubjectId,
@@ -349,13 +384,7 @@ test("reference/candidate identity swap is rejected despite recomputed digest", 
     afterSubjectId: fixture.proposal.payload.referenceSubjectId,
     rollbackTargetSubjectId: fixture.proposal.payload.candidateSubjectId,
   };
-  const proposalSha256 = await sha256Canonical(forgedPayload);
-  const forged = {
-    ...fixture.proposal,
-    proposalSha256,
-    proposalId: `m5routeproposal:${proposalSha256.slice(0, 32).toLowerCase()}`,
-    payload: forgedPayload,
-  };
+  const forged = await rehashProposal(payload);
   await assert.rejects(
     verifyRoutingPromotionProposal(forged, fixture.context),
     /canonical source binding drift|before\/after\/rollback/,
@@ -515,27 +544,27 @@ async function promotionFixture(t, overrides = {}) {
     experimentWorkflow,
     authorizationInput(),
   );
-
-  const finalProgress = overrides.finalProgress ?? {
+  const counters = overrides.finalProgress ?? {
     shadowSamples: 1,
     liveSamples: 2,
     candidateLiveSamples: 2,
+  };
+  const finalProgress = {
+    observedAt: "2026-08-21T03:00:00.000Z",
+    ...counters,
+    referenceEvalSummary: base.reference.evalSummary,
+    candidateEvalSummary: base.candidate.evalSummary,
+    referenceExecutionSummary: base.reference.executionSummary,
+    candidateExecutionSummary: base.candidate.executionSummary,
   };
   const finalGuardrail = await evaluateControlledExperimentGuardrails({
     experiment,
     authorization: experimentAuthorization,
     admissionDecision: base.admissionDecision,
     workflow: experimentWorkflow,
-    progress: {
-      observedAt: "2026-08-21T03:00:00.000Z",
-      ...finalProgress,
-      referenceEvalSummary: base.reference.evalSummary,
-      candidateEvalSummary: base.candidate.evalSummary,
-      referenceExecutionSummary: base.reference.executionSummary,
-      candidateExecutionSummary: base.candidate.executionSummary,
-    },
+    progress: finalProgress,
   });
-
+  const sideEffectJournal = await openSideEffectJournal(base.root, "canonical");
   const publicationEvidence = [await candidatePublicationEvidence({
     root: base.root,
     admissionDecision: base.admissionDecision,
@@ -544,8 +573,8 @@ async function promotionFixture(t, overrides = {}) {
     experimentWorkflow,
     reference: base.reference,
     candidate: base.candidate,
+    sideEffectJournal,
   })];
-
   const snapshot = await prepareRoutingPreconditionSnapshot({
     projectId: experiment.payload.projectId,
     routeId: "route:code-interactive",
@@ -560,7 +589,9 @@ async function promotionFixture(t, overrides = {}) {
     experiment,
     experimentAuthorization,
     experimentWorkflow,
+    finalProgress,
     finalGuardrailDecision: finalGuardrail,
+    sideEffectJournal,
     preconditionSnapshot: snapshot,
     referenceCohort: cohortEvidence(base.reference),
     candidateCohort: cohortEvidence(base.candidate),
@@ -574,7 +605,9 @@ async function promotionFixture(t, overrides = {}) {
     experiment,
     experimentWorkflow,
     experimentAuthorization,
+    finalProgress,
     finalGuardrail,
+    sideEffectJournal,
     snapshot,
     context,
     proposal,
@@ -646,8 +679,31 @@ async function candidatePublicationEvidence(input) {
     liveWorkflow,
     authorization: authorizationInputValue,
   });
-  const receipt = await publicationReceipt(authorization);
-  const recoveryReport = await recoveryReportForPublication(authorization, receipt);
+  const runtimeResultId = "m5liveresult:promotion-candidate-2";
+  const operationId = `publication:${authorization.authorizationId}:${runtimeResultId}`;
+  const idempotencyKey = `${authorization.authorizationId}:${runtimeResultId}`;
+  await input.sideEffectJournal.reserve({
+    kind: "publication",
+    operationId,
+    idempotencyKey,
+    sinkId: "isolated-loopback",
+    authorityId: authorization.authorizationId,
+    subjectId: authorization.payload.selectedSubjectId,
+    sampleId: authorization.payload.sampleId,
+    outputSha256: SHA_B,
+    reservedAt: "2026-08-21T02:56:00.000Z",
+  });
+  const commitEvent = await input.sideEffectJournal.recordCommit({
+    operationId,
+    externalReference: "isolated-publication:promotion-candidate-2",
+    committedAt: "2026-08-21T02:57:00.000Z",
+  });
+  const receipt = await publicationReceipt(authorization, commitEvent, runtimeResultId);
+  const recoveryReport = await recoveryReportFromEvent(commitEvent, {
+    classification: "consistent_committed",
+    explicitOperatorActionRequired: false,
+    reason: "Canonical durable side-effect journal contains committed terminal evidence.",
+  });
   return {
     guardrailDecision: preDispatchGuardrail,
     liveWorkflow,
@@ -658,24 +714,24 @@ async function candidatePublicationEvidence(input) {
   };
 }
 
-async function publicationReceipt(authorization) {
+async function publicationReceipt(authorization, commitEvent, runtimeResultId) {
   const payload = {
     sampleAuthorizationId: authorization.authorizationId,
     sampleAuthorizationSha256: authorization.authorizationSha256,
-    runtimeResultId: "m5liveresult:promotion-candidate-2",
-    runtimeResultSha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    runtimeResultId,
+    runtimeResultSha256: SHA_A,
     sampleId: authorization.payload.sampleId,
     selectedSubjectId: authorization.payload.selectedSubjectId,
     selectedRole: "candidate",
-    sinkId: "isolated-loopback",
-    publicationReference: "isolated-publication:promotion-candidate-2",
-    publicationIdempotencyKey: `${authorization.authorizationId}:m5liveresult:promotion-candidate-2`,
-    sideEffectOperationId: `publication:${authorization.authorizationId}:m5liveresult:promotion-candidate-2`,
-    sideEffectCommitEventId: "m5liveeffect:promotion-candidate-2",
-    outputSha256: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    sinkId: commitEvent.payload.sinkId,
+    publicationReference: commitEvent.payload.externalReference,
+    publicationIdempotencyKey: commitEvent.payload.idempotencyKey,
+    sideEffectOperationId: commitEvent.payload.operationId,
+    sideEffectCommitEventId: commitEvent.eventId,
+    outputSha256: commitEvent.payload.outputSha256,
     outputBytes: 128,
     verifiedAt: "2026-08-21T02:56:00.000Z",
-    publishedAt: "2026-08-21T02:57:00.000Z",
+    publishedAt: commitEvent.payload.committedAt,
     externallyVisible: true,
     candidateOutputExternallyVisible: true,
     rawOutputPersisted: false,
@@ -693,32 +749,10 @@ async function publicationReceipt(authorization) {
   };
 }
 
-async function recoveryReportForPublication(authorization, receipt) {
-  return rehashRecovery({
-    operationId: receipt.payload.sideEffectOperationId,
-    kind: "publication",
-    journalEventId: receipt.payload.sideEffectCommitEventId,
-    journalEventType: "operation_committed",
-    idempotencyKey: receipt.payload.publicationIdempotencyKey,
-    sinkId: receipt.payload.sinkId,
-    authorityId: authorization.authorizationId,
-    subjectId: authorization.payload.selectedSubjectId,
-    sampleId: authorization.payload.sampleId,
-    outputSha256: receipt.payload.outputSha256,
-    externalReference: receipt.payload.publicationReference,
-    classification: "consistent_committed",
-    automaticRetryAllowed: false,
-    automaticMutationAllowed: false,
-    explicitOperatorActionRequired: false,
-    observedAt: receipt.payload.publishedAt,
-    reason: "Durable side-effect journal contains committed terminal evidence.",
-  });
-}
-
 async function referenceRestoreEvidence(fixture) {
   const authorizationPayload = {
     actor: "operator:rollback",
-    approvedAt: "2026-08-21T02:40:00.000Z",
+    approvedAt: "2026-08-21T03:10:00.000Z",
     policyReferences: ["policy:rollback-v1"],
     approvalIds: ["approval:rollback-1"],
     experimentId: fixture.experiment.experimentId,
@@ -726,7 +760,7 @@ async function referenceRestoreEvidence(fixture) {
     experimentAuthorizationId: fixture.experimentAuthorization.authorizationId,
     experimentAuthorizationSha256: fixture.experimentAuthorization.authorizationSha256,
     guardrailDecisionId: "guardrail:rollback-prior",
-    guardrailDecisionSha256: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    guardrailDecisionSha256: SHA_C,
     experimentWorkflowRunId: fixture.experimentWorkflow.id,
     rollbackWorkflowRunId: "workflow:rollback-prior",
     projectId: fixture.experiment.payload.projectId,
@@ -746,17 +780,33 @@ async function referenceRestoreEvidence(fixture) {
     authorizationSha256,
     payload: authorizationPayload,
   };
+  const operationId = `restore:${authorization.authorizationId}`;
+  const idempotencyKey = `${authorization.authorizationId}:${fixture.experiment.payload.referenceSubjectId}`;
+  await fixture.sideEffectJournal.reserve({
+    kind: "reference_restore",
+    operationId,
+    idempotencyKey,
+    sinkId: "isolated-loopback",
+    authorityId: authorization.authorizationId,
+    subjectId: fixture.experiment.payload.referenceSubjectId,
+    reservedAt: "2026-08-21T03:10:00.000Z",
+  });
+  const commitEvent = await fixture.sideEffectJournal.recordCommit({
+    operationId,
+    externalReference: "isolated-restore:prior",
+    committedAt: "2026-08-21T03:11:00.000Z",
+  });
   const receiptPayload = {
     rollbackAuthorizationId: authorization.authorizationId,
     rollbackAuthorizationSha256: authorization.authorizationSha256,
     experimentId: fixture.experiment.experimentId,
     targetSubjectId: fixture.experiment.payload.referenceSubjectId,
-    sinkId: "isolated-loopback",
-    restoreReference: "isolated-restore:prior",
-    restoreIdempotencyKey: `${authorization.authorizationId}:${fixture.experiment.payload.referenceSubjectId}`,
-    sideEffectOperationId: `restore:${authorization.authorizationId}`,
-    sideEffectCommitEventId: "m5liveeffect:restore-prior",
-    restoredAt: "2026-08-21T02:41:00.000Z",
+    sinkId: commitEvent.payload.sinkId,
+    restoreReference: commitEvent.payload.externalReference,
+    restoreIdempotencyKey: commitEvent.payload.idempotencyKey,
+    sideEffectOperationId: operationId,
+    sideEffectCommitEventId: commitEvent.eventId,
+    restoredAt: commitEvent.payload.committedAt,
     activeSubjectId: fixture.experiment.payload.referenceSubjectId,
     referenceSubjectRestored: true,
     automaticRollbackAllowed: false,
@@ -771,24 +821,52 @@ async function referenceRestoreEvidence(fixture) {
     receiptSha256,
     payload: receiptPayload,
   };
-  const recoveryReport = await rehashRecovery({
-    operationId: receipt.payload.sideEffectOperationId,
-    kind: "reference_restore",
-    journalEventId: receipt.payload.sideEffectCommitEventId,
-    journalEventType: "operation_committed",
-    idempotencyKey: receipt.payload.restoreIdempotencyKey,
-    sinkId: receipt.payload.sinkId,
-    authorityId: authorization.authorizationId,
-    subjectId: fixture.experiment.payload.referenceSubjectId,
-    externalReference: receipt.payload.restoreReference,
+  const recoveryReport = await recoveryReportFromEvent(commitEvent, {
     classification: "consistent_committed",
-    automaticRetryAllowed: false,
-    automaticMutationAllowed: false,
     explicitOperatorActionRequired: false,
-    observedAt: receipt.payload.restoredAt,
-    reason: "Durable side-effect journal contains committed terminal evidence.",
+    reason: "Canonical durable side-effect journal contains committed terminal restore evidence.",
   });
   return { authorization, receipt, recoveryReport };
+}
+
+async function recoveryReportFromEvent(event, overrides) {
+  const payload = event.payload;
+  const recoveryPayload = {
+    operationId: payload.operationId,
+    kind: payload.kind,
+    journalEventId: event.eventId,
+    journalEventType: payload.eventType,
+    idempotencyKey: payload.idempotencyKey,
+    sinkId: payload.sinkId,
+    authorityId: payload.authorityId,
+    subjectId: payload.subjectId,
+    sampleId: payload.sampleId,
+    outputSha256: payload.outputSha256,
+    probeId: overrides.probeId,
+    probeStatus: overrides.probeStatus,
+    externalReference: payload.eventType === "operation_committed" ? payload.externalReference : undefined,
+    classification: overrides.classification,
+    automaticRetryAllowed: false,
+    automaticMutationAllowed: false,
+    explicitOperatorActionRequired: overrides.explicitOperatorActionRequired,
+    observedAt: payload.eventType === "operation_committed"
+      ? payload.committedAt
+      : payload.eventType === "operation_error"
+        ? payload.observedAt
+        : payload.reservedAt,
+    reason: overrides.reason,
+  };
+  return rehashRecovery(recoveryPayload);
+}
+
+async function openSideEffectJournal(root, label) {
+  journalSequence += 1;
+  return JsonlBoundedLiveSideEffectJournal.open({
+    filePath: join(root, `routing-promotion-side-effects-${label}-${journalSequence}.jsonl`),
+    maxFileBytes: 2 * 1024 * 1024,
+    maxEventBytes: 128 * 1024,
+    maxStringBytes: 4096,
+  });
 }
 
 async function approvedPublishWorkflow(root, projectId, prefix, now) {
@@ -822,7 +900,7 @@ function proposalInput() {
     routeId: "route:code-interactive",
     capability: "code.interactive",
     proposedAt: "2026-08-21T03:02:00.000Z",
-    policyReferences: ["policy:routing-promotion-v2"],
+    policyReferences: ["policy:routing-promotion-v3"],
   };
 }
 
@@ -836,6 +914,17 @@ function promotionAuthorizationInput(approvalIds, decidedAt) {
   };
 }
 
+async function rehashGuardrail(payload) {
+  const decisionSha256 = await sha256Canonical(payload);
+  return {
+    schemaVersion: 1,
+    algorithm: "sha256",
+    decisionId: `m5expguard:${decisionSha256.slice(0, 32).toLowerCase()}`,
+    decisionSha256,
+    payload,
+  };
+}
+
 async function rehashRecovery(payload) {
   const reconciliationSha256 = await sha256Canonical(payload);
   return {
@@ -843,6 +932,28 @@ async function rehashRecovery(payload) {
     algorithm: "sha256",
     reconciliationId: `m5livereconcile:${reconciliationSha256.slice(0, 32).toLowerCase()}`,
     reconciliationSha256,
+    payload,
+  };
+}
+
+async function rehashProposal(payload) {
+  const proposalSha256 = await sha256Canonical(payload);
+  return {
+    schemaVersion: 1,
+    algorithm: "sha256",
+    proposalId: `m5routeproposal:${proposalSha256.slice(0, 32).toLowerCase()}`,
+    proposalSha256,
+    payload,
+  };
+}
+
+async function rehashRoutingAuthorization(payload) {
+  const authorizationSha256 = await sha256Canonical(payload);
+  return {
+    schemaVersion: 1,
+    algorithm: "sha256",
+    authorizationId: `m5routeauth:${authorizationSha256.slice(0, 32).toLowerCase()}`,
+    authorizationSha256,
     payload,
   };
 }
