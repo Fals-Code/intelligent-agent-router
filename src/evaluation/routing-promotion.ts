@@ -27,8 +27,14 @@ import {
   verifyControlledExperimentAuthorization,
   verifyControlledExperimentDefinition,
 } from "./controlled-experiment.js";
-import type { ControlledExperimentGuardrailDecision } from "./controlled-experiment-guardrails.js";
-import { verifyControlledExperimentGuardrailDecision } from "./controlled-experiment-guardrails.js";
+import type {
+  ControlledExperimentGuardrailDecision,
+  ControlledExperimentProgressInput,
+} from "./controlled-experiment-guardrails.js";
+import {
+  evaluateControlledExperimentGuardrails,
+  verifyControlledExperimentGuardrailDecision,
+} from "./controlled-experiment-guardrails.js";
 import type {
   BoundedLiveSampleAuthorization,
   BoundedLiveSampleAuthorizationInput,
@@ -46,6 +52,11 @@ import {
 } from "../integration/bounded-live-reference-restore.js";
 import type { BoundedLiveSideEffectRecoveryReport } from "../integration/bounded-live-side-effect-reconciliation.js";
 import { verifyBoundedLiveSideEffectRecoveryReport } from "../integration/bounded-live-side-effect-reconciliation.js";
+import type { BoundedLiveSideEffectEvent } from "../integration/bounded-live-side-effect-journal.js";
+import {
+  JsonlBoundedLiveSideEffectJournal,
+  verifyBoundedLiveSideEffectEvent,
+} from "../integration/bounded-live-side-effect-journal.js";
 
 export const ROUTING_PRECONDITION_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 export const ROUTING_PROMOTION_PROPOSAL_SCHEMA_VERSION = 1 as const;
@@ -92,7 +103,7 @@ export interface RoutingPromotionBoundedLivePublicationEvidence {
   readonly liveWorkflow: WorkflowRun;
   readonly authorizationInput: BoundedLiveSampleAuthorizationInput;
   readonly authorization: BoundedLiveSampleAuthorization;
-  /** Required for a durably committed publication; absent for unresolved recovery states. */
+  /** Required only for a durably committed publication. */
   readonly receipt?: BoundedLivePublicationReceipt;
   readonly recoveryReport: BoundedLiveSideEffectRecoveryReport;
 }
@@ -108,7 +119,11 @@ export interface RoutingPromotionContext {
   readonly experiment: ControlledExperimentDefinition;
   readonly experimentAuthorization: ControlledExperimentAuthorization;
   readonly experimentWorkflow: WorkflowRun;
+  /** Exact authoritative final progress used to derive finalGuardrailDecision. */
+  readonly finalProgress: ControlledExperimentProgressInput;
   readonly finalGuardrailDecision: ControlledExperimentGuardrailDecision;
+  /** Canonical durable journal reopened/owned by the bounded-live side-effect boundary. */
+  readonly sideEffectJournal: JsonlBoundedLiveSideEffectJournal;
   readonly preconditionSnapshot: RoutingPreconditionSnapshot;
   readonly referenceCohort: RoutingPromotionCohortEvidence;
   readonly candidateCohort: RoutingPromotionCohortEvidence;
@@ -136,6 +151,7 @@ export interface RoutingPromotionProposalPayload {
   readonly experimentAuthorizationId: string;
   readonly experimentAuthorizationSha256: string;
   readonly experimentWorkflowRunId: string;
+  readonly finalProgressSha256: string;
   readonly finalGuardrailDecisionId: string;
   readonly finalGuardrailDecisionSha256: string;
   readonly preconditionSnapshotId: string;
@@ -202,121 +218,54 @@ export interface RoutingPromotionAuthorization {
 }
 
 type DerivedPromotionEvidence = {
+  readonly finalProgressSha256: string;
   readonly runLedgerEvidenceReferences: readonly string[];
   readonly evalEvidenceReferences: readonly string[];
   readonly boundedLiveEvidenceReferences: readonly string[];
 };
 
 const SNAPSHOT_INPUT_FIELDS = new Set([
-  "projectId",
-  "routeId",
-  "capability",
-  "currentSubjectId",
-  "routeRevision",
-  "capturedAt",
-  "policyReferences",
+  "projectId", "routeId", "capability", "currentSubjectId", "routeRevision", "capturedAt", "policyReferences",
 ]);
 const SNAPSHOT_ENVELOPE_FIELDS = new Set([
-  "schemaVersion",
-  "algorithm",
-  "snapshotId",
-  "snapshotSha256",
-  "payload",
+  "schemaVersion", "algorithm", "snapshotId", "snapshotSha256", "payload",
 ]);
 const SNAPSHOT_PAYLOAD_FIELDS = new Set([
-  ...SNAPSHOT_INPUT_FIELDS,
-  "providerSpecificStatePersisted",
-  "rawProviderOutputPersisted",
+  ...SNAPSHOT_INPUT_FIELDS, "providerSpecificStatePersisted", "rawProviderOutputPersisted",
 ]);
-const PROPOSAL_INPUT_FIELDS = new Set([
-  "routeId",
-  "capability",
-  "proposedAt",
-  "policyReferences",
-]);
+const PROPOSAL_INPUT_FIELDS = new Set(["routeId", "capability", "proposedAt", "policyReferences"]);
 const PROPOSAL_ENVELOPE_FIELDS = new Set([
-  "schemaVersion",
-  "algorithm",
-  "proposalId",
-  "proposalSha256",
-  "payload",
+  "schemaVersion", "algorithm", "proposalId", "proposalSha256", "payload",
 ]);
 const PROPOSAL_PAYLOAD_FIELDS = new Set([
-  "projectId",
-  "routeId",
-  "capability",
-  "referenceSubjectId",
-  "candidateSubjectId",
-  "admissionDecisionId",
-  "admissionDecisionSha256",
-  "experimentId",
-  "experimentSha256",
-  "experimentAuthorizationId",
-  "experimentAuthorizationSha256",
-  "experimentWorkflowRunId",
-  "finalGuardrailDecisionId",
-  "finalGuardrailDecisionSha256",
-  "preconditionSnapshotId",
-  "preconditionSnapshotSha256",
-  "routeRevision",
-  "beforeSubjectId",
-  "afterSubjectId",
-  "rollbackTargetSubjectId",
-  "runLedgerEvidenceReferences",
-  "evalEvidenceReferences",
-  "boundedLiveEvidenceReferences",
-  "proposedAt",
-  "policyReferences",
-  "classification",
-  "reasons",
-  "automaticRoutingMutationAllowed",
-  "automaticRollbackAllowed",
-  "automaticRetryAllowed",
+  "projectId", "routeId", "capability", "referenceSubjectId", "candidateSubjectId",
+  "admissionDecisionId", "admissionDecisionSha256", "experimentId", "experimentSha256",
+  "experimentAuthorizationId", "experimentAuthorizationSha256", "experimentWorkflowRunId",
+  "finalProgressSha256", "finalGuardrailDecisionId", "finalGuardrailDecisionSha256",
+  "preconditionSnapshotId", "preconditionSnapshotSha256", "routeRevision", "beforeSubjectId",
+  "afterSubjectId", "rollbackTargetSubjectId", "runLedgerEvidenceReferences", "evalEvidenceReferences",
+  "boundedLiveEvidenceReferences", "proposedAt", "policyReferences", "classification", "reasons",
+  "automaticRoutingMutationAllowed", "automaticRollbackAllowed", "automaticRetryAllowed",
   "automaticRedispatchAllowed",
 ]);
 const AUTH_INPUT_FIELDS = new Set([
-  "decision",
-  "actor",
-  "decidedAt",
-  "policyReferences",
-  "approvalIds",
+  "decision", "actor", "decidedAt", "policyReferences", "approvalIds",
 ]);
 const AUTH_ENVELOPE_FIELDS = new Set([
-  "schemaVersion",
-  "algorithm",
-  "authorizationId",
-  "authorizationSha256",
-  "payload",
+  "schemaVersion", "algorithm", "authorizationId", "authorizationSha256", "payload",
 ]);
 const AUTH_PAYLOAD_FIELDS = new Set([
-  ...AUTH_INPUT_FIELDS,
-  "proposalId",
-  "proposalSha256",
-  "projectId",
-  "routeId",
-  "capability",
-  "referenceSubjectId",
-  "candidateSubjectId",
-  "preconditionSnapshotId",
-  "preconditionSnapshotSha256",
-  "routeRevision",
-  "workflowRunId",
-  "riskClass",
-  "routingMutationAuthorized",
-  "automaticRoutingMutationAllowed",
-  "automaticRollbackAllowed",
-  "automaticRetryAllowed",
+  ...AUTH_INPUT_FIELDS, "proposalId", "proposalSha256", "projectId", "routeId", "capability",
+  "referenceSubjectId", "candidateSubjectId", "preconditionSnapshotId", "preconditionSnapshotSha256",
+  "routeRevision", "workflowRunId", "riskClass", "routingMutationAuthorized",
+  "automaticRoutingMutationAllowed", "automaticRollbackAllowed", "automaticRetryAllowed",
   "automaticRedispatchAllowed",
 ]);
 
 export async function prepareRoutingPreconditionSnapshot(
   input: RoutingPreconditionSnapshotInput,
 ): Promise<RoutingPreconditionSnapshot> {
-  assertExactFields(
-    input as unknown as Record<string, unknown>,
-    SNAPSHOT_INPUT_FIELDS,
-    "Routing precondition snapshot input",
-  );
+  assertExactFields(input as unknown as Record<string, unknown>, SNAPSHOT_INPUT_FIELDS, "Routing precondition snapshot input");
   const payload: RoutingPreconditionSnapshotPayload = deepFreeze({
     projectId: prepareIdentity(input.projectId, "Routing precondition projectId"),
     routeId: prepareIdentity(input.routeId, "Routing precondition routeId"),
@@ -324,11 +273,7 @@ export async function prepareRoutingPreconditionSnapshot(
     currentSubjectId: prepareIdentity(input.currentSubjectId, "Routing precondition currentSubjectId"),
     routeRevision: prepareSafeReference(input.routeRevision, "Routing precondition routeRevision"),
     capturedAt: prepareTimestamp(input.capturedAt, "Routing precondition capturedAt"),
-    policyReferences: normalizeSafeSet(
-      input.policyReferences,
-      "Routing precondition policy reference",
-      true,
-    ),
+    policyReferences: normalizeSafeSet(input.policyReferences, "Routing precondition policy reference", true),
     providerSpecificStatePersisted: false,
     rawProviderOutputPersisted: false,
   });
@@ -342,27 +287,21 @@ export async function prepareRoutingPreconditionSnapshot(
   });
 }
 
-export async function verifyRoutingPreconditionSnapshot(
-  snapshot: RoutingPreconditionSnapshot,
-): Promise<void> {
+export async function verifyRoutingPreconditionSnapshot(snapshot: RoutingPreconditionSnapshot): Promise<void> {
   if (!isRecord(snapshot)) throw new Error("Routing precondition snapshot must be an object");
   assertExactFields(snapshot, SNAPSHOT_ENVELOPE_FIELDS, "Routing precondition snapshot");
   if (
     snapshot.schemaVersion !== ROUTING_PRECONDITION_SNAPSHOT_SCHEMA_VERSION ||
     snapshot.algorithm !== "sha256" ||
     !isRecord(snapshot.payload)
-  ) {
-    throw new Error("Routing precondition snapshot envelope is invalid");
-  }
+  ) throw new Error("Routing precondition snapshot envelope is invalid");
   assertExactFields(snapshot.payload, SNAPSHOT_PAYLOAD_FIELDS, "Routing precondition snapshot payload");
   validateSnapshotPayload(snapshot.payload as unknown as RoutingPreconditionSnapshotPayload);
   const expected = await sha256Canonical(snapshot.payload);
   if (
     snapshot.snapshotSha256 !== expected ||
     snapshot.snapshotId !== `m5routesnap:${expected.slice(0, 32).toLowerCase()}`
-  ) {
-    throw new Error("Routing precondition snapshot content address is invalid");
-  }
+  ) throw new Error("Routing precondition snapshot content address is invalid");
 }
 
 export async function prepareRoutingPromotionProposal(input: {
@@ -371,29 +310,18 @@ export async function prepareRoutingPromotionProposal(input: {
 }): Promise<RoutingPromotionProposal> {
   const { context, proposal } = input;
   const derived = await verifyPromotionContext(context);
-  assertExactFields(
-    proposal as unknown as Record<string, unknown>,
-    PROPOSAL_INPUT_FIELDS,
-    "Routing promotion proposal input",
-  );
+  assertExactFields(proposal as unknown as Record<string, unknown>, PROPOSAL_INPUT_FIELDS, "Routing promotion proposal input");
   const routeId = prepareIdentity(proposal.routeId, "Routing promotion routeId");
   const capability = prepareCapability(proposal.capability);
   if (
     routeId !== context.preconditionSnapshot.payload.routeId ||
     capability !== context.preconditionSnapshot.payload.capability
-  ) {
-    throw new Error("Routing promotion route/capability does not match precondition snapshot");
-  }
+  ) throw new Error("Routing promotion route/capability does not match precondition snapshot");
   const proposedAt = prepareTimestamp(proposal.proposedAt, "Routing promotion proposedAt");
   assertTimestampAtOrAfter(
     proposedAt,
     [context.finalGuardrailDecision.payload.observedAt, context.preconditionSnapshot.payload.capturedAt],
     "Routing promotion proposal cannot predate final evidence or route snapshot",
-  );
-  const policyReferences = normalizeSafeSet(
-    proposal.policyReferences,
-    "Routing promotion policy reference",
-    true,
   );
   const experiment = context.experiment;
   const classification = classifyPromotion(context);
@@ -410,6 +338,7 @@ export async function prepareRoutingPromotionProposal(input: {
     experimentAuthorizationId: context.experimentAuthorization.authorizationId,
     experimentAuthorizationSha256: context.experimentAuthorization.authorizationSha256,
     experimentWorkflowRunId: context.experimentWorkflow.id,
+    finalProgressSha256: derived.finalProgressSha256,
     finalGuardrailDecisionId: context.finalGuardrailDecision.decisionId,
     finalGuardrailDecisionSha256: context.finalGuardrailDecision.decisionSha256,
     preconditionSnapshotId: context.preconditionSnapshot.snapshotId,
@@ -422,7 +351,7 @@ export async function prepareRoutingPromotionProposal(input: {
     evalEvidenceReferences: derived.evalEvidenceReferences,
     boundedLiveEvidenceReferences: derived.boundedLiveEvidenceReferences,
     proposedAt,
-    policyReferences,
+    policyReferences: normalizeSafeSet(proposal.policyReferences, "Routing promotion policy reference", true),
     classification,
     reasons: promotionReasons(classification, context),
     automaticRoutingMutationAllowed: false,
@@ -452,9 +381,7 @@ export async function verifyRoutingPromotionProposal(
     proposal.schemaVersion !== ROUTING_PROMOTION_PROPOSAL_SCHEMA_VERSION ||
     proposal.algorithm !== "sha256" ||
     !isRecord(proposal.payload)
-  ) {
-    throw new Error("Routing promotion proposal envelope is invalid");
-  }
+  ) throw new Error("Routing promotion proposal envelope is invalid");
   assertExactFields(proposal.payload, PROPOSAL_PAYLOAD_FIELDS, "Routing promotion proposal payload");
   const payload = proposal.payload as unknown as RoutingPromotionProposalPayload;
   validateProposalPayload(payload);
@@ -463,9 +390,7 @@ export async function verifyRoutingPromotionProposal(
   if (
     proposal.proposalSha256 !== expected ||
     proposal.proposalId !== `m5routeproposal:${expected.slice(0, 32).toLowerCase()}`
-  ) {
-    throw new Error("Routing promotion proposal content address is invalid");
-  }
+  ) throw new Error("Routing promotion proposal content address is invalid");
 }
 
 export async function prepareRoutingPromotionAuthorization(input: {
@@ -480,31 +405,18 @@ export async function prepareRoutingPromotionAuthorization(input: {
   await verifyRoutingPreconditionSnapshot(currentPreconditionSnapshot);
   assertFreshSnapshot(proposal, currentPreconditionSnapshot);
   assertPromotionWorkflow(workflow, proposal, proposalContext.experimentWorkflow.id);
-  assertExactFields(
-    authorization as unknown as Record<string, unknown>,
-    AUTH_INPUT_FIELDS,
-    "Routing promotion authorization input",
-  );
+  assertExactFields(authorization as unknown as Record<string, unknown>, AUTH_INPUT_FIELDS, "Routing promotion authorization input");
   if (authorization.decision !== "allow" && authorization.decision !== "deny") {
     throw new Error("Routing promotion authorization decision is invalid");
   }
-  if (
-    authorization.decision === "allow" &&
-    proposal.payload.classification !== "PROMOTION_ELIGIBLE"
-  ) {
+  if (authorization.decision === "allow" && proposal.payload.classification !== "PROMOTION_ELIGIBLE") {
     throw new Error("Routing promotion allow authorization requires an eligible proposal");
   }
-  const actor = prepareIdentity(authorization.actor, "Routing promotion authorization actor");
   const decidedAt = prepareTimestamp(authorization.decidedAt, "Routing promotion authorization decidedAt");
   assertTimestampAtOrAfter(
     decidedAt,
     [proposal.payload.proposedAt, workflow.updatedAt],
     "Routing promotion authorization cannot predate proposal or durable workflow state",
-  );
-  const policyReferences = normalizeSafeSet(
-    authorization.policyReferences,
-    "Routing promotion authorization policy reference",
-    true,
   );
   const approvalIds = normalizeSafeSet(
     authorization.approvalIds,
@@ -524,9 +436,13 @@ export async function prepareRoutingPromotionAuthorization(input: {
   }
   const payload: RoutingPromotionAuthorizationPayload = deepFreeze({
     decision: authorization.decision,
-    actor,
+    actor: prepareIdentity(authorization.actor, "Routing promotion authorization actor"),
     decidedAt,
-    policyReferences,
+    policyReferences: normalizeSafeSet(
+      authorization.policyReferences,
+      "Routing promotion authorization policy reference",
+      true,
+    ),
     approvalIds,
     proposalId: proposal.proposalId,
     proposalSha256: proposal.proposalSha256,
@@ -574,9 +490,7 @@ export async function verifyRoutingPromotionAuthorization(
     authorization.schemaVersion !== ROUTING_PROMOTION_AUTHORIZATION_SCHEMA_VERSION ||
     authorization.algorithm !== "sha256" ||
     !isRecord(authorization.payload)
-  ) {
-    throw new Error("Routing promotion authorization envelope is invalid");
-  }
+  ) throw new Error("Routing promotion authorization envelope is invalid");
   assertExactFields(authorization.payload, AUTH_PAYLOAD_FIELDS, "Routing promotion authorization payload");
   const payload = authorization.payload as unknown as RoutingPromotionAuthorizationPayload;
   validateAuthorizationPayload(payload);
@@ -588,20 +502,16 @@ export async function verifyRoutingPromotionAuthorization(
     payload.capability !== proposal.payload.capability ||
     payload.referenceSubjectId !== proposal.payload.referenceSubjectId ||
     payload.candidateSubjectId !== proposal.payload.candidateSubjectId
-  ) {
-    throw new Error("Routing promotion authorization scope drift detected");
-  }
+  ) throw new Error("Routing promotion authorization scope drift detected");
   if (
     payload.preconditionSnapshotId !== currentPreconditionSnapshot.snapshotId ||
     payload.preconditionSnapshotSha256 !== currentPreconditionSnapshot.snapshotSha256 ||
     payload.routeRevision !== currentPreconditionSnapshot.payload.routeRevision
-  ) {
-    throw new Error("Routing promotion authorization precondition snapshot drift detected");
-  }
+  ) throw new Error("Routing promotion authorization precondition snapshot drift detected");
   if (payload.workflowRunId !== workflow.id || payload.riskClass !== workflow.riskClass) {
     throw new Error("Routing promotion authorization workflow identity drift detected");
   }
-  const approvalIds = normalizeSafeSet(
+  const approvals = normalizeSafeSet(
     payload.approvalIds,
     "Routing promotion authorization approvalId",
     payload.decision === "allow",
@@ -611,16 +521,14 @@ export async function verifyRoutingPromotionAuthorization(
     "Routing promotion durable workflow approvalId",
     payload.decision === "allow",
   );
-  if (!sameArray(approvalIds, payload.approvalIds) || !sameArray(approvalIds, durableApprovals)) {
+  if (!sameArray(approvals, payload.approvalIds) || !sameArray(approvals, durableApprovals)) {
     throw new Error("Routing promotion authorization approvals drift from durable WorkflowRun approvals");
   }
   if (
     payload.routingMutationAuthorized !== (payload.decision === "allow") ||
     (payload.decision === "allow" && proposal.payload.classification !== "PROMOTION_ELIGIBLE") ||
     (payload.decision === "allow" && workflow.status !== "running")
-  ) {
-    throw new Error("Routing promotion authorization decision/eligibility state is invalid");
-  }
+  ) throw new Error("Routing promotion authorization decision/eligibility state is invalid");
   assertTimestampAtOrAfter(
     payload.decidedAt,
     [proposal.payload.proposedAt, workflow.updatedAt],
@@ -630,9 +538,7 @@ export async function verifyRoutingPromotionAuthorization(
   if (
     authorization.authorizationSha256 !== expected ||
     authorization.authorizationId !== `m5routeauth:${expected.slice(0, 32).toLowerCase()}`
-  ) {
-    throw new Error("Routing promotion authorization content address is invalid");
-  }
+  ) throw new Error("Routing promotion authorization content address is invalid");
 }
 
 export async function verifiedRoutingPromotionProposalToEvidence(
@@ -689,29 +595,23 @@ export async function verifiedRoutingPromotionAuthorizationToEvidence(
 async function verifyPromotionContext(context: RoutingPromotionContext): Promise<DerivedPromotionEvidence> {
   await verifyAuthorityChain(context);
   await verifyRoutingPreconditionSnapshot(context.preconditionSnapshot);
-  await verifyControlledExperimentGuardrailDecision(context.finalGuardrailDecision);
-  assertFinalGuardrailBinding(context);
+  if (!(context.sideEffectJournal instanceof JsonlBoundedLiveSideEffectJournal)) {
+    throw new Error("Routing promotion requires the canonical durable bounded-live side-effect journal");
+  }
   if (
     context.preconditionSnapshot.payload.projectId !== context.experiment.payload.projectId ||
     context.preconditionSnapshot.payload.currentSubjectId !== context.experiment.payload.referenceSubjectId
-  ) {
-    throw new Error("Routing promotion precondition snapshot does not bind the exact known-good reference route");
-  }
-  assertTimestampAtOrAfter(
-    context.preconditionSnapshot.payload.capturedAt,
-    [context.finalGuardrailDecision.payload.observedAt],
-    "Routing promotion route snapshot cannot predate final guardrail evidence",
-  );
+  ) throw new Error("Routing promotion precondition snapshot does not bind the exact known-good reference route");
+
   const reference = await verifyCohortEvidence("reference", context.referenceCohort, context);
   const candidate = await verifyCohortEvidence("candidate", context.candidateCohort, context);
+  const finalProgressSha256 = await verifyFinalProgressEvidence(context);
   const boundedLiveEvidenceReferences = await verifyBoundedLiveEvidence(context);
+
   return deepFreeze({
-    runLedgerEvidenceReferences: deepFreeze(
-      [...reference.runLedgerReferences, ...candidate.runLedgerReferences].sort(),
-    ),
-    evalEvidenceReferences: deepFreeze(
-      [...reference.evalReferences, ...candidate.evalReferences].sort(),
-    ),
+    finalProgressSha256,
+    runLedgerEvidenceReferences: deepFreeze([...reference.runLedgerReferences, ...candidate.runLedgerReferences].sort()),
+    evalEvidenceReferences: deepFreeze([...reference.evalReferences, ...candidate.evalReferences].sort()),
     boundedLiveEvidenceReferences,
   });
 }
@@ -728,30 +628,42 @@ async function verifyAuthorityChain(context: RoutingPromotionContext): Promise<v
   if (
     context.admissionDecision.payload.classification !== "ELIGIBLE_FOR_CONTROLLED_EXPERIMENT" ||
     context.admissionDecision.payload.experimentAdmissionEligible !== true
-  ) {
-    throw new Error("Routing promotion requires an eligible M5 admission decision");
-  }
+  ) throw new Error("Routing promotion requires an eligible M5 admission decision");
   if (
     context.experimentAuthorization.payload.decision !== "allow" ||
     context.experimentAuthorization.payload.experimentContractAuthorized !== true
-  ) {
-    throw new Error("Routing promotion requires an allowed controlled experiment");
-  }
+  ) throw new Error("Routing promotion requires an allowed controlled experiment");
 }
 
-function assertFinalGuardrailBinding(context: RoutingPromotionContext): void {
-  const guardrail = context.finalGuardrailDecision.payload;
-  if (
-    guardrail.experimentId !== context.experiment.experimentId ||
-    guardrail.experimentSha256 !== context.experiment.experimentSha256 ||
-    guardrail.authorizationId !== context.experimentAuthorization.authorizationId ||
-    guardrail.authorizationSha256 !== context.experimentAuthorization.authorizationSha256 ||
-    guardrail.admissionDecisionId !== context.admissionDecision.decisionId ||
-    guardrail.admissionDecisionSha256 !== context.admissionDecision.decisionSha256 ||
-    guardrail.workflowRunId !== context.experimentWorkflow.id
-  ) {
-    throw new Error("Routing promotion final guardrail authority binding drift detected");
+async function verifyFinalProgressEvidence(context: RoutingPromotionContext): Promise<string> {
+  const progress = context.finalProgress;
+  if (!progress || typeof progress !== "object") {
+    throw new Error("Routing promotion requires authoritative final ControlledExperimentProgressInput");
   }
+  if (
+    stableStringify(progress.referenceEvalSummary) !== stableStringify(context.referenceCohort.evalSummary) ||
+    stableStringify(progress.candidateEvalSummary) !== stableStringify(context.candidateCohort.evalSummary) ||
+    stableStringify(progress.referenceExecutionSummary) !== stableStringify(context.referenceCohort.executionSummary) ||
+    stableStringify(progress.candidateExecutionSummary) !== stableStringify(context.candidateCohort.executionSummary)
+  ) throw new Error("Routing promotion final progress summaries drift from canonical Eval/Run Ledger cohorts");
+
+  await verifyControlledExperimentGuardrailDecision(context.finalGuardrailDecision);
+  const rederived = await evaluateControlledExperimentGuardrails({
+    experiment: context.experiment,
+    authorization: context.experimentAuthorization,
+    admissionDecision: context.admissionDecision,
+    workflow: context.experimentWorkflow,
+    progress,
+  });
+  if (stableStringify(rederived) !== stableStringify(context.finalGuardrailDecision)) {
+    throw new Error("Routing promotion final guardrail does not match re-derived authoritative final progress");
+  }
+  assertTimestampAtOrAfter(
+    context.preconditionSnapshot.payload.capturedAt,
+    [context.finalGuardrailDecision.payload.observedAt],
+    "Routing promotion route snapshot cannot predate final guardrail evidence",
+  );
+  return sha256Canonical(progress);
 }
 
 async function verifyCohortEvidence(
@@ -801,9 +713,7 @@ async function verifyCohortEvidence(
       [...cohort.evalSummary.payload.observationIds].sort(),
       [...cohort.executionSummary.payload.observationIds].sort(),
     )
-  ) {
-    throw new Error(`Routing promotion ${role} canonical Eval/Run Ledger identity drift detected`);
-  }
+  ) throw new Error(`Routing promotion ${role} canonical Eval/Run Ledger identity drift detected`);
   for (const record of cohort.runLedgerRecords) {
     if (record.projectId !== context.experiment.payload.projectId) {
       throw new Error(`Routing promotion ${role} Run Ledger projectId drift detected`);
@@ -825,9 +735,7 @@ async function verifyCohortEvidence(
   return { runLedgerReferences, evalReferences };
 }
 
-async function verifyBoundedLiveEvidence(
-  context: RoutingPromotionContext,
-): Promise<readonly string[]> {
+async function verifyBoundedLiveEvidence(context: RoutingPromotionContext): Promise<readonly string[]> {
   if (!Array.isArray(context.publicationEvidence) || !Array.isArray(context.referenceRestoreEvidence)) {
     throw new Error("Routing promotion bounded-live evidence collections must be arrays");
   }
@@ -857,23 +765,26 @@ async function verifyBoundedLiveEvidence(
       auth.projectId !== context.experiment.payload.projectId ||
       auth.liveAssignment !== "candidate" ||
       auth.selectedSubjectId !== context.experiment.payload.candidateSubjectId
-    ) {
-      throw new Error("Routing promotion bounded-live authorization is not bound to this exact candidate experiment");
-    }
-    assertPublicationRecoveryAuthority(evidence.authorization, evidence.recoveryReport);
+    ) throw new Error("Routing promotion bounded-live authorization is not bound to this exact candidate experiment");
+
+    const journalEvent = await requireExactJournalEvent(context.sideEffectJournal, evidence.recoveryReport);
+    assertPublicationRecoveryAuthority(evidence.authorization, evidence.recoveryReport, journalEvent);
     if (sampleIds.has(auth.sampleId) || operationIds.has(recovery.operationId)) {
       throw new Error("Routing promotion bounded-live publication evidence must be unique");
     }
     sampleIds.add(auth.sampleId);
     operationIds.add(recovery.operationId);
+    refs.push(
+      `m5liveauth-ref:${evidence.authorization.authorizationId}:${evidence.authorization.authorizationSha256}`,
+      `m5liveeffect-ref:${journalEvent.eventId}:${journalEvent.eventSha256}`,
+    );
 
-    refs.push(`m5liveauth-ref:${evidence.authorization.authorizationId}:${evidence.authorization.authorizationSha256}`);
     if (recovery.classification === "consistent_committed") {
       if (!evidence.receipt) {
         throw new Error("Routing promotion committed candidate publication requires exact publication receipt");
       }
       await verifyBoundedLivePublicationReceipt(evidence.receipt);
-      assertCommittedPublicationBinding(evidence);
+      assertCommittedPublicationBinding(evidence, journalEvent);
       refs.push(`m5livepub-ref:${evidence.receipt.receiptId}:${evidence.receipt.receiptSha256}`);
     } else if (evidence.receipt !== undefined) {
       throw new Error("Routing promotion unresolved publication evidence must not claim a committed receipt");
@@ -885,10 +796,12 @@ async function verifyBoundedLiveEvidence(
     await verifyBoundedLiveRollbackAuthorizationEnvelope(evidence.authorization);
     await verifyBoundedLiveReferenceRestoreReceipt(evidence.receipt);
     await verifyBoundedLiveSideEffectRecoveryReport(evidence.recoveryReport);
+    const journalEvent = await requireExactJournalEvent(context.sideEffectJournal, evidence.recoveryReport);
     const auth = evidence.authorization.payload;
     const receipt = evidence.receipt.payload;
     const recovery = evidence.recoveryReport.payload;
     if (
+      journalEvent.payload.eventType !== "operation_committed" ||
       auth.experimentId !== context.experiment.experimentId ||
       auth.experimentSha256 !== context.experiment.experimentSha256 ||
       auth.experimentAuthorizationId !== context.experimentAuthorization.authorizationId ||
@@ -899,6 +812,7 @@ async function verifyBoundedLiveEvidence(
       receipt.rollbackAuthorizationSha256 !== evidence.authorization.authorizationSha256 ||
       receipt.experimentId !== context.experiment.experimentId ||
       receipt.targetSubjectId !== context.experiment.payload.referenceSubjectId ||
+      receipt.sideEffectCommitEventId !== journalEvent.eventId ||
       recovery.kind !== "reference_restore" ||
       recovery.classification !== "consistent_committed" ||
       recovery.authorityId !== evidence.authorization.authorizationId ||
@@ -907,9 +821,7 @@ async function verifyBoundedLiveEvidence(
       recovery.idempotencyKey !== receipt.restoreIdempotencyKey ||
       recovery.sinkId !== receipt.sinkId ||
       recovery.externalReference !== receipt.restoreReference
-    ) {
-      throw new Error("Routing promotion reference restore evidence is not bound to this exact experiment/operation");
-    }
+    ) throw new Error("Routing promotion reference restore evidence is not bound to exact durable experiment/operation state");
     if (operationIds.has(recovery.operationId)) {
       throw new Error("Routing promotion bounded-live operation evidence must be unique");
     }
@@ -917,15 +829,52 @@ async function verifyBoundedLiveEvidence(
     refs.push(
       `m5rollbackauth-ref:${evidence.authorization.authorizationId}:${evidence.authorization.authorizationSha256}`,
       `m5restore-ref:${evidence.receipt.receiptId}:${evidence.receipt.receiptSha256}`,
+      `m5liveeffect-ref:${journalEvent.eventId}:${journalEvent.eventSha256}`,
       `m5liverecovery-ref:${evidence.recoveryReport.reconciliationId}:${evidence.recoveryReport.reconciliationSha256}`,
     );
   }
   return normalizeSafeSet(refs, "Routing promotion bounded-live evidence reference", false);
 }
 
+async function requireExactJournalEvent(
+  journal: JsonlBoundedLiveSideEffectJournal,
+  report: BoundedLiveSideEffectRecoveryReport,
+): Promise<BoundedLiveSideEffectEvent> {
+  const recovery = report.payload;
+  const event = journal.latest(recovery.operationId);
+  if (!event) {
+    throw new Error("Routing promotion recovery evidence has no canonical durable side-effect journal event");
+  }
+  await verifyBoundedLiveSideEffectEvent(event);
+  const payload = event.payload;
+  if (
+    event.eventId !== recovery.journalEventId ||
+    payload.eventType !== recovery.journalEventType ||
+    payload.kind !== recovery.kind ||
+    payload.operationId !== recovery.operationId ||
+    payload.idempotencyKey !== recovery.idempotencyKey ||
+    payload.sinkId !== recovery.sinkId ||
+    payload.authorityId !== recovery.authorityId ||
+    payload.subjectId !== recovery.subjectId ||
+    payload.sampleId !== recovery.sampleId ||
+    normalizeOptionalSha(payload.outputSha256) !== normalizeOptionalSha(recovery.outputSha256)
+  ) throw new Error("Routing promotion recovery report drifts from canonical durable side-effect journal event");
+  if (payload.eventType === "operation_committed") {
+    if (
+      recovery.classification !== "consistent_committed" ||
+      recovery.explicitOperatorActionRequired !== false ||
+      recovery.externalReference !== payload.externalReference
+    ) throw new Error("Routing promotion committed journal state does not match recovery classification/reference");
+  } else if (recovery.classification === "consistent_committed") {
+    throw new Error("Routing promotion consistent_committed recovery requires durable operation_committed journal state");
+  }
+  return event;
+}
+
 function assertPublicationRecoveryAuthority(
   authorization: BoundedLiveSampleAuthorization,
   report: BoundedLiveSideEffectRecoveryReport,
+  journalEvent: BoundedLiveSideEffectEvent,
 ): void {
   const auth = authorization.payload;
   const recovery = report.payload;
@@ -936,10 +885,9 @@ function assertPublicationRecoveryAuthority(
     recovery.subjectId !== auth.selectedSubjectId ||
     recovery.sampleId !== auth.sampleId ||
     normalizeOptionalSha(recovery.outputSha256) === undefined ||
-    !recovery.operationId.startsWith(prefix)
-  ) {
-    throw new Error("Routing promotion recovery report is not bound to exact candidate publication authority/sample");
-  }
+    !recovery.operationId.startsWith(prefix) ||
+    journalEvent.payload.operationId !== recovery.operationId
+  ) throw new Error("Routing promotion recovery report is not bound to exact candidate publication authority/sample");
   const runtimeResultId = recovery.operationId.slice(prefix.length);
   if (!runtimeResultId || recovery.idempotencyKey !== `${authorization.authorizationId}:${runtimeResultId}`) {
     throw new Error("Routing promotion recovery report publication operation/idempotency identity is invalid");
@@ -948,8 +896,11 @@ function assertPublicationRecoveryAuthority(
 
 function assertCommittedPublicationBinding(
   evidence: RoutingPromotionBoundedLivePublicationEvidence,
+  journalEvent: BoundedLiveSideEffectEvent,
 ): void {
-  if (!evidence.receipt) throw new Error("Routing promotion committed publication receipt is missing");
+  if (!evidence.receipt || journalEvent.payload.eventType !== "operation_committed") {
+    throw new Error("Routing promotion committed publication durable evidence is missing");
+  }
   const auth = evidence.authorization.payload;
   const receipt = evidence.receipt.payload;
   const recovery = evidence.recoveryReport.payload;
@@ -960,40 +911,37 @@ function assertCommittedPublicationBinding(
     receipt.selectedSubjectId !== auth.selectedSubjectId ||
     receipt.selectedRole !== "candidate" ||
     receipt.candidateOutputExternallyVisible !== true ||
+    receipt.sideEffectCommitEventId !== journalEvent.eventId ||
+    recovery.journalEventId !== journalEvent.eventId ||
     recovery.operationId !== receipt.sideEffectOperationId ||
     recovery.idempotencyKey !== receipt.publicationIdempotencyKey ||
     recovery.sinkId !== receipt.sinkId ||
     normalizeOptionalSha(recovery.outputSha256) !== normalizeOptionalSha(receipt.outputSha256) ||
-    recovery.externalReference !== receipt.publicationReference
-  ) {
-    throw new Error("Routing promotion recovery report is not bound to the exact publication authority/operation");
-  }
+    recovery.externalReference !== receipt.publicationReference ||
+    journalEvent.payload.externalReference !== receipt.publicationReference
+  ) throw new Error("Routing promotion recovery/receipt is not bound to exact durable publication authority/operation");
 }
 
 function classifyPromotion(context: RoutingPromotionContext): RoutingPromotionClassification {
+  const journalState = context.sideEffectJournal.inspect();
   const recoveries = [
     ...context.publicationEvidence.map((item) => item.recoveryReport),
     ...context.referenceRestoreEvidence.map((item) => item.recoveryReport),
   ];
-  if (recoveries.some((report) =>
-    report.payload.classification !== "consistent_committed" ||
-    report.payload.explicitOperatorActionRequired !== false
-  )) {
-    return "MANUAL_RECONCILIATION_REQUIRED";
-  }
+  if (
+    journalState.unresolvedOperationIds.length > 0 ||
+    recoveries.some((report) =>
+      report.payload.classification !== "consistent_committed" ||
+      report.payload.explicitOperatorActionRequired !== false
+    )
+  ) return "MANUAL_RECONCILIATION_REQUIRED";
   if (context.finalGuardrailDecision.payload.classification !== "COMPLETE") {
     return "PROMOTION_NOT_ELIGIBLE";
   }
-  if (context.referenceRestoreEvidence.length > 0) {
-    return "PROMOTION_NOT_ELIGIBLE";
-  }
-  if (
-    !context.publicationEvidence.some((item) =>
-      item.recoveryReport.payload.classification === "consistent_committed" && item.receipt !== undefined
-    )
-  ) {
-    return "PROMOTION_NOT_ELIGIBLE";
-  }
+  if (context.referenceRestoreEvidence.length > 0) return "PROMOTION_NOT_ELIGIBLE";
+  if (!context.publicationEvidence.some((item) =>
+    item.recoveryReport.payload.classification === "consistent_committed" && item.receipt !== undefined
+  )) return "PROMOTION_NOT_ELIGIBLE";
   return "PROMOTION_ELIGIBLE";
 }
 
@@ -1006,12 +954,13 @@ function promotionReasons(
     ...context.publicationEvidence.map((item) => item.recoveryReport),
     ...context.referenceRestoreEvidence.map((item) => item.recoveryReport),
   ];
-  if (recoveries.some((report) =>
-    report.payload.classification !== "consistent_committed" ||
-    report.payload.explicitOperatorActionRequired !== false
-  )) {
-    reasons.push("bounded_live_side_effect_not_durably_reconciled");
-  }
+  if (
+    context.sideEffectJournal.inspect().unresolvedOperationIds.length > 0 ||
+    recoveries.some((report) =>
+      report.payload.classification !== "consistent_committed" ||
+      report.payload.explicitOperatorActionRequired !== false
+    )
+  ) reasons.push("bounded_live_side_effect_not_durably_reconciled");
   if (context.finalGuardrailDecision.payload.classification !== "COMPLETE") {
     reasons.push("controlled_experiment_not_complete");
   }
@@ -1019,9 +968,7 @@ function promotionReasons(
   if (!context.publicationEvidence.some((item) => item.receipt !== undefined)) {
     reasons.push("candidate_publication_commit_missing");
   }
-  if (classification === "PROMOTION_ELIGIBLE") {
-    reasons.push("canonical_evidence_chain_complete_and_reconciled");
-  }
+  if (classification === "PROMOTION_ELIGIBLE") reasons.push("canonical_evidence_chain_complete_and_reconciled");
   return deepFreeze([...new Set(reasons)].sort());
 }
 
@@ -1044,6 +991,7 @@ function assertProposalMatchesContext(
     payload.experimentAuthorizationId !== context.experimentAuthorization.authorizationId ||
     payload.experimentAuthorizationSha256 !== context.experimentAuthorization.authorizationSha256 ||
     payload.experimentWorkflowRunId !== context.experimentWorkflow.id ||
+    payload.finalProgressSha256 !== derived.finalProgressSha256 ||
     payload.finalGuardrailDecisionId !== context.finalGuardrailDecision.decisionId ||
     payload.finalGuardrailDecisionSha256 !== context.finalGuardrailDecision.decisionSha256 ||
     payload.preconditionSnapshotId !== context.preconditionSnapshot.snapshotId ||
@@ -1059,9 +1007,7 @@ function assertProposalMatchesContext(
     !sameArray(payload.runLedgerEvidenceReferences, derived.runLedgerEvidenceReferences) ||
     !sameArray(payload.evalEvidenceReferences, derived.evalEvidenceReferences) ||
     !sameArray(payload.boundedLiveEvidenceReferences, derived.boundedLiveEvidenceReferences)
-  ) {
-    throw new Error("Routing promotion proposal canonical source binding drift detected");
-  }
+  ) throw new Error("Routing promotion proposal canonical source binding drift detected");
   assertTimestampAtOrAfter(
     payload.proposedAt,
     [context.finalGuardrailDecision.payload.observedAt, context.preconditionSnapshot.payload.capturedAt],
@@ -1087,28 +1033,18 @@ function validateSnapshotPayload(payload: RoutingPreconditionSnapshotPayload): v
 
 function validateProposalPayload(payload: RoutingPromotionProposalPayload): void {
   for (const [value, label] of [
-    [payload.projectId, "projectId"],
-    [payload.routeId, "routeId"],
-    [payload.referenceSubjectId, "referenceSubjectId"],
-    [payload.candidateSubjectId, "candidateSubjectId"],
-    [payload.admissionDecisionId, "admissionDecisionId"],
-    [payload.admissionDecisionSha256, "admissionDecisionSha256"],
-    [payload.experimentId, "experimentId"],
-    [payload.experimentSha256, "experimentSha256"],
+    [payload.projectId, "projectId"], [payload.routeId, "routeId"],
+    [payload.referenceSubjectId, "referenceSubjectId"], [payload.candidateSubjectId, "candidateSubjectId"],
+    [payload.admissionDecisionId, "admissionDecisionId"], [payload.admissionDecisionSha256, "admissionDecisionSha256"],
+    [payload.experimentId, "experimentId"], [payload.experimentSha256, "experimentSha256"],
     [payload.experimentAuthorizationId, "experimentAuthorizationId"],
     [payload.experimentAuthorizationSha256, "experimentAuthorizationSha256"],
-    [payload.experimentWorkflowRunId, "experimentWorkflowRunId"],
-    [payload.finalGuardrailDecisionId, "finalGuardrailDecisionId"],
-    [payload.finalGuardrailDecisionSha256, "finalGuardrailDecisionSha256"],
-    [payload.preconditionSnapshotId, "preconditionSnapshotId"],
-    [payload.preconditionSnapshotSha256, "preconditionSnapshotSha256"],
-    [payload.routeRevision, "routeRevision"],
-    [payload.beforeSubjectId, "beforeSubjectId"],
-    [payload.afterSubjectId, "afterSubjectId"],
-    [payload.rollbackTargetSubjectId, "rollbackTargetSubjectId"],
-  ] as const) {
-    prepareIdentity(value, `Routing promotion ${label}`);
-  }
+    [payload.experimentWorkflowRunId, "experimentWorkflowRunId"], [payload.finalProgressSha256, "finalProgressSha256"],
+    [payload.finalGuardrailDecisionId, "finalGuardrailDecisionId"], [payload.finalGuardrailDecisionSha256, "finalGuardrailDecisionSha256"],
+    [payload.preconditionSnapshotId, "preconditionSnapshotId"], [payload.preconditionSnapshotSha256, "preconditionSnapshotSha256"],
+    [payload.routeRevision, "routeRevision"], [payload.beforeSubjectId, "beforeSubjectId"],
+    [payload.afterSubjectId, "afterSubjectId"], [payload.rollbackTargetSubjectId, "rollbackTargetSubjectId"],
+  ] as const) prepareIdentity(value, `Routing promotion ${label}`);
   prepareCapability(payload.capability);
   if (payload.referenceSubjectId === payload.candidateSubjectId) {
     throw new Error("Routing promotion reference and candidate subjects must differ");
@@ -1117,9 +1053,7 @@ function validateProposalPayload(payload: RoutingPromotionProposalPayload): void
     payload.beforeSubjectId !== payload.referenceSubjectId ||
     payload.afterSubjectId !== payload.candidateSubjectId ||
     payload.rollbackTargetSubjectId !== payload.referenceSubjectId
-  ) {
-    throw new Error("Routing promotion before/after/rollback intent is invalid");
-  }
+  ) throw new Error("Routing promotion before/after/rollback intent is invalid");
   prepareTimestamp(payload.proposedAt, "Routing promotion proposedAt");
   for (const [values, label, required] of [
     [payload.runLedgerEvidenceReferences, "Run Ledger evidence reference", true],
@@ -1133,11 +1067,7 @@ function validateProposalPayload(payload: RoutingPromotionProposalPayload): void
       throw new Error(`Routing promotion ${label}s must be unique and canonically sorted`);
     }
   }
-  if (![
-    "PROMOTION_NOT_ELIGIBLE",
-    "PROMOTION_ELIGIBLE",
-    "MANUAL_RECONCILIATION_REQUIRED",
-  ].includes(payload.classification)) {
+  if (!["PROMOTION_NOT_ELIGIBLE", "PROMOTION_ELIGIBLE", "MANUAL_RECONCILIATION_REQUIRED"].includes(payload.classification)) {
     throw new Error("Routing promotion classification is invalid");
   }
   if (
@@ -1145,9 +1075,7 @@ function validateProposalPayload(payload: RoutingPromotionProposalPayload): void
     payload.automaticRollbackAllowed !== false ||
     payload.automaticRetryAllowed !== false ||
     payload.automaticRedispatchAllowed !== false
-  ) {
-    throw new Error("Routing promotion proposal cannot grant automatic authority");
-  }
+  ) throw new Error("Routing promotion proposal cannot grant automatic authority");
 }
 
 function validateAuthorizationPayload(payload: RoutingPromotionAuthorizationPayload): void {
@@ -1155,27 +1083,15 @@ function validateAuthorizationPayload(payload: RoutingPromotionAuthorizationPayl
     throw new Error("Routing promotion authorization decision is invalid");
   }
   for (const [value, label] of [
-    [payload.actor, "actor"],
-    [payload.proposalId, "proposalId"],
-    [payload.proposalSha256, "proposalSha256"],
-    [payload.projectId, "projectId"],
-    [payload.routeId, "routeId"],
-    [payload.referenceSubjectId, "referenceSubjectId"],
-    [payload.candidateSubjectId, "candidateSubjectId"],
-    [payload.preconditionSnapshotId, "preconditionSnapshotId"],
-    [payload.preconditionSnapshotSha256, "preconditionSnapshotSha256"],
-    [payload.routeRevision, "routeRevision"],
-    [payload.workflowRunId, "workflowRunId"],
-  ] as const) {
-    prepareIdentity(value, `Routing promotion authorization ${label}`);
-  }
+    [payload.actor, "actor"], [payload.proposalId, "proposalId"], [payload.proposalSha256, "proposalSha256"],
+    [payload.projectId, "projectId"], [payload.routeId, "routeId"],
+    [payload.referenceSubjectId, "referenceSubjectId"], [payload.candidateSubjectId, "candidateSubjectId"],
+    [payload.preconditionSnapshotId, "preconditionSnapshotId"], [payload.preconditionSnapshotSha256, "preconditionSnapshotSha256"],
+    [payload.routeRevision, "routeRevision"], [payload.workflowRunId, "workflowRunId"],
+  ] as const) prepareIdentity(value, `Routing promotion authorization ${label}`);
   prepareCapability(payload.capability);
   prepareTimestamp(payload.decidedAt, "Routing promotion authorization decidedAt");
-  const policies = normalizeSafeSet(
-    payload.policyReferences,
-    "Routing promotion authorization policy reference",
-    true,
-  );
+  const policies = normalizeSafeSet(payload.policyReferences, "Routing promotion authorization policy reference", true);
   const approvals = normalizeSafeSet(
     payload.approvalIds,
     "Routing promotion authorization approvalId",
@@ -1193,9 +1109,7 @@ function validateAuthorizationPayload(payload: RoutingPromotionAuthorizationPayl
     payload.automaticRollbackAllowed !== false ||
     payload.automaticRetryAllowed !== false ||
     payload.automaticRedispatchAllowed !== false
-  ) {
-    throw new Error("Routing promotion authorization authority flags are invalid");
-  }
+  ) throw new Error("Routing promotion authorization authority flags are invalid");
 }
 
 function assertFreshSnapshot(proposal: RoutingPromotionProposal, current: RoutingPreconditionSnapshot): void {
@@ -1207,9 +1121,7 @@ function assertFreshSnapshot(proposal: RoutingPromotionProposal, current: Routin
     current.payload.capability !== proposal.payload.capability ||
     current.payload.currentSubjectId !== proposal.payload.referenceSubjectId ||
     current.payload.routeRevision !== proposal.payload.routeRevision
-  ) {
-    throw new Error("Routing promotion precondition snapshot is stale or route state drifted");
-  }
+  ) throw new Error("Routing promotion precondition snapshot is stale or route state drifted");
 }
 
 function assertPromotionWorkflow(
@@ -1239,11 +1151,7 @@ function prepareCapability(value: CapabilityId): CapabilityId {
   return value;
 }
 
-function normalizeSafeSet(
-  values: readonly string[],
-  label: string,
-  requireNonEmpty: boolean,
-): readonly string[] {
+function normalizeSafeSet(values: readonly string[], label: string, requireNonEmpty: boolean): readonly string[] {
   if (!Array.isArray(values)) throw new Error(`${label}s must be an array`);
   const normalized = [...new Set(values.map((item) => prepareSafeReference(item, label)))].sort();
   if (normalized.length !== values.length) throw new Error(`${label}s must not contain duplicates`);
@@ -1253,9 +1161,7 @@ function normalizeSafeSet(
 
 function prepareIdentity(value: string, label: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must not be empty`);
-  if (value !== value.trim() || /\r|\n/.test(value)) {
-    throw new Error(`${label} must be canonical single-line text`);
-  }
+  if (value !== value.trim() || /\r|\n/.test(value)) throw new Error(`${label} must be canonical single-line text`);
   if (utf8ByteLength(value) > 2048) throw new Error(`${label} exceeds 2048 bytes`);
   if (sanitizeText(value) !== value) throw new Error(`${label} contains secret-like material`);
   return value;
