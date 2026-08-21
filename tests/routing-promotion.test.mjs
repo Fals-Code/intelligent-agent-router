@@ -171,8 +171,8 @@ test("stale journal reader fails closed after a second writer appends an unresol
 test("re-hashed COMPLETE guardrail forgery is rejected when final progress does not derive it", async (t) => {
   const fixture = await promotionFixture(t, {
     assignments: ["candidate"],
-    maxTotalSamples: 3,
-    shadowSamples: 1,
+    maxTotalSamples: 4,
+    shadowSamples: 2,
   });
   assert.notEqual(fixture.finalGuardrail.payload.classification, "COMPLETE");
   const forgedGuardrail = await rehashGuardrail({
@@ -245,7 +245,11 @@ test("same candidate subject with unrelated bounded-live authority is rejected",
 });
 
 test("unresolved exact bounded-live recovery blocks promotion and automatic retry", async (t) => {
-  const fixture = await promotionFixture(t, { assignments: ["candidate"], maxTotalSamples: 2 });
+  const fixture = await promotionFixture(t, {
+    assignments: ["candidate"],
+    maxTotalSamples: 3,
+    shadowSamples: 2,
+  });
   const original = fixture.context.publicationEvidence[0];
   const journal = await openSideEffectJournal(fixture.root, "unresolved");
   const auth = original.authorization;
@@ -304,8 +308,8 @@ test("unresolved exact bounded-live recovery blocks promotion and automatic retr
 test("non-COMPLETE experiment evidence cannot become promotion eligible", async (t) => {
   const fixture = await promotionFixture(t, {
     assignments: ["candidate"],
-    maxTotalSamples: 3,
-    shadowSamples: 1,
+    maxTotalSamples: 4,
+    shadowSamples: 2,
   });
   assert.notEqual(fixture.finalGuardrail.payload.classification, "COMPLETE");
   assert.equal(fixture.proposal.payload.classification, "PROMOTION_NOT_ELIGIBLE");
@@ -712,19 +716,20 @@ function cohortEvidence(cohort) {
 }
 
 async function livePublicationEvidence(input) {
-  const referenceObservations = input.reference.observations.slice(0, 2);
-  const candidateObservations = input.candidate.observations.slice(0, 2);
+  const completedBefore = input.shadowSamples + input.ordinal;
+  const referenceObservations = input.reference.observations.slice(0, completedBefore);
+  const candidateObservations = input.candidate.observations.slice(0, completedBefore);
   const referenceEvalSummary = await buildEvalCohortSummary(referenceObservations);
   const candidateEvalSummary = await buildEvalCohortSummary(candidateObservations);
   const referenceExecutionSummary = await buildExecutionReliabilitySummary(
     referenceObservations,
-    input.reference.projections.slice(0, 2),
-    input.reference.records.slice(0, 2),
+    input.reference.projections.slice(0, completedBefore),
+    input.reference.records.slice(0, completedBefore),
   );
   const candidateExecutionSummary = await buildExecutionReliabilitySummary(
     candidateObservations,
-    input.candidate.projections.slice(0, 2),
-    input.candidate.records.slice(0, 2),
+    input.candidate.projections.slice(0, completedBefore),
+    input.candidate.records.slice(0, completedBefore),
   );
   const observedMinute = 50 + input.ordinal * 2;
   const workflowMinute = 51 + input.ordinal * 2;
