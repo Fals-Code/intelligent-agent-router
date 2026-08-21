@@ -8,6 +8,8 @@ import {
   RoutingEvalPlane,
   assessM5ControlledExperimentAdmission,
   buildCanonicalMetricTaxonomy,
+  buildEvalCohortSummary,
+  buildExecutionReliabilitySummary,
   evaluateControlledExperimentGuardrails,
   prepareBoundedLiveSampleAuthorization,
   prepareControlledExperimentAuthorization,
@@ -31,7 +33,7 @@ import {
 
 let workflowSequence = 0;
 
-test("promotion proposal derives canonical Run Ledger/Eval evidence and separate approval authorizes only the exact proposal", async (t) => {
+test("promotion proposal derives canonical Run Ledger/Eval evidence and exact bounded-live authority", async (t) => {
   const fixture = await promotionFixture(t);
 
   assert.equal(fixture.proposal.payload.classification, "PROMOTION_ELIGIBLE");
@@ -42,7 +44,7 @@ test("promotion proposal derives canonical Run Ledger/Eval evidence and separate
   assert.equal(fixture.proposal.payload.boundedLiveEvidenceReferences.length, 3);
   assert.ok(
     fixture.proposal.payload.runLedgerEvidenceReferences.every((item) =>
-      /:(?:run-ledger):[^:]+:[0-9A-F]{64}$/.test(item),
+      /:run-ledger:[^:]+:[0-9A-F]{64}$/.test(item),
     ),
   );
 
@@ -66,7 +68,6 @@ test("promotion proposal derives canonical Run Ledger/Eval evidence and separate
   assert.equal(authorization.payload.routingMutationAuthorized, true);
   assert.equal(authorization.payload.automaticRoutingMutationAllowed, false);
   assert.notEqual(authorization.payload.workflowRunId, fixture.experimentWorkflow.id);
-
   await verifyRoutingPromotionAuthorization(
     authorization,
     fixture.proposal,
@@ -133,12 +134,7 @@ test("same candidate subject with unrelated bounded-live authority is rejected",
   });
   const driftedContext = {
     ...fixture.context,
-    publicationEvidence: [
-      {
-        ...original,
-        recoveryReport: forgedRecovery,
-      },
-    ],
+    publicationEvidence: [{ ...original, recoveryReport: forgedRecovery }],
   };
   await assert.rejects(
     verifyRoutingPromotionProposal(fixture.proposal, driftedContext),
@@ -150,7 +146,7 @@ test("non-COMPLETE experiment evidence cannot become promotion-eligible", async 
   const fixture = await promotionFixture(t, {
     maxTotalSamples: 4,
     finalProgress: {
-      shadowSamples: 1,
+      shadowSamples: 2,
       liveSamples: 1,
       candidateLiveSamples: 1,
     },
@@ -226,7 +222,7 @@ test("stale route snapshot invalidates promotion authorization", async (t) => {
   );
 });
 
-test("promotion authorization requires a distinct R3/R4 publish workflow and exact durable approvals", async (t) => {
+test("promotion authorization requires distinct R3/R4 publish workflow and exact durable approvals", async (t) => {
   const fixture = await promotionFixture(t);
   await assert.rejects(
     prepareRoutingPromotionAuthorization({
@@ -261,7 +257,6 @@ test("promotion authorization requires a distinct R3/R4 publish workflow and exa
     }),
     /do not match durable WorkflowRun approvals/,
   );
-
   await assert.rejects(
     prepareRoutingPromotionAuthorization({
       proposal: fixture.proposal,
@@ -296,7 +291,7 @@ test("re-hashed semantic forgery cannot grant automatic routing mutation", async
   );
 });
 
-test("reference/candidate identity swap is rejected even with a valid recomputed digest", async (t) => {
+test("reference/candidate identity swap is rejected despite recomputed digest", async (t) => {
   const fixture = await promotionFixture(t);
   const forgedPayload = {
     ...fixture.proposal.payload,
@@ -345,29 +340,17 @@ async function routingAdmissionFixture(t) {
       schemaVersion: 1,
       suiteId: "routing-promotion-suite",
       description: "Routing promotion evidence fixture.",
-      tasks: [
-        {
-          id: "route",
-          kind: "routing",
-          prompt: "Route this synthetic promotion task.",
-          critical: true,
-          minimumScore: 1,
-          assertions: [
-            {
-              id: "model",
-              kind: "primary_model_equals",
-              weight: 1,
-              expected: "model-a",
-            },
-            {
-              id: "verify",
-              kind: "requires_verification_equals",
-              weight: 1,
-              expected: true,
-            },
-          ],
-        },
-      ],
+      tasks: [{
+        id: "route",
+        kind: "routing",
+        prompt: "Route this synthetic promotion task.",
+        critical: true,
+        minimumScore: 1,
+        assertions: [
+          { id: "model", kind: "primary_model_equals", weight: 1, expected: "model-a" },
+          { id: "verify", kind: "requires_verification_equals", weight: 1, expected: true },
+        ],
+      }],
     },
     {
       maxTasks: 8,
@@ -377,15 +360,12 @@ async function routingAdmissionFixture(t) {
       maxSuiteBytes: 64 * 1024,
     },
   );
-  const plane = new RoutingEvalPlane({
-    maxReportBytes: 64 * 1024,
-    maxSubjectIdBytes: 2048,
-  });
-  const subject = (id, model) => ({
+  const plane = new RoutingEvalPlane({ maxReportBytes: 64 * 1024, maxSubjectIdBytes: 2048 });
+  const subject = (id) => ({
     id,
     async route() {
       return {
-        primaryModel: { candidate: { id: model } },
+        primaryModel: { candidate: { id: "model-a" } },
         selectedSkills: [],
         analysis: { requiresVerification: true },
       };
@@ -393,14 +373,8 @@ async function routingAdmissionFixture(t) {
   });
   const referenceSubjectId = "opencode:9router/hemat";
   const candidateSubjectId = "opencode:9router/smart";
-  const referenceReport = await plane.evaluate(
-    suite,
-    subject(referenceSubjectId, "model-a"),
-  );
-  const candidateReport = await plane.evaluate(
-    suite,
-    subject(candidateSubjectId, "model-a"),
-  );
+  const referenceReport = await plane.evaluate(suite, subject(referenceSubjectId));
+  const candidateReport = await plane.evaluate(suite, subject(candidateSubjectId));
   const baselineId = "routing-promotion-baseline";
   const baselineFor = (subjectId) => ({
     schemaVersion: 1,
@@ -514,17 +488,15 @@ async function promotionFixture(t, overrides = {}) {
     },
   });
 
-  const publicationEvidence = [
-    await candidatePublicationEvidence({
-      root: base.root,
-      admissionDecision: base.admissionDecision,
-      experiment,
-      experimentAuthorization,
-      experimentWorkflow,
-      reference: base.reference,
-      candidate: base.candidate,
-    }),
-  ];
+  const publicationEvidence = [await candidatePublicationEvidence({
+    root: base.root,
+    admissionDecision: base.admissionDecision,
+    experiment,
+    experimentAuthorization,
+    experimentWorkflow,
+    reference: base.reference,
+    candidate: base.candidate,
+  })];
 
   const snapshot = await prepareRoutingPreconditionSnapshot({
     projectId: experiment.payload.projectId,
@@ -547,10 +519,7 @@ async function promotionFixture(t, overrides = {}) {
     publicationEvidence,
     referenceRestoreEvidence: [],
   };
-  const proposal = await prepareRoutingPromotionProposal({
-    context,
-    proposal: proposalInput(),
-  });
+  const proposal = await prepareRoutingPromotionProposal({ context, proposal: proposalInput() });
   await verifyRoutingPromotionProposal(proposal, context);
   return {
     ...base,
@@ -575,6 +544,20 @@ function cohortEvidence(cohort) {
 }
 
 async function candidatePublicationEvidence(input) {
+  const referenceObservations = input.reference.observations.slice(0, 2);
+  const candidateObservations = input.candidate.observations.slice(0, 2);
+  const referenceEvalSummary = await buildEvalCohortSummary(referenceObservations);
+  const candidateEvalSummary = await buildEvalCohortSummary(candidateObservations);
+  const referenceExecutionSummary = await buildExecutionReliabilitySummary(
+    referenceObservations,
+    input.reference.projections.slice(0, 2),
+    input.reference.records.slice(0, 2),
+  );
+  const candidateExecutionSummary = await buildExecutionReliabilitySummary(
+    candidateObservations,
+    input.candidate.projections.slice(0, 2),
+    input.candidate.records.slice(0, 2),
+  );
   const preDispatchGuardrail = await evaluateControlledExperimentGuardrails({
     experiment: input.experiment,
     authorization: input.experimentAuthorization,
@@ -585,10 +568,10 @@ async function candidatePublicationEvidence(input) {
       shadowSamples: 1,
       liveSamples: 1,
       candidateLiveSamples: 1,
-      referenceEvalSummary: input.reference.evalSummary,
-      candidateEvalSummary: input.candidate.evalSummary,
-      referenceExecutionSummary: input.reference.executionSummary,
-      candidateExecutionSummary: input.candidate.executionSummary,
+      referenceEvalSummary,
+      candidateEvalSummary,
+      referenceExecutionSummary,
+      candidateExecutionSummary,
     },
   });
   const liveWorkflow = await approvedPublishWorkflow(
@@ -632,8 +615,7 @@ async function publicationReceipt(authorization) {
     sampleAuthorizationId: authorization.authorizationId,
     sampleAuthorizationSha256: authorization.authorizationSha256,
     runtimeResultId: "m5liveresult:promotion-candidate-2",
-    runtimeResultSha256:
-      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    runtimeResultSha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     sampleId: authorization.payload.sampleId,
     selectedSubjectId: authorization.payload.selectedSubjectId,
     selectedRole: "candidate",
@@ -642,8 +624,7 @@ async function publicationReceipt(authorization) {
     publicationIdempotencyKey: `${authorization.authorizationId}:m5liveresult:promotion-candidate-2`,
     sideEffectOperationId: `publication:${authorization.authorizationId}:m5liveresult:promotion-candidate-2`,
     sideEffectCommitEventId: "m5liveeffect:promotion-candidate-2",
-    outputSha256:
-      "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    outputSha256: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
     outputBytes: 128,
     verifiedAt: "2026-08-21T02:56:00.000Z",
     publishedAt: "2026-08-21T02:57:00.000Z",
@@ -697,8 +678,7 @@ async function referenceRestoreEvidence(fixture) {
     experimentAuthorizationId: fixture.experimentAuthorization.authorizationId,
     experimentAuthorizationSha256: fixture.experimentAuthorization.authorizationSha256,
     guardrailDecisionId: "guardrail:rollback-prior",
-    guardrailDecisionSha256:
-      "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    guardrailDecisionSha256: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
     experimentWorkflowRunId: fixture.experimentWorkflow.id,
     rollbackWorkflowRunId: "workflow:rollback-prior",
     projectId: fixture.experiment.payload.projectId,
@@ -785,11 +765,7 @@ async function approvedPublishWorkflow(root, projectId, prefix, now) {
   run = durable.advance(run, at(4));
   run = durable.advance(run, at(5));
   run = durable.requestApproval(run, at(6));
-  run = durable.approve(
-    run,
-    `approval:${prefix}-${workflowSequence}`,
-    at(60),
-  );
+  run = durable.approve(run, `approval:${prefix}-${workflowSequence}`, at(60));
   return run;
 }
 
@@ -817,9 +793,7 @@ async function rehashRecovery(payload) {
   return {
     schemaVersion: 1,
     algorithm: "sha256",
-    reconciliationId: `m5livereconcile:${reconciliationSha256
-      .slice(0, 32)
-      .toLowerCase()}`,
+    reconciliationId: `m5livereconcile:${reconciliationSha256.slice(0, 32).toLowerCase()}`,
     reconciliationSha256,
     payload,
   };
