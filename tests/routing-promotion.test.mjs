@@ -39,17 +39,36 @@ const SHA_A = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 const SHA_B = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 const SHA_C = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
 
-test("promotion proposal derives canonical Eval/Run Ledger, final progress, and durable bounded-live evidence", async (t) => {
-  const fixture = await promotionFixture(t);
+const journalOptions = (filePath) => ({
+  filePath,
+  maxFileBytes: 2 * 1024 * 1024,
+  maxEventBytes: 128 * 1024,
+  maxStringBytes: 4096,
+});
+
+test("exact 2/2 candidate live coverage becomes promotion eligible only with two durable proofs", async (t) => {
+  const fixture = await promotionFixture(t, { assignments: ["candidate", "candidate"] });
+  assert.equal(fixture.finalProgress.liveSamples, 2);
+  assert.equal(fixture.finalProgress.candidateLiveSamples, 2);
+  assert.equal(fixture.context.publicationEvidence.length, 2);
+  assert.deepEqual(
+    fixture.context.publicationEvidence.map((item) => item.authorization.payload.liveSamplesBeforeDispatch),
+    [0, 1],
+  );
+  assert.deepEqual(
+    fixture.context.publicationEvidence.map((item) => item.authorization.payload.candidateLiveSamplesBeforeDispatch),
+    [0, 1],
+  );
   assert.equal(fixture.proposal.payload.classification, "PROMOTION_ELIGIBLE");
   assert.equal(fixture.proposal.payload.automaticRoutingMutationAllowed, false);
   assert.equal(fixture.proposal.payload.automaticRollbackAllowed, false);
   assert.match(fixture.proposal.payload.finalProgressSha256, /^[0-9A-F]{64}$/);
   assert.ok(fixture.proposal.payload.runLedgerEvidenceReferences.length >= 2);
   assert.equal(fixture.proposal.payload.evalEvidenceReferences.length, 4);
-  assert.equal(fixture.proposal.payload.boundedLiveEvidenceReferences.length, 4);
-  assert.ok(
-    fixture.proposal.payload.boundedLiveEvidenceReferences.some((item) => item.startsWith("m5liveeffect-ref:")),
+  assert.equal(fixture.proposal.payload.boundedLiveEvidenceReferences.length, 8);
+  assert.equal(
+    fixture.proposal.payload.boundedLiveEvidenceReferences.filter((item) => item.startsWith("m5liveeffect-ref:")).length,
+    2,
   );
 
   const workflow = await approvedPublishWorkflow(
@@ -93,10 +112,67 @@ test("promotion proposal derives canonical Eval/Run Ledger, final progress, and 
   assert.equal(authorizationEvidence.status, "passed");
 });
 
+test("mixed candidate/reference live coverage exactly matches final progress", async (t) => {
+  const fixture = await promotionFixture(t, { assignments: ["candidate", "reference"] });
+  assert.equal(fixture.finalProgress.liveSamples, 2);
+  assert.equal(fixture.finalProgress.candidateLiveSamples, 1);
+  assert.deepEqual(
+    fixture.context.publicationEvidence.map((item) => item.authorization.payload.liveAssignment),
+    ["candidate", "reference"],
+  );
+  assert.deepEqual(
+    fixture.context.publicationEvidence.map((item) => item.authorization.payload.selectedSubjectId),
+    [fixture.experiment.payload.candidateSubjectId, fixture.experiment.payload.referenceSubjectId],
+  );
+  assert.equal(fixture.proposal.payload.classification, "PROMOTION_ELIGIBLE");
+  await verifyRoutingPromotionProposal(fixture.proposal, fixture.context);
+});
+
+test("missing bounded-live proof for a declared final live sample is rejected", async (t) => {
+  const fixture = await promotionFixture(t, { assignments: ["candidate", "candidate"] });
+  const context = {
+    ...fixture.context,
+    publicationEvidence: fixture.context.publicationEvidence.slice(0, 1),
+  };
+  await assert.rejects(
+    verifyRoutingPromotionProposal(fixture.proposal, context),
+    /coverage does not match authoritative final liveSamples/,
+  );
+});
+
+test("stale journal reader fails closed after a second writer appends an unresolved operation", async (t) => {
+  const fixture = await promotionFixture(t, { assignments: ["candidate", "candidate"] });
+  const secondWriter = await JsonlBoundedLiveSideEffectJournal.open(journalOptions(fixture.sideEffectJournal.filePath));
+  await secondWriter.reserve({
+    kind: "publication",
+    operationId: "publication:m5liveauth:external-writer:m5liveresult:late-unresolved",
+    idempotencyKey: "m5liveauth:external-writer:m5liveresult:late-unresolved",
+    sinkId: "isolated-loopback",
+    authorityId: "m5liveauth:external-writer",
+    subjectId: fixture.experiment.payload.candidateSubjectId,
+    sampleId: "sample:late-unresolved",
+    outputSha256: SHA_C,
+    reservedAt: "2026-08-21T03:01:30.000Z",
+  });
+
+  await assert.rejects(
+    verifyRoutingPromotionProposal(fixture.proposal, fixture.context),
+    /changed outside the supplied reader|reopen and retry from fresh evidence/,
+  );
+
+  const freshReader = await JsonlBoundedLiveSideEffectJournal.open(journalOptions(fixture.sideEffectJournal.filePath));
+  const freshContext = { ...fixture.context, sideEffectJournal: freshReader };
+  const freshProposal = await prepareRoutingPromotionProposal({ context: freshContext, proposal: proposalInput() });
+  assert.equal(freshProposal.payload.classification, "MANUAL_RECONCILIATION_REQUIRED");
+  assert.match(freshProposal.payload.reasons.join(","), /bounded_live_side_effect_not_durably_reconciled/);
+  assert.equal(freshProposal.payload.automaticRetryAllowed, false);
+});
+
 test("re-hashed COMPLETE guardrail forgery is rejected when final progress does not derive it", async (t) => {
   const fixture = await promotionFixture(t, {
-    maxTotalSamples: 4,
-    finalProgress: { shadowSamples: 2, liveSamples: 1, candidateLiveSamples: 1 },
+    assignments: ["candidate"],
+    maxTotalSamples: 3,
+    shadowSamples: 1,
   });
   assert.notEqual(fixture.finalGuardrail.payload.classification, "COMPLETE");
   const forgedGuardrail = await rehashGuardrail({
@@ -160,16 +236,16 @@ test("same candidate subject with unrelated bounded-live authority is rejected",
   });
   const context = {
     ...fixture.context,
-    publicationEvidence: [{ ...original, recoveryReport: forgedRecovery }],
+    publicationEvidence: [{ ...original, recoveryReport: forgedRecovery }, ...fixture.context.publicationEvidence.slice(1)],
   };
   await assert.rejects(
     verifyRoutingPromotionProposal(fixture.proposal, context),
-    /durable side-effect journal event|candidate publication authority/,
+    /durable side-effect journal event|live publication authority|drifts/,
   );
 });
 
 test("unresolved exact bounded-live recovery blocks promotion and automatic retry", async (t) => {
-  const fixture = await promotionFixture(t);
+  const fixture = await promotionFixture(t, { assignments: ["candidate"], maxTotalSamples: 2 });
   const original = fixture.context.publicationEvidence[0];
   const journal = await openSideEffectJournal(fixture.root, "unresolved");
   const auth = original.authorization;
@@ -227,8 +303,9 @@ test("unresolved exact bounded-live recovery blocks promotion and automatic retr
 
 test("non-COMPLETE experiment evidence cannot become promotion eligible", async (t) => {
   const fixture = await promotionFixture(t, {
-    maxTotalSamples: 4,
-    finalProgress: { shadowSamples: 2, liveSamples: 1, candidateLiveSamples: 1 },
+    assignments: ["candidate"],
+    maxTotalSamples: 3,
+    shadowSamples: 1,
   });
   assert.notEqual(fixture.finalGuardrail.payload.classification, "COMPLETE");
   assert.equal(fixture.proposal.payload.classification, "PROMOTION_NOT_ELIGIBLE");
@@ -339,7 +416,7 @@ test("re-hashed semantic forgery cannot grant automatic routing mutation in prop
   const forged = await rehashProposal(payload);
   await assert.rejects(
     verifyRoutingPromotionProposal(forged, fixture.context),
-    /cannot grant automatic authority/,
+    /cannot grant automatic authority|authority flags/,
   );
 });
 
@@ -523,8 +600,10 @@ async function routingAdmissionFixture(t) {
 
 async function promotionFixture(t, overrides = {}) {
   const base = await routingAdmissionFixture(t);
-  const maxTotalSamples = overrides.maxTotalSamples ?? 3;
-  const maxLiveSamples = maxTotalSamples - 1;
+  const assignments = overrides.assignments ?? ["candidate", "candidate"];
+  const shadowSamples = overrides.shadowSamples ?? 1;
+  const maxTotalSamples = overrides.maxTotalSamples ?? (shadowSamples + assignments.length);
+  const maxLiveSamples = maxTotalSamples - shadowSamples;
   const experiment = await prepareControlledExperimentDefinition(
     base.admissionDecision,
     experimentDefinitionInput({
@@ -544,14 +623,12 @@ async function promotionFixture(t, overrides = {}) {
     experimentWorkflow,
     authorizationInput(),
   );
-  const counters = overrides.finalProgress ?? {
-    shadowSamples: 1,
-    liveSamples: 2,
-    candidateLiveSamples: 2,
-  };
+  const candidateLiveSamples = assignments.filter((assignment) => assignment === "candidate").length;
   const finalProgress = {
     observedAt: "2026-08-21T03:00:00.000Z",
-    ...counters,
+    shadowSamples,
+    liveSamples: assignments.length,
+    candidateLiveSamples,
     referenceEvalSummary: base.reference.evalSummary,
     candidateEvalSummary: base.candidate.evalSummary,
     referenceExecutionSummary: base.reference.executionSummary,
@@ -565,16 +642,26 @@ async function promotionFixture(t, overrides = {}) {
     progress: finalProgress,
   });
   const sideEffectJournal = await openSideEffectJournal(base.root, "canonical");
-  const publicationEvidence = [await candidatePublicationEvidence({
-    root: base.root,
-    admissionDecision: base.admissionDecision,
-    experiment,
-    experimentAuthorization,
-    experimentWorkflow,
-    reference: base.reference,
-    candidate: base.candidate,
-    sideEffectJournal,
-  })];
+  const publicationEvidence = [];
+  let candidateBefore = 0;
+  for (let ordinal = 0; ordinal < assignments.length; ordinal += 1) {
+    const assignment = assignments[ordinal];
+    publicationEvidence.push(await livePublicationEvidence({
+      root: base.root,
+      admissionDecision: base.admissionDecision,
+      experiment,
+      experimentAuthorization,
+      experimentWorkflow,
+      reference: base.reference,
+      candidate: base.candidate,
+      sideEffectJournal,
+      ordinal,
+      assignment,
+      candidateBefore,
+      shadowSamples,
+    }));
+    if (assignment === "candidate") candidateBefore += 1;
+  }
   const snapshot = await prepareRoutingPreconditionSnapshot({
     projectId: experiment.payload.projectId,
     routeId: "route:code-interactive",
@@ -624,7 +711,7 @@ function cohortEvidence(cohort) {
   };
 }
 
-async function candidatePublicationEvidence(input) {
+async function livePublicationEvidence(input) {
   const referenceObservations = input.reference.observations.slice(0, 2);
   const candidateObservations = input.candidate.observations.slice(0, 2);
   const referenceEvalSummary = await buildEvalCohortSummary(referenceObservations);
@@ -639,16 +726,20 @@ async function candidatePublicationEvidence(input) {
     input.candidate.projections.slice(0, 2),
     input.candidate.records.slice(0, 2),
   );
+  const observedMinute = 50 + input.ordinal * 2;
+  const workflowMinute = 51 + input.ordinal * 2;
+  const approvedMinute = 55 + input.ordinal * 2;
+  const committedMinute = 56 + input.ordinal * 2;
   const preDispatchGuardrail = await evaluateControlledExperimentGuardrails({
     experiment: input.experiment,
     authorization: input.experimentAuthorization,
     admissionDecision: input.admissionDecision,
     workflow: input.experimentWorkflow,
     progress: {
-      observedAt: "2026-08-21T02:50:00.000Z",
-      shadowSamples: 1,
-      liveSamples: 1,
-      candidateLiveSamples: 1,
+      observedAt: minuteTime(observedMinute),
+      shadowSamples: input.shadowSamples,
+      liveSamples: input.ordinal,
+      candidateLiveSamples: input.candidateBefore,
       referenceEvalSummary,
       candidateEvalSummary,
       referenceExecutionSummary,
@@ -658,15 +749,15 @@ async function candidatePublicationEvidence(input) {
   const liveWorkflow = await approvedPublishWorkflow(
     input.root,
     input.experiment.payload.projectId,
-    "live",
-    "2026-08-21T02:51:00.000Z",
+    `live-${input.ordinal}`,
+    minuteTime(workflowMinute),
   );
   const authorizationInputValue = {
-    sampleId: "sample:promotion-candidate-2",
-    inputReference: "input:promotion-candidate-2",
-    liveAssignment: "candidate",
+    sampleId: `sample:promotion-${input.assignment}-${input.ordinal}`,
+    inputReference: `input:promotion-${input.ordinal}`,
+    liveAssignment: input.assignment,
     actor: "operator:bounded-live",
-    approvedAt: "2026-08-21T02:55:00.000Z",
+    approvedAt: minuteTime(approvedMinute),
     policyReferences: ["policy:bounded-live-v1"],
     approvalIds: liveWorkflow.approvalIds,
   };
@@ -679,9 +770,10 @@ async function candidatePublicationEvidence(input) {
     liveWorkflow,
     authorization: authorizationInputValue,
   });
-  const runtimeResultId = "m5liveresult:promotion-candidate-2";
+  const runtimeResultId = `m5liveresult:promotion-${input.assignment}-${input.ordinal}`;
   const operationId = `publication:${authorization.authorizationId}:${runtimeResultId}`;
   const idempotencyKey = `${authorization.authorizationId}:${runtimeResultId}`;
+  const outputSha256 = input.ordinal % 2 === 0 ? SHA_B : SHA_C;
   await input.sideEffectJournal.reserve({
     kind: "publication",
     operationId,
@@ -690,13 +782,13 @@ async function candidatePublicationEvidence(input) {
     authorityId: authorization.authorizationId,
     subjectId: authorization.payload.selectedSubjectId,
     sampleId: authorization.payload.sampleId,
-    outputSha256: SHA_B,
-    reservedAt: "2026-08-21T02:56:00.000Z",
+    outputSha256,
+    reservedAt: minuteTime(approvedMinute),
   });
   const commitEvent = await input.sideEffectJournal.recordCommit({
     operationId,
-    externalReference: "isolated-publication:promotion-candidate-2",
-    committedAt: "2026-08-21T02:57:00.000Z",
+    externalReference: `isolated-publication:${input.assignment}-${input.ordinal}`,
+    committedAt: minuteTime(committedMinute),
   });
   const receipt = await publicationReceipt(authorization, commitEvent, runtimeResultId);
   const recoveryReport = await recoveryReportFromEvent(commitEvent, {
@@ -715,6 +807,7 @@ async function candidatePublicationEvidence(input) {
 }
 
 async function publicationReceipt(authorization, commitEvent, runtimeResultId) {
+  const assignment = authorization.payload.liveAssignment;
   const payload = {
     sampleAuthorizationId: authorization.authorizationId,
     sampleAuthorizationSha256: authorization.authorizationSha256,
@@ -722,7 +815,7 @@ async function publicationReceipt(authorization, commitEvent, runtimeResultId) {
     runtimeResultSha256: SHA_A,
     sampleId: authorization.payload.sampleId,
     selectedSubjectId: authorization.payload.selectedSubjectId,
-    selectedRole: "candidate",
+    selectedRole: assignment,
     sinkId: commitEvent.payload.sinkId,
     publicationReference: commitEvent.payload.externalReference,
     publicationIdempotencyKey: commitEvent.payload.idempotencyKey,
@@ -730,10 +823,10 @@ async function publicationReceipt(authorization, commitEvent, runtimeResultId) {
     sideEffectCommitEventId: commitEvent.eventId,
     outputSha256: commitEvent.payload.outputSha256,
     outputBytes: 128,
-    verifiedAt: "2026-08-21T02:56:00.000Z",
+    verifiedAt: commitEvent.payload.committedAt,
     publishedAt: commitEvent.payload.committedAt,
     externallyVisible: true,
-    candidateOutputExternallyVisible: true,
+    candidateOutputExternallyVisible: assignment === "candidate",
     rawOutputPersisted: false,
     automaticRetryAllowed: false,
     automaticRollbackAllowed: false,
@@ -861,12 +954,9 @@ async function recoveryReportFromEvent(event, overrides) {
 
 async function openSideEffectJournal(root, label) {
   journalSequence += 1;
-  return JsonlBoundedLiveSideEffectJournal.open({
-    filePath: join(root, `routing-promotion-side-effects-${label}-${journalSequence}.jsonl`),
-    maxFileBytes: 2 * 1024 * 1024,
-    maxEventBytes: 128 * 1024,
-    maxStringBytes: 4096,
-  });
+  return JsonlBoundedLiveSideEffectJournal.open(
+    journalOptions(join(root, `routing-promotion-side-effects-${label}-${journalSequence}.jsonl`)),
+  );
 }
 
 async function approvedPublishWorkflow(root, projectId, prefix, now) {
@@ -912,6 +1002,10 @@ function promotionAuthorizationInput(approvalIds, decidedAt) {
     policyReferences: ["policy:routing-promotion-authorization-v1"],
     approvalIds,
   };
+}
+
+function minuteTime(minute) {
+  return new Date(Date.UTC(2026, 7, 21, 2, minute, 0)).toISOString();
 }
 
 async function rehashGuardrail(payload) {
