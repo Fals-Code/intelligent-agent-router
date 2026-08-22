@@ -724,7 +724,7 @@ function identity(value: string, label: string): string {
 
 function sha256(value: string, label: string): string {
   if (!/^[a-f0-9]{64}$/i.test(value)) throw new Error(`${label} must be a SHA-256 hex digest`);
-  return value.toLowerCase();
+  return value;
 }
 
 function timestamp(value: string, label: string): string {
