@@ -108,7 +108,7 @@ export interface ObservabilityReadinessEvidenceInput {
 
 type ReadinessEvidenceKind = "credential_isolation" | "backup_restore" | "rollback_rehearsal" | "observability";
 
-export interface LocalProductionRoutingReadinessEvidence<TPayload extends Record<string, unknown> = Record<string, unknown>> {
+export interface LocalProductionRoutingReadinessEvidence<TPayload extends object = object> {
   readonly schemaVersion: typeof LOCAL_PRODUCTION_ROUTING_READINESS_EVIDENCE_SCHEMA_VERSION;
   readonly algorithm: "sha256";
   readonly kind: ReadinessEvidenceKind;
@@ -562,7 +562,7 @@ async function verifyReadinessContext(context: LocalProductionRoutingReadinessCo
   });
 }
 
-async function prepareEvidence<T extends Record<string, unknown>>(
+async function prepareEvidence<T extends object>(
   kind: ReadinessEvidenceKind,
   payload: T,
 ): Promise<LocalProductionRoutingReadinessEvidence<T>> {
