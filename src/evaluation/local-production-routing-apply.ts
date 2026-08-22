@@ -497,6 +497,17 @@ const AUTO_FIELDS = [
   "automaticPromotionAllowed",
 ] as const;
 
+const APPLY_PROPOSAL_PAYLOAD_FIELDS = [
+  "candidateSubjectId", "candidateRouteRevision", "proposedAt", "policyReferences", "runLedgerReferences", "traceReferences",
+  "readinessAuthorizationId", "readinessAuthorizationSha256", "rehearsalReceiptId", "rehearsalReceiptSha256",
+  "targetSnapshotId", "targetSnapshotSha256", "sourceSnapshotId", "sourceSnapshotSha256",
+  "adapterId", "adapterVersion", "adapterSourceSha256", "mainSourceSha256", "productionTargetId", "projectId", "routeId", "capability",
+  "referenceSubjectId", "referenceRouteRevision", "productionPreFingerprintId", "productionPreFingerprintSha256",
+  "productionPreStateId", "productionPreStateSha256", "productionPreRawFileSha256", "backupEvidenceId", "backupEvidenceSha256",
+  "backupId", "backupSha256", "canonicalWriterId", "writeBoundaryId", "singleWriterVerified", "productionRoutingMutationAuthorized",
+  "automaticRoutingMutationAllowed", "automaticRetryAllowed", "automaticRollbackAllowed", "automaticRedispatchAllowed", "automaticPromotionAllowed",
+] as const;
+
 export class JsonFileLocalProductionRoutingApplyBackupStore {
   readonly descriptor: LocalProductionRoutingApplyBackupStoreDescriptor;
 
@@ -824,6 +835,7 @@ export async function verifyLocalProductionRoutingApplyProposal(proposal: LocalP
   assertExactKeys(proposal, ["schemaVersion", "algorithm", "proposalId", "proposalSha256", "payload"], "apply proposal");
   if (proposal.schemaVersion !== 2 || proposal.algorithm !== "sha256") throw new Error("Production apply proposal envelope invalid");
   await verifyApplyContext(context, requireLivePreState);
+  assertProposalPayloadSemantics(proposal.payload, context);
   assertProposalBindings(proposal, context);
   const expectedSha = await sha256Canonical(proposal.payload);
   if (proposal.proposalSha256 !== expectedSha || proposal.proposalId !== `m5localprodapplyproposal:${expectedSha.slice(0, 32).toLowerCase()}`) throw new Error("Production apply proposal content-address drift");
@@ -1231,6 +1243,35 @@ function classifyProgression(events: readonly LocalProductionRoutingApplyJournal
 function assertEventBindings(event: LocalProductionRoutingApplyJournalEvent, input: { readonly proposal: LocalProductionRoutingApplyProposal; readonly authorization: LocalProductionRoutingApplyAuthorization; readonly executionApproval: LocalProductionRoutingApplyExecutionApproval; readonly prewriteSeal: LocalProductionRoutingApplyPrewriteSeal; readonly context: LocalProductionRoutingApplyContext; readonly workflow: WorkflowRun; readonly currentTargetSnapshot: LocalProductionRoutingTargetSnapshot; readonly currentSourceSnapshot: LocalProductionRoutingReadinessSourceSnapshot }): void {
   const e = event.payload; const p = input.proposal.payload;
   if (e.operationId !== input.executionApproval.payload.operationId || e.idempotencyKey !== e.operationId || e.productionTargetId !== p.productionTargetId || e.projectId !== p.projectId || e.routeId !== p.routeId || e.capability !== p.capability || e.beforeStateId !== p.productionPreStateId || e.beforeStateSha256 !== p.productionPreStateSha256 || e.beforeSubjectId !== p.referenceSubjectId || e.beforeRouteRevision !== p.referenceRouteRevision || e.afterSubjectId !== p.candidateSubjectId || e.afterRouteRevision !== p.candidateRouteRevision || e.productionPreFingerprintId !== p.productionPreFingerprintId || e.productionPreFingerprintSha256 !== p.productionPreFingerprintSha256 || e.productionPreRawFileSha256 !== p.productionPreRawFileSha256 || e.readinessAuthorizationId !== p.readinessAuthorizationId || e.readinessAuthorizationSha256 !== p.readinessAuthorizationSha256 || e.rehearsalReceiptId !== p.rehearsalReceiptId || e.rehearsalReceiptSha256 !== p.rehearsalReceiptSha256 || e.proposalId !== input.proposal.proposalId || e.proposalSha256 !== input.proposal.proposalSha256 || e.authorizationId !== input.authorization.authorizationId || e.authorizationSha256 !== input.authorization.authorizationSha256 || e.executionApprovalId !== input.executionApproval.approvalId || e.executionApprovalSha256 !== input.executionApproval.approvalSha256 || e.prewriteSealId !== input.prewriteSeal.sealId || e.prewriteSealSha256 !== input.prewriteSeal.sealSha256 || e.currentSourceSnapshotId !== input.currentSourceSnapshot.snapshotId || e.currentSourceSnapshotSha256 !== input.currentSourceSnapshot.snapshotSha256 || e.currentTargetSnapshotId !== input.currentTargetSnapshot.snapshotId || e.currentTargetSnapshotSha256 !== input.currentTargetSnapshot.snapshotSha256 || e.backupEvidenceId !== p.backupEvidenceId || e.backupEvidenceSha256 !== p.backupEvidenceSha256 || e.backupId !== p.backupId || e.backupSha256 !== p.backupSha256 || e.canonicalWriterId !== p.canonicalWriterId || e.workflowRunId !== input.authorization.payload.workflowRunId || !sameJson(e.approvalIds, input.authorization.payload.approvalIds) || !sameJson(e.runLedgerReferences, p.runLedgerReferences) || !sameJson(e.traceReferences, p.traceReferences)) throw new Error("Apply journal event authority/state/provenance binding drift");
+}
+
+function assertProposalPayloadSemantics(payload: LocalProductionRoutingApplyProposalPayload, context: LocalProductionRoutingApplyContext): void {
+  assertExactKeys(payload, APPLY_PROPOSAL_PAYLOAD_FIELDS, "apply proposal payload");
+  const proposedAt = timestamp(payload.proposedAt, "proposedAt");
+  if (payload.proposedAt !== proposedAt) throw new Error("Production apply proposal timestamp must be canonical ISO");
+  if (payload.candidateSubjectId !== identity(payload.candidateSubjectId, "candidateSubjectId") || payload.candidateRouteRevision !== identity(payload.candidateRouteRevision, "candidateRouteRevision")) {
+    throw new Error("Production apply candidate identity is non-canonical");
+  }
+  if (!sameJson(payload.policyReferences, normalizeSet(payload.policyReferences, "apply proposal policy reference", true)) ||
+      !sameJson(payload.runLedgerReferences, normalizeSet(payload.runLedgerReferences, "apply Run Ledger reference", true)) ||
+      !sameJson(payload.traceReferences, normalizeSet(payload.traceReferences, "apply trace reference", true))) {
+    throw new Error("Production apply proposal references are non-canonical");
+  }
+  const latest = Math.max(
+    Date.parse(context.currentTargetSnapshot.payload.capturedAt),
+    Date.parse(context.currentSourceSnapshot.payload.observedAt),
+    Date.parse(context.productionPreFingerprint.payload.observedAt),
+    Date.parse(context.backupEvidence.payload.capturedAt),
+    Date.parse(context.rehearsalReceipt.payload.completedAt),
+  );
+  if (Date.parse(proposedAt) <= latest) throw new Error("Production apply proposal must follow final evidence snapshot");
+  if (Date.parse(context.backupEvidence.payload.capturedAt) < Date.parse(context.productionPreFingerprint.payload.observedAt)) {
+    throw new Error("Production backup is stale relative to production pre-fingerprint");
+  }
+  const pre = context.productionPreFingerprint.payload;
+  if (payload.candidateSubjectId === pre.currentSubjectId || payload.candidateRouteRevision === pre.routeRevision) {
+    throw new Error("Production candidate must differ from exact reference subject and revision");
+  }
 }
 
 function assertProposalBindings(proposal: LocalProductionRoutingApplyProposal, context: LocalProductionRoutingApplyContext): void {
