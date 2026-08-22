@@ -178,7 +178,7 @@ export async function buildLocalProductionAdapterRehearsalFixture(t, suffix = "r
     evidenceReferences: ["evidence:adapter-source-verified", "evidence:main-source-verified"],
     adapterSourceVerified: true,
     mainSourceVerified: true,
-    observedAt: "2026-08-21T03:14:30.000Z",
+    observedAt: "2026-08-21T03:15:15.000Z",
   });
 
   const readinessContext = {
