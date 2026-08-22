@@ -9,11 +9,14 @@ import {
   prepareCredentialIsolationReadinessEvidence,
   prepareLocalProductionRoutingReadinessAuthorization,
   prepareLocalProductionRoutingReadinessProposal,
+  prepareLocalProductionRoutingReadinessSourceSnapshot,
   prepareLocalProductionRoutingTargetSnapshot,
   prepareObservabilityReadinessEvidence,
   prepareRollbackRehearsalReadinessEvidence,
   verifyLocalProductionRoutingReadinessAuthorization,
+  verifyLocalProductionRoutingReadinessEvidence,
   verifyLocalProductionRoutingReadinessProposal,
+  verifyLocalProductionRoutingReadinessSourceSnapshot,
 } from "../dist/index.js";
 import { buildAuthorizedRoutingPromotionFixture } from "./isolated-routing-mutation-fixture.mjs";
 
@@ -39,6 +42,20 @@ function isolatedJournalOptions(root, suffix = "readiness") {
     maxFileBytes: 2 * 1024 * 1024,
     maxEventBytes: 256 * 1024,
     maxStringBytes: 4096,
+  };
+}
+
+function sourceSnapshotInput(overrides = {}) {
+  return {
+    adapterId: "adapter:local-production-routing-v1",
+    adapterVersion: "design-v1",
+    adapterSourceSha256: SHA_B,
+    mainSourceSha256: SHA_C,
+    evidenceReferences: ["evidence:adapter-source-verified", "evidence:main-source-verified"],
+    adapterSourceVerified: true,
+    mainSourceVerified: true,
+    observedAt: "2026-08-21T03:14:30.000Z",
+    ...overrides,
   };
 }
 
@@ -154,12 +171,15 @@ async function buildReadyContext(t, suffix = "readiness") {
     observedAt: "2026-08-21T03:12:00.000Z",
   });
 
+  const sourceSnapshot = await prepareLocalProductionRoutingReadinessSourceSnapshot(sourceSnapshotInput());
+
   return {
     fixture,
     isolatedTarget,
     isolatedJournal,
     isolatedMutationReceipt,
     targetSnapshot,
+    sourceSnapshot,
     credentialEvidence,
     backupEvidence,
     rollbackEvidence,
@@ -207,6 +227,28 @@ function r4Workflow(projectId, overrides = {}) {
   };
 }
 
+function authorizationInput(workflow, overrides = {}) {
+  return {
+    decision: "allow",
+    actor: "operator:local-production-readiness",
+    decidedAt: "2026-08-21T03:15:00.000Z",
+    approvalIds: workflow.approvalIds,
+    policyReferences: ["policy:r4-local-production-readiness-approval-v1"],
+    ...overrides,
+  };
+}
+
+async function createAuthorization(ready, proposal, workflow = r4Workflow(ready.fixture.authorization.payload.projectId), overrides = {}) {
+  return prepareLocalProductionRoutingReadinessAuthorization({
+    proposal,
+    context: ready.context,
+    currentTargetSnapshot: ready.targetSnapshot,
+    currentSourceSnapshot: ready.sourceSnapshot,
+    workflow,
+    authorization: authorizationInput(workflow, overrides),
+  });
+}
+
 test("ready contract authorizes implementation readiness only and never production mutation", async (t) => {
   const ready = await buildReadyContext(t, "ready");
   const proposal = await prepareLocalProductionRoutingReadinessProposal({ context: ready.context, proposal: proposalInput() });
@@ -216,23 +258,18 @@ test("ready contract authorizes implementation readiness only and never producti
   assert.equal(proposal.payload.automaticRollbackAllowed, false);
 
   const workflow = r4Workflow(ready.fixture.authorization.payload.projectId);
-  const authorization = await prepareLocalProductionRoutingReadinessAuthorization({
-    proposal,
-    context: ready.context,
-    currentTargetSnapshot: ready.targetSnapshot,
-    workflow,
-    authorization: {
-      decision: "allow",
-      actor: "operator:local-production-readiness",
-      decidedAt: "2026-08-21T03:15:00.000Z",
-      approvalIds: workflow.approvalIds,
-      policyReferences: ["policy:r4-local-production-readiness-approval-v1"],
-    },
-  });
+  const authorization = await createAuthorization(ready, proposal, workflow);
   assert.equal(authorization.payload.implementationReadinessAuthorized, true);
   assert.equal(authorization.payload.productionRoutingMutationAuthorized, false);
   assert.equal(authorization.payload.riskClass, "R4");
-  await verifyLocalProductionRoutingReadinessAuthorization(authorization, proposal, ready.context, ready.targetSnapshot, workflow);
+  await verifyLocalProductionRoutingReadinessAuthorization(
+    authorization,
+    proposal,
+    ready.context,
+    ready.targetSnapshot,
+    ready.sourceSnapshot,
+    workflow,
+  );
 });
 
 test("credential or isolation weakness classifies NOT_READY and cannot be allowed", async (t) => {
@@ -251,14 +288,9 @@ test("credential or isolation weakness classifies NOT_READY and cannot be allowe
       proposal,
       context,
       currentTargetSnapshot: ready.targetSnapshot,
+      currentSourceSnapshot: ready.sourceSnapshot,
       workflow,
-      authorization: {
-        decision: "allow",
-        actor: "operator:readiness",
-        decidedAt: "2026-08-21T03:15:00.000Z",
-        approvalIds: workflow.approvalIds,
-        policyReferences: ["policy:r4-local-production-readiness-approval-v1"],
-      },
+      authorization: authorizationInput(workflow),
     }),
     /READY classification/,
   );
@@ -301,14 +333,9 @@ test("stale local-production target snapshot rejects authorization after approva
       proposal,
       context: ready.context,
       currentTargetSnapshot: drifted,
+      currentSourceSnapshot: ready.sourceSnapshot,
       workflow,
-      authorization: {
-        decision: "allow",
-        actor: "operator:readiness",
-        decidedAt: "2026-08-21T03:15:00.000Z",
-        approvalIds: workflow.approvalIds,
-        policyReferences: ["policy:r4-local-production-readiness-approval-v1"],
-      },
+      authorization: authorizationInput(workflow),
     }),
     /stale or drifted/,
   );
@@ -357,14 +384,9 @@ test("R4 durable workflow and exact approval set are mandatory", async (t) => {
       proposal,
       context: ready.context,
       currentTargetSnapshot: ready.targetSnapshot,
+      currentSourceSnapshot: ready.sourceSnapshot,
       workflow: wrongRisk,
-      authorization: {
-        decision: "allow",
-        actor: "operator:readiness",
-        decidedAt: "2026-08-21T03:15:00.000Z",
-        approvalIds: wrongRisk.approvalIds,
-        policyReferences: ["policy:r4-local-production-readiness-approval-v1"],
-      },
+      authorization: authorizationInput(wrongRisk),
     }),
     /exact R4 workflow scope/,
   );
@@ -375,14 +397,9 @@ test("R4 durable workflow and exact approval set are mandatory", async (t) => {
       proposal,
       context: ready.context,
       currentTargetSnapshot: ready.targetSnapshot,
+      currentSourceSnapshot: ready.sourceSnapshot,
       workflow,
-      authorization: {
-        decision: "allow",
-        actor: "operator:readiness",
-        decidedAt: "2026-08-21T03:15:00.000Z",
-        approvalIds: ["approval:wrong"],
-        policyReferences: ["policy:r4-local-production-readiness-approval-v1"],
-      },
+      authorization: authorizationInput(workflow, { approvalIds: ["approval:wrong"] }),
     }),
     /do not match durable R4 workflow approvals/,
   );
@@ -399,14 +416,7 @@ test("rehashed proposal cannot forge production or automatic mutation authority"
     automaticRollbackAllowed: true,
     automaticRedispatchAllowed: true,
   };
-  const digest = await sha256Canonical(forgedPayload);
-  const forged = {
-    schemaVersion: 1,
-    algorithm: "sha256",
-    proposalId: `m5localprodready:${digest.slice(0, 32).toLowerCase()}`,
-    proposalSha256: digest,
-    payload: forgedPayload,
-  };
+  const forged = await rehashProposal(proposal, forgedPayload);
   await assert.rejects(
     verifyLocalProductionRoutingReadinessProposal(forged, ready.context),
     /cannot grant production or automatic mutation authority/,
@@ -433,28 +443,278 @@ test("adapter source identity is content-addressed and authorization is bound to
   const ready = await buildReadyContext(t, "adapter-source");
   const proposal = await prepareLocalProductionRoutingReadinessProposal({ context: ready.context, proposal: proposalInput() });
   const workflow = r4Workflow(ready.fixture.authorization.payload.projectId);
-  const authorization = await prepareLocalProductionRoutingReadinessAuthorization({
-    proposal,
-    context: ready.context,
-    currentTargetSnapshot: ready.targetSnapshot,
-    workflow,
-    authorization: {
-      decision: "allow",
-      actor: "operator:readiness",
-      decidedAt: "2026-08-21T03:15:00.000Z",
-      approvalIds: workflow.approvalIds,
-      policyReferences: ["policy:r4-local-production-readiness-approval-v1"],
-    },
-  });
+  const authorization = await createAuthorization(ready, proposal, workflow);
   const driftedProposal = await prepareLocalProductionRoutingReadinessProposal({
     context: ready.context,
     proposal: proposalInput({ adapterSourceSha256: SHA_A }),
   });
   await assert.rejects(
-    verifyLocalProductionRoutingReadinessAuthorization(authorization, driftedProposal, ready.context, ready.targetSnapshot, workflow),
-    /scope\/source drift|content address|proposalId/,
+    verifyLocalProductionRoutingReadinessAuthorization(
+      authorization,
+      driftedProposal,
+      ready.context,
+      ready.targetSnapshot,
+      ready.sourceSnapshot,
+      workflow,
+    ),
+    /stale, drifted, or unverified|scope\/source drift|content address|proposalId/,
   );
 });
+
+test("readiness evidence, proposal, authorization, and current source snapshots reject rehashed provider-specific extra fields", async (t) => {
+  const ready = await buildReadyContext(t, "unknown-fields");
+  const proposal = await prepareLocalProductionRoutingReadinessProposal({ context: ready.context, proposal: proposalInput() });
+  const workflow = r4Workflow(ready.fixture.authorization.payload.projectId);
+  const authorization = await createAuthorization(ready, proposal, workflow);
+
+  const extra = { providerSpecificCredential: "api_key=LEAKED_PROVIDER_SECRET_012345678901234567890" };
+  const forgedEvidencePayload = { ...ready.credentialEvidence.payload, ...extra };
+  const forgedEvidence = await rehashEvidence(ready.credentialEvidence, forgedEvidencePayload);
+  await assert.rejects(
+    verifyLocalProductionRoutingReadinessEvidence(forgedEvidence),
+    /providerSpecificCredential is not allowed/,
+  );
+
+  const forgedProposal = await rehashProposal(proposal, { ...proposal.payload, ...extra });
+  await assert.rejects(
+    verifyLocalProductionRoutingReadinessProposal(forgedProposal, ready.context),
+    /providerSpecificCredential is not allowed/,
+  );
+
+  const forgedAuthorization = await rehashAuthorization(authorization, { ...authorization.payload, ...extra });
+  await assert.rejects(
+    verifyLocalProductionRoutingReadinessAuthorization(
+      forgedAuthorization,
+      proposal,
+      ready.context,
+      ready.targetSnapshot,
+      ready.sourceSnapshot,
+      workflow,
+    ),
+    /providerSpecificCredential is not allowed/,
+  );
+
+  const forgedSource = await rehashSourceSnapshot(ready.sourceSnapshot, { ...ready.sourceSnapshot.payload, ...extra });
+  await assert.rejects(
+    verifyLocalProductionRoutingReadinessSourceSnapshot(forgedSource),
+    /providerSpecificCredential is not allowed/,
+  );
+});
+
+test("old readiness authorization fails against refreshed adapter or main source drift", async (t) => {
+  const ready = await buildReadyContext(t, "source-freshness");
+  const proposal = await prepareLocalProductionRoutingReadinessProposal({ context: ready.context, proposal: proposalInput() });
+  const workflow = r4Workflow(ready.fixture.authorization.payload.projectId);
+  const authorization = await createAuthorization(ready, proposal, workflow);
+
+  const adapterDrift = await prepareLocalProductionRoutingReadinessSourceSnapshot(sourceSnapshotInput({
+    adapterSourceSha256: SHA_A,
+    observedAt: "2026-08-21T03:16:00.000Z",
+  }));
+  await assert.rejects(
+    verifyLocalProductionRoutingReadinessAuthorization(
+      authorization,
+      proposal,
+      ready.context,
+      ready.targetSnapshot,
+      adapterDrift,
+      workflow,
+    ),
+    /adapter\/main source is stale, drifted, or unverified/,
+  );
+
+  const mainDrift = await prepareLocalProductionRoutingReadinessSourceSnapshot(sourceSnapshotInput({
+    mainSourceSha256: SHA_A,
+    observedAt: "2026-08-21T03:16:00.000Z",
+  }));
+  await assert.rejects(
+    verifyLocalProductionRoutingReadinessAuthorization(
+      authorization,
+      proposal,
+      ready.context,
+      ready.targetSnapshot,
+      mainDrift,
+      workflow,
+    ),
+    /adapter\/main source is stale, drifted, or unverified/,
+  );
+
+  const unverified = await prepareLocalProductionRoutingReadinessSourceSnapshot(sourceSnapshotInput({
+    adapterSourceVerified: false,
+    observedAt: "2026-08-21T03:16:00.000Z",
+  }));
+  await assert.rejects(
+    verifyLocalProductionRoutingReadinessAuthorization(
+      authorization,
+      proposal,
+      ready.context,
+      ready.targetSnapshot,
+      unverified,
+      workflow,
+    ),
+    /adapter\/main source is stale, drifted, or unverified/,
+  );
+});
+
+test("mandatory readiness proposal scope drift matrix rejects project route capability reference candidate and revision drift", async (t) => {
+  const ready = await buildReadyContext(t, "scope-drift-matrix");
+  const proposal = await prepareLocalProductionRoutingReadinessProposal({ context: ready.context, proposal: proposalInput() });
+  const alternateCapability = proposal.payload.capability === "code.review" ? "code.interactive" : "code.review";
+  const cases = [
+    ["projectId", "project:drifted"],
+    ["routeId", "route:drifted"],
+    ["capability", alternateCapability],
+    ["referenceSubjectId", "subject:drifted-reference"],
+    ["candidateSubjectId", "subject:drifted-candidate"],
+    ["routeRevision", "route-revision:drifted"],
+  ];
+  for (const [field, value] of cases) {
+    const forged = await rehashProposal(proposal, { ...proposal.payload, [field]: value });
+    await assert.rejects(
+      verifyLocalProductionRoutingReadinessProposal(forged, ready.context),
+      /canonical source binding drift detected/,
+      `expected ${field} drift to fail closed`,
+    );
+  }
+});
+
+test("mandatory missing isolated backup and rollback evidence fail closed at readiness boundary", async (t) => {
+  const ready = await buildReadyContext(t, "missing-evidence");
+  for (const field of ["isolatedMutationReceipt", "credentialEvidence", "backupEvidence", "rollbackEvidence"]) {
+    const context = { ...ready.context, [field]: undefined };
+    await assert.rejects(
+      prepareLocalProductionRoutingReadinessProposal({ context, proposal: proposalInput() }),
+      new RegExp(`context\\.${field} evidence is required`),
+      `expected missing ${field} to fail closed`,
+    );
+  }
+});
+
+test("invalid backup integrity and FAILED rollback rehearsal classify NOT_READY", async (t) => {
+  const ready = await buildReadyContext(t, "failed-readiness-proofs");
+  const backupEvidence = await prepareBackupRestoreReadinessEvidence({
+    ...ready.backupEvidence.payload,
+    backupIntegrityVerified: false,
+  });
+  const backupProposal = await prepareLocalProductionRoutingReadinessProposal({
+    context: { ...ready.context, backupEvidence },
+    proposal: proposalInput(),
+  });
+  assert.equal(backupProposal.payload.classification, "NOT_READY");
+  assert.match(backupProposal.payload.reasons.join(" "), /Backup integrity is not verified/);
+
+  const rollbackEvidence = await prepareRollbackRehearsalReadinessEvidence({
+    ...ready.rollbackEvidence.payload,
+    rehearsalResult: "FAILED",
+    exactReferenceRestored: false,
+  });
+  const rollbackProposal = await prepareLocalProductionRoutingReadinessProposal({
+    context: { ...ready.context, rollbackEvidence },
+    proposal: proposalInput(),
+  });
+  assert.equal(rollbackProposal.payload.classification, "NOT_READY");
+  assert.match(rollbackProposal.payload.reasons.join(" "), /Rollback rehearsal is not a clean/);
+});
+
+test("broadened credential or write scope and multiple-writer ambiguity classify NOT_READY", async (t) => {
+  const ready = await buildReadyContext(t, "scope-and-writer-ambiguity");
+  const credentialEvidence = await prepareCredentialIsolationReadinessEvidence({
+    ...ready.credentialEvidence.payload,
+    exactTargetOnly: false,
+    singleWriterVerified: false,
+  });
+  const proposal = await prepareLocalProductionRoutingReadinessProposal({
+    context: { ...ready.context, credentialEvidence },
+    proposal: proposalInput(),
+  });
+  assert.equal(proposal.payload.classification, "NOT_READY");
+  assert.match(proposal.payload.reasons.join(" "), /not bounded to the exact target/);
+  assert.match(proposal.payload.reasons.join(" "), /Single-writer ownership is not proven/);
+});
+
+test("missing and stale human approval or workflow state fails closed", async (t) => {
+  const ready = await buildReadyContext(t, "approval-freshness");
+  const proposal = await prepareLocalProductionRoutingReadinessProposal({ context: ready.context, proposal: proposalInput() });
+  const workflow = r4Workflow(ready.fixture.authorization.payload.projectId);
+
+  await assert.rejects(
+    prepareLocalProductionRoutingReadinessAuthorization({
+      proposal,
+      context: ready.context,
+      currentTargetSnapshot: ready.targetSnapshot,
+      currentSourceSnapshot: ready.sourceSnapshot,
+      workflow: undefined,
+      authorization: authorizationInput(workflow),
+    }),
+    /workflow must be an object/,
+  );
+
+  await assert.rejects(
+    prepareLocalProductionRoutingReadinessAuthorization({
+      proposal,
+      context: ready.context,
+      currentTargetSnapshot: ready.targetSnapshot,
+      currentSourceSnapshot: ready.sourceSnapshot,
+      workflow,
+      authorization: authorizationInput(workflow, { approvalIds: [] }),
+    }),
+    /approvalId list must not be empty/,
+  );
+
+  const authorization = await createAuthorization(ready, proposal, workflow);
+  const staleWorkflow = { ...workflow, updatedAt: "2026-08-21T03:16:00.000Z" };
+  await assert.rejects(
+    verifyLocalProductionRoutingReadinessAuthorization(
+      authorization,
+      proposal,
+      ready.context,
+      ready.targetSnapshot,
+      ready.sourceSnapshot,
+      staleWorkflow,
+    ),
+    /predates proposal or workflow/,
+  );
+});
+
+async function rehashEvidence(evidence, payload) {
+  const digest = await sha256Canonical({ kind: evidence.kind, payload });
+  return {
+    ...evidence,
+    evidenceId: `m5localprodproof:${evidence.kind}:${digest.slice(0, 32).toLowerCase()}`,
+    evidenceSha256: digest,
+    payload,
+  };
+}
+
+async function rehashProposal(proposal, payload) {
+  const digest = await sha256Canonical(payload);
+  return {
+    ...proposal,
+    proposalId: `m5localprodready:${digest.slice(0, 32).toLowerCase()}`,
+    proposalSha256: digest,
+    payload,
+  };
+}
+
+async function rehashAuthorization(authorization, payload) {
+  const digest = await sha256Canonical(payload);
+  return {
+    ...authorization,
+    authorizationId: `m5localprodreadyauth:${digest.slice(0, 32).toLowerCase()}`,
+    authorizationSha256: digest,
+    payload,
+  };
+}
+
+async function rehashSourceSnapshot(snapshot, payload) {
+  const digest = await sha256Canonical(payload);
+  return {
+    ...snapshot,
+    snapshotId: `m5localprodsource:${digest.slice(0, 32).toLowerCase()}`,
+    snapshotSha256: digest,
+    payload,
+  };
+}
 
 async function sha256Canonical(value) {
   const digest = await globalThis.crypto.subtle.digest(
