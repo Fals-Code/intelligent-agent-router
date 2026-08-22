@@ -10,7 +10,7 @@ The frozen Architecture Contract remains authoritative: no evidence means no suc
 
 ## Authority chain
 
-`verified isolated mutation/recovery capability -> exact local-production target snapshot -> credential/isolation proof -> backup/restore proof -> rollback rehearsal proof -> canonical Run Ledger + trace evidence -> readiness proposal -> separate durable R4 approval -> readiness authorization`
+`verified isolated mutation/recovery capability -> exact local-production target snapshot -> credential/isolation proof -> backup/restore proof -> rollback rehearsal proof -> canonical Run Ledger + trace evidence -> readiness proposal -> independently verified current adapter/main source snapshot -> separate durable R4 approval -> readiness authorization`
 
 A readiness authorization permits only a later **adapter implementation/rehearsal gate**.
 
@@ -51,6 +51,28 @@ The snapshot hard-codes:
 
 The readiness layer stores no credential/token values and no provider-specific production schema.
 
+## Current adapter/main source snapshot
+
+`LocalProductionRoutingReadinessSourceSnapshot` is a separate content-addressed source authority presented at readiness authorization time. It binds:
+
+- exact adapter identity and version;
+- current adapter source SHA-256;
+- current `main` source SHA-256;
+- independent source-evidence references;
+- explicit adapter-source verification state;
+- explicit main-source verification state;
+- observation timestamp.
+
+Authorization preparation and verification both require this current source snapshot. They fail closed if the adapter identity/version, adapter source SHA, or `main` source SHA differs from the approved proposal, if either source is not verified, or if the source evidence predates the proposal. Reusing an old readiness authorization against changed source therefore fails and requires new readiness evidence plus R4 approval.
+
+The source snapshot itself is provider-neutral and hard-codes `providerSpecificStatePersisted=false` and `secretMaterialPersisted=false`.
+
+## Structural fail-closed boundary
+
+Target snapshots, source snapshots, every evidence kind, readiness proposals, and readiness authorizations use explicit field allowlists. Unknown fields are rejected before a content-addressed artifact can be treated as valid.
+
+This means adding an arbitrary/provider-specific/secret-bearing field and recomputing the artifact hash/id does not turn that modified object into valid readiness evidence. The core contract accepts only the frozen provider-neutral schema.
+
 ## Credential + isolation proof
 
 Credential/isolation evidence binds only normalized scope identities and verifiable booleans. It must prove:
@@ -61,7 +83,7 @@ Credential/isolation evidence binds only normalized scope identities and verifia
 - provider failure is contained at the adapter boundary;
 - the canonical routing state retains one verified writer.
 
-Any missing proof classifies the candidate `NOT_READY`.
+Any missing proof classifies the candidate `NOT_READY`. Broadened target/write scope or ambiguous multiple-writer ownership also classifies `NOT_READY`.
 
 ## Backup + restore proof
 
@@ -74,7 +96,7 @@ Backup readiness binds:
 - independent evidence references;
 - backup-integrity and restore verification results.
 
-A successful restore claim whose restored content address differs from the exact target reference snapshot is rejected, not downgraded to a warning.
+A successful restore claim whose restored content address differs from the exact target reference snapshot is rejected, not downgraded to a warning. Missing or invalid backup integrity evidence prevents READY classification.
 
 This slice performs no destructive cleanup.
 
@@ -89,7 +111,7 @@ A readiness candidate can become READY only when a non-production rehearsal prov
 - no duplicate side effect occurred;
 - automatic rollback remains disabled.
 
-A rehearsal that cannot be reconciled exactly classifies `MANUAL_RECONCILIATION_REQUIRED`.
+A rehearsal that cannot be reconciled exactly classifies `MANUAL_RECONCILIATION_REQUIRED`. A `FAILED` rehearsal cannot become READY.
 
 ## Observability + Run Ledger proof
 
@@ -120,6 +142,8 @@ Agent self-report is never accepted as proof.
 - exact `main` source SHA-256 supplied to the contract;
 - classification + reasons.
 
+Proposal verification re-derives these bindings from the verified context. Project, route, capability, reference, candidate, route-revision, evidence, or provenance drift fails closed even when a caller recomputes the proposal hash.
+
 All mutation authority flags are hard-coded false:
 
 - `productionRoutingMutationAuthorized=false`;
@@ -134,7 +158,9 @@ All mutation authority flags are hard-coded false:
 
 An `allow` decision is valid only for a proposal classified `READY_FOR_LOCAL_PRODUCTION_ADAPTER_IMPLEMENTATION`.
 
-The authorization binds the exact proposal, target snapshot, adapter identity/version/source SHA and main source SHA.
+The authorization binds the exact proposal, target snapshot, adapter identity/version/source SHA and main source SHA. Verification also compares those approved identities to the independently supplied current source snapshot.
+
+Missing workflow state, missing/different durable approvals, stale approval timing, target drift, or source drift fails closed.
 
 Even when `implementationReadinessAuthorized=true`, production mutation remains explicitly unauthorized.
 
@@ -142,24 +168,32 @@ Even when `implementationReadinessAuthorized=true`, production mutation remains 
 
 Authorization fails closed if the current local-production target no longer exactly matches the approved snapshot, including project/route/capability/reference subject/route revision.
 
+Authorization also fails closed if the separately verified current adapter/main source snapshot no longer exactly matches the approved adapter identity/version/source SHA and `main` source SHA.
+
 Proposal verification re-verifies the isolated mutation receipt and its durable journal. A stale in-memory journal reader therefore fails closed if a second writer changes durable classification after the reader opened.
 
-Changing adapter source identity, target snapshot, evidence content address, Run Ledger source, or durable R4 approval requires a new readiness artifact and authorization.
+Changing adapter source identity, `main` source identity, target snapshot, evidence content address, Run Ledger source, or durable R4 approval requires a new readiness artifact and authorization.
 
 ## Negative-first proof
 
 The regression suite covers at minimum:
 
-- clean READY path with R4 approval;
+- clean READY path with R4 approval while production mutation remains unauthorized;
 - credential/isolation weakness -> `NOT_READY`;
 - manual rollback state -> `MANUAL_RECONCILIATION_REQUIRED`;
+- `FAILED` rollback rehearsal -> `NOT_READY`;
 - target revision drift before authorization;
-- backup/reference mismatch;
+- project/route/capability/reference/candidate/revision proposal drift with recomputed hashes;
+- missing isolated mutation receipt and missing credential/backup/rollback evidence;
+- missing/invalid backup integrity and exact backup/reference mismatch;
 - secret-like material rejection;
-- R3 workflow rejection and approval-set drift rejection;
+- broadened credential/write scope and multiple-writer ambiguity -> `NOT_READY`;
+- missing R4 workflow, missing/wrong/stale durable human approval;
 - re-hashed production/automatic-authority forgery rejection;
+- re-hashed provider-specific/unknown-field forgery rejection for evidence, proposal, authorization, and source snapshot;
 - stale isolated journal reader after second-writer durable classification drift;
-- adapter source identity drift against an existing authorization.
+- adapter source identity drift against an existing authorization;
+- current adapter source SHA drift, current `main` source SHA drift, and unverified current source against an old authorization.
 
 ## Non-goals
 
