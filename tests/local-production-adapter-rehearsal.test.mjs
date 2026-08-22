@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, linkSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   JsonFileLocalProductionRehearsalTarget,
   JsonlLocalProductionRehearsalJournal,
@@ -28,7 +28,11 @@ function context(r, authority = r.authority, pre = r.productionPreFingerprint) {
 function coord(r, journal = r.rehearsalJournal, faultInjector, pre = r.productionPreFingerprint) {
   return new LocalProductionAdapterRehearsalCoordinator(r.productionTarget, r.rehearsalTarget, journal, pre, faultInjector);
 }
-const reopen = (r, authority = r.authority, pre = r.productionPreFingerprint) => JsonlLocalProductionRehearsalJournal.open(r.rehearsalJournalOptions, context(r, authority, pre));
+const reopen = (r, authority = r.authority, pre = r.productionPreFingerprint, observedAt = "2026-08-21T03:20:30.000Z") => JsonlLocalProductionRehearsalJournal.open(
+  r.rehearsalJournalOptions,
+  context(r, authority, pre),
+  { productionTarget: r.productionTarget, observedAt },
+);
 async function complete(r) {
   const c = coord(r);
   await c.applyCandidate({ authority: r.authority, ...candidateTimes() });
@@ -67,8 +71,8 @@ async function rejectApply(r, authority, pattern = /readiness|authorization|scop
   assert.equal((await r.rehearsalTarget.read()).stateId, before.stateId);
 }
 async function manualLatest(r, phase) {
-  const j = await reopen(r);
-  const e = j.latest(`local-production-rehearsal:${r.readinessAuthorization.authorizationId}:${phase}`);
+  const operationId = `local-production-rehearsal:${r.readinessAuthorization.authorizationId}:${phase}`;
+  const e = entries(r).map(({ event }) => event).filter((event) => event.payload.operationId === operationId).at(-1);
   assert.equal(e?.payload.eventType, "rehearsal_manual_reconciliation_required");
   assert.equal(e?.payload.productionRouteMutated, false);
   assert.equal(e?.payload.automaticRetryAllowed, false);
@@ -186,6 +190,15 @@ test("TARGET / ISOLATION: live descriptor, aliases, mismatch, broadened scope, a
   await assert.rejects(JsonFileLocalProductionRehearsalTarget.initialize({ ...base, descriptor: { ...r.rehearsalDescriptor, sourceProductionTargetId: "production:wrong" } }), /sourceProductionTargetId/i);
   await assert.rejects(JsonFileLocalProductionRehearsalTarget.initialize({ ...base, descriptor: { ...r.rehearsalDescriptor, writeScope: "filesystem:any" } }), /unknown, missing, or provider-specific fields/i);
   await assert.rejects(JsonFileLocalProductionRehearsalTarget.initialize({ ...base, descriptor: { ...r.rehearsalDescriptor, providerToken: "not-a-real-secret" } }), /unknown, missing, or provider-specific fields/i);
+
+  const productionRaw = readFileSync(r.productionPath, "utf8");
+  const hardlinkPath = `${r.productionPath}.hardlink-alias`;
+  linkSync(r.productionPath, hardlinkPath);
+  await assert.rejects(
+    JsonFileLocalProductionRehearsalTarget.initialize({ ...base, descriptor: { ...r.rehearsalDescriptor, stateFilePath: hardlinkPath } }),
+    /physical path aliases|file identity aliases|aliases production/i,
+  );
+  assert.equal(readFileSync(r.productionPath, "utf8"), productionRaw);
 });
 
 // INTERRUPTION MATRIX
@@ -258,6 +271,11 @@ test("DURABLE JOURNAL: stale reader, truncation, and event hash tamper fail clos
     const r = await buildLocalProductionAdapterRehearsalFixture(s, "journal-hash"); const fault = { hit(p) { if (p === "after_candidate_reservation") throw new Error("stop"); } }; await assert.rejects(coord(r, r.rehearsalJournal, fault).applyCandidate({ authority: r.authority, ...candidateTimes() }), /stop/);
     const list = entries(r); list[0].event.eventSha256 = "0".repeat(64); writeEntries(r, list); await assert.rejects(reopen(r), /content address/i);
   });
+  await t.test("non-empty reopen requires live production proof", async (s) => {
+    const r = await buildLocalProductionAdapterRehearsalFixture(s, "journal-reopen-proof"); await reservationOnly(r, "candidate");
+    await assert.rejects(JsonlLocalProductionRehearsalJournal.open(r.rehearsalJournalOptions, context(r)), /live production proof/i);
+    await reopen(r);
+  });
 });
 
 async function reservationOnly(r, phase) {
@@ -315,11 +333,46 @@ test("PRODUCTION IMMUTABILITY: raw-byte drift before candidate reservation fails
 test("PRODUCTION IMMUTABILITY: drift after candidate reservation before apply blocks clone write", async (t) => {
   const r = await buildLocalProductionAdapterRehearsalFixture(t, "drift-after-reservation"); const fault = { hit(p) { if (p === "after_candidate_reservation") driftRaw(r); } }; await assertApplyDrift(r, fault); assert.equal((await r.rehearsalTarget.read()).payload.mutationCount, 0); await manualLatest(r, "candidate");
 });
+test("PRODUCTION IMMUTABILITY: malformed production after candidate reservation is durable MANUAL", async (t) => {
+  const r = await buildLocalProductionAdapterRehearsalFixture(t, "proof-loss-after-reservation");
+  const productionRaw = readFileSync(r.productionPath, "utf8");
+  const fault = { hit(p) { if (p === "after_candidate_reservation") writeFileSync(r.productionPath, "{\n", "utf8"); } };
+  await assert.rejects(coord(r, r.rehearsalJournal, fault).applyCandidate({ authority: r.authority, ...candidateTimes() }), /unreadable|unverifiable|manual/i);
+  assert.equal((await r.rehearsalTarget.read()).payload.mutationCount, 0);
+  assert.deepEqual(entries(r).map((e) => e.event.payload.eventType), ["rehearsal_reserved", "rehearsal_manual_reconciliation_required"]);
+  await manualLatest(r, "candidate");
+  writeFileSync(r.productionPath, productionRaw, "utf8");
+  const j = await reopen(r, r.authority, r.productionPreFingerprint, "2026-08-21T03:20:31.000Z");
+  const c = new LocalProductionAdapterRehearsalCoordinator(r.productionTarget, r.rehearsalTarget, j, r.productionPreFingerprint);
+  assert.equal((await c.reconcile({ authority: r.authority, phase: "candidate", observedAt: "2026-08-21T03:20:32.000Z" })).classification, "MANUAL_RECONCILIATION_REQUIRED");
+});
 test("PRODUCTION IMMUTABILITY: drift after candidate apply before commit blocks success commit", async (t) => {
   const r = await buildLocalProductionAdapterRehearsalFixture(t, "drift-after-apply"); const fault = { hit(p) { if (p === "after_candidate_apply_before_commit") driftRaw(r); } }; await assertApplyDrift(r, fault); assert.equal((await r.rehearsalTarget.read()).payload.mutationCount, 1); assert.deepEqual(entries(r).map((e) => e.event.payload.eventType), ["rehearsal_reserved", "rehearsal_manual_reconciliation_required"]);
 });
-test("PRODUCTION IMMUTABILITY: drift on restart/reconcile => MANUAL", async (t) => {
-  const r = await buildLocalProductionAdapterRehearsalFixture(t, "drift-reconcile"); await reservationOnly(r, "candidate"); driftRaw(r); const j = await reopen(r); const c = new LocalProductionAdapterRehearsalCoordinator(r.productionTarget, r.rehearsalTarget, j, r.productionPreFingerprint); assert.equal((await c.reconcile({ authority: r.authority, phase: "candidate", observedAt: "2026-08-21T03:18:10.000Z" })).classification, "MANUAL_RECONCILIATION_REQUIRED"); await manualLatest(r, "candidate");
+test("PRODUCTION IMMUTABILITY: deleted production after candidate apply is durable MANUAL with no commit", async (t) => {
+  const r = await buildLocalProductionAdapterRehearsalFixture(t, "proof-loss-after-apply");
+  const productionRaw = readFileSync(r.productionPath, "utf8");
+  const fault = { hit(p) { if (p === "after_candidate_apply_before_commit") unlinkSync(r.productionPath); } };
+  await assert.rejects(coord(r, r.rehearsalJournal, fault).applyCandidate({ authority: r.authority, ...candidateTimes() }), /unreadable|unverifiable|manual/i);
+  assert.equal((await r.rehearsalTarget.read()).payload.mutationCount, 1);
+  assert.deepEqual(entries(r).map((e) => e.event.payload.eventType), ["rehearsal_reserved", "rehearsal_manual_reconciliation_required"]);
+  await manualLatest(r, "candidate");
+  writeFileSync(r.productionPath, productionRaw, "utf8");
+  const j = await reopen(r, r.authority, r.productionPreFingerprint, "2026-08-21T03:20:31.000Z");
+  const c = new LocalProductionAdapterRehearsalCoordinator(r.productionTarget, r.rehearsalTarget, j, r.productionPreFingerprint);
+  assert.equal((await c.reconcile({ authority: r.authority, phase: "candidate", observedAt: "2026-08-21T03:20:32.000Z" })).classification, "MANUAL_RECONCILIATION_REQUIRED");
+});
+test("PRODUCTION IMMUTABILITY: drift is blocked at reopen and cannot silently recover after restoration", async (t) => {
+  const r = await buildLocalProductionAdapterRehearsalFixture(t, "drift-reopen");
+  const productionRaw = readFileSync(r.productionPath, "utf8");
+  await reservationOnly(r, "candidate");
+  driftRaw(r);
+  await assert.rejects(reopen(r, r.authority, r.productionPreFingerprint, "2026-08-21T03:20:30.000Z"), /manual|could not be proven|drift/i);
+  await manualLatest(r, "candidate");
+  writeFileSync(r.productionPath, productionRaw, "utf8");
+  const j = await reopen(r, r.authority, r.productionPreFingerprint, "2026-08-21T03:20:31.000Z");
+  const c = new LocalProductionAdapterRehearsalCoordinator(r.productionTarget, r.rehearsalTarget, j, r.productionPreFingerprint);
+  assert.equal((await c.reconcile({ authority: r.authority, phase: "candidate", observedAt: "2026-08-21T03:20:32.000Z" })).classification, "MANUAL_RECONCILIATION_REQUIRED");
 });
 test("PRODUCTION IMMUTABILITY: drift before restore blocks clone restore", async (t) => {
   const r = await buildLocalProductionAdapterRehearsalFixture(t, "drift-before-restore"); await coord(r).applyCandidate({ authority: r.authority, ...candidateTimes() }); const candidate = await r.rehearsalTarget.read(); driftRaw(r); await assert.rejects(coord(r).restoreReference({ authority: r.authority, ...restoreTimes() }), /manual|fingerprint drift/i); assert.equal((await r.rehearsalTarget.read()).stateId, candidate.stateId); await manualLatest(r, "restore");
