@@ -339,6 +339,7 @@ export class JsonlRoutingMutationJournal {
   private readonly events: RoutingMutationJournalEvent[] = [];
   private readonly latestByOperation = new Map<string, RoutingMutationJournalEvent>();
   private expectedFileSize = 0;
+  private expectedFileSha256 = "";
 
   private constructor(options: RoutingMutationJournalOptions) {
     if (!options.filePath.trim()) throw new Error("Routing mutation journal filePath must not be empty");
@@ -387,6 +388,16 @@ export class JsonlRoutingMutationJournal {
       manualReconciliationOperationIds: manualReconciliationOperationIds.sort(),
       automaticRetryAllowed: false,
     });
+  }
+
+  async assertFreshRead(): Promise<void> {
+    const raw = existsSync(this.filePath) ? readFileSync(this.filePath, "utf8") : "";
+    const currentSize = utf8ByteLength(raw);
+    if (currentSize > this.maxFileBytes) throw new Error("Routing mutation journal exceeds maxFileBytes");
+    const currentSha256 = await sha256Text(raw);
+    if (currentSize !== this.expectedFileSize || currentSha256 !== this.expectedFileSha256) {
+      throw new Error("Routing mutation journal changed since this reader opened; reopen before evidence verification");
+    }
   }
 
   async reserve(payload: Omit<RoutingMutationReservationPayload, "eventType" | "automaticRetryAllowed" | "automaticRollbackAllowed" | "productionRoutingMutationAllowed">): Promise<RoutingMutationJournalEvent> {
@@ -459,11 +470,11 @@ export class JsonlRoutingMutationJournal {
   }
 
   private async load(): Promise<void> {
-    if (!existsSync(this.filePath)) return;
-    const size = statSync(this.filePath).size;
+    const raw = existsSync(this.filePath) ? readFileSync(this.filePath, "utf8") : "";
+    const size = utf8ByteLength(raw);
     if (size > this.maxFileBytes) throw new Error("Routing mutation journal exceeds maxFileBytes");
-    const raw = readFileSync(this.filePath, "utf8");
-    this.expectedFileSize = utf8ByteLength(raw);
+    this.expectedFileSize = size;
+    this.expectedFileSha256 = await sha256Text(raw);
     if (!raw) return;
     if (!raw.endsWith("\n")) throw new Error("Routing mutation journal is not newline-terminated; possible partial write");
     const lines = raw.slice(0, -1).split("\n");
@@ -501,6 +512,11 @@ export class JsonlRoutingMutationJournal {
     try { writeFileSync(handle, raw, "utf8"); fsyncSync(handle); }
     finally { closeSync(handle); }
     this.expectedFileSize += bytes;
+    const persistedRaw = readFileSync(this.filePath, "utf8");
+    if (utf8ByteLength(persistedRaw) !== this.expectedFileSize) {
+      throw new Error("Routing mutation journal changed during append; reopen before continuing");
+    }
+    this.expectedFileSha256 = await sha256Text(persistedRaw);
     this.admit(event);
     return event;
   }
@@ -731,14 +747,20 @@ export async function verifyIsolatedRoutingMutationReceipt(
     p.targetId !== target.descriptor.targetId || p.projectId !== a.projectId || p.routeId !== a.routeId || p.capability !== a.capability ||
     p.beforeSubjectId !== proposal.referenceSubjectId || p.afterSubjectId !== proposal.candidateSubjectId
   ) throw new Error("Isolated routing mutation receipt authority/scope drift detected");
+  await journal.assertFreshRead();
   const event = journal.latest(p.operationId);
   if (!event || event.payload.eventType !== "mutation_committed" || event.eventId !== p.mutationJournalCommitEventId || event.eventSha256 !== p.mutationJournalCommitEventSha256) {
     throw new Error("Isolated routing mutation receipt lacks exact durable commit event");
+  }
+  const expectedFromJournal = receiptPayloadFromCommitEvent(event);
+  if (stableStringify(p) !== stableStringify(expectedFromJournal)) {
+    throw new Error("Isolated routing mutation receipt durable provenance does not exactly match committed journal event");
   }
   const current = await target.read();
   if (current.stateId !== p.afterStateId || current.stateSha256 !== p.afterStateSha256 || current.payload.currentSubjectId !== p.afterSubjectId || current.payload.routeRevision !== p.afterRouteRevision) {
     throw new Error("Isolated routing mutation receipt after-state is no longer authoritative");
   }
+  await journal.assertFreshRead();
 }
 
 export async function verifyRoutingMutationRecoveryReport(report: RoutingMutationRecoveryReport): Promise<void> {
@@ -1042,6 +1064,41 @@ function journalCommonFrom(payload: RoutingMutationJournalPayload): RoutingMutat
   });
 }
 
+function receiptPayloadFromCommitEvent(event: RoutingMutationJournalEvent): IsolatedRoutingMutationReceiptPayload {
+  if (event.payload.eventType !== "mutation_committed") throw new Error("Isolated routing mutation receipt requires durable committed journal event");
+  const p = event.payload;
+  return deepFreeze({
+    operationId: p.operationId,
+    idempotencyKey: p.idempotencyKey,
+    authorizationId: p.authorizationId,
+    authorizationSha256: p.authorizationSha256,
+    proposalId: p.proposalId,
+    proposalSha256: p.proposalSha256,
+    preconditionSnapshotId: p.preconditionSnapshotId,
+    preconditionSnapshotSha256: p.preconditionSnapshotSha256,
+    targetKind: p.targetKind,
+    targetId: p.targetId,
+    projectId: p.projectId,
+    routeId: p.routeId,
+    capability: p.capability,
+    beforeStateId: p.beforeStateId,
+    beforeStateSha256: p.beforeStateSha256,
+    afterStateId: p.afterStateId,
+    afterStateSha256: p.afterStateSha256,
+    beforeSubjectId: p.beforeSubjectId,
+    afterSubjectId: p.afterSubjectId,
+    beforeRouteRevision: p.beforeRouteRevision,
+    afterRouteRevision: p.afterRouteRevision,
+    mutationJournalCommitEventId: event.eventId,
+    mutationJournalCommitEventSha256: event.eventSha256,
+    committedAt: p.committedAt,
+    recoveredAfterRestart: p.recoveredAfterRestart,
+    automaticRetryAllowed: false,
+    automaticRollbackAllowed: false,
+    productionRoutingMutationAllowed: false,
+  });
+}
+
 function validateJournalPayload(payload: RoutingMutationJournalPayload, maxStringBytes: number): void {
   if (!isRecord(payload)) throw new Error("Routing mutation journal payload must be an object");
   if (payload.eventType === "mutation_reserved") assertExactFields(payload, JOURNAL_RESERVATION_FIELDS, "Routing mutation reservation payload");
@@ -1145,10 +1202,14 @@ function utf8ByteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
-async function sha256Canonical(value: unknown): Promise<string> {
+async function sha256Text(value: string): Promise<string> {
   if (!globalThis.crypto?.subtle) throw new Error("Web Crypto SHA-256 is unavailable in this runtime");
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableStringify(value)));
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
+async function sha256Canonical(value: unknown): Promise<string> {
+  return sha256Text(stableStringify(value));
 }
 
 function stableStringify(value: unknown): string {
