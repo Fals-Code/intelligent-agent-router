@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { join } from "node:path";
-import { appendFile, writeFile } from "node:fs/promises";
+import { appendFile, readFile, writeFile } from "node:fs/promises";
 import {
   IsolatedRoutingMutationCoordinator,
   JsonFileIsolatedRoutingTarget,
@@ -439,10 +439,68 @@ test("re-hashed receipt cannot forge durable committed journal provenance fields
     const forged = await rehashReceipt(receipt, { [field]: value });
     await assert.rejects(
       verifyIsolatedRoutingMutationReceipt(forged, fixture.authority, target, journal),
-      /lacks exact durable commit event|durable provenance does not exactly match committed journal event/,
+      /lacks exact durable commit event|durable provenance does not exactly match committed journal event|operation\/idempotency identity is not canonical/,
       `${field} forgery must reject`,
     );
   }
+});
+
+test("self-consistent rehashed journal and receipt cannot forge deterministic operation identity", async (t) => {
+  const fixture = await buildAuthorizedRoutingPromotionFixture(t);
+  const suffix = "self-consistent-operation-forgery";
+  const target = await initializedTarget(fixture.root, fixture.authority, suffix);
+  const journal = await openJournal(fixture.root, suffix);
+  const coordinator = new IsolatedRoutingMutationCoordinator(target, journal);
+  const receipt = await coordinator.apply({
+    authority: fixture.authority,
+    mutatedAt: "2026-08-21T03:07:00.000Z",
+    committedAt: "2026-08-21T03:07:01.000Z",
+  });
+
+  const forgedOperationId = `${receipt.payload.operationId}:forged`;
+  const forgedIdempotencyKey = `${receipt.payload.idempotencyKey}:forged`;
+  const raw = await readFile(journal.filePath, "utf8");
+  const entries = raw.trimEnd().split("\n").map((line) => JSON.parse(line));
+  const rewrittenEntries = [];
+
+  for (const entry of entries) {
+    const payload = {
+      ...entry.event.payload,
+      operationId: forgedOperationId,
+      idempotencyKey: forgedIdempotencyKey,
+    };
+    const eventSha256 = await sha256Canonical(payload);
+    rewrittenEntries.push({
+      ...entry,
+      event: {
+        ...entry.event,
+        eventId: `m5routemutationevent:${eventSha256.slice(0, 32).toLowerCase()}`,
+        eventSha256,
+        payload,
+      },
+    });
+  }
+
+  await writeFile(
+    journal.filePath,
+    `${rewrittenEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+    "utf8",
+  );
+
+  const commitEntry = rewrittenEntries.find((entry) => entry.event.payload.eventType === "mutation_committed");
+  assert.ok(commitEntry);
+  const forgedReceipt = await rehashReceipt(receipt, {
+    operationId: forgedOperationId,
+    idempotencyKey: forgedIdempotencyKey,
+    mutationJournalCommitEventId: commitEntry.event.eventId,
+    mutationJournalCommitEventSha256: commitEntry.event.eventSha256,
+  });
+  const forgedJournal = await openJournal(fixture.root, suffix);
+
+  await assert.rejects(
+    verifyIsolatedRoutingMutationReceipt(forgedReceipt, fixture.authority, target, forgedJournal),
+    /operation\/idempotency identity is not canonical for the exact promotion authorization/,
+  );
 });
 
 test("stale recovered-evidence reader fails closed after a second writer changes durable classification", async (t) => {
