@@ -740,6 +740,10 @@ export async function verifyIsolatedRoutingMutationReceipt(
   if (receipt.receiptSha256 !== expectedDigest || receipt.receiptId !== `m5routemutation:${expectedDigest.slice(0, 32).toLowerCase()}`) throw new Error("Isolated routing mutation receipt content address is invalid");
   const a = authority.authorization.payload;
   const proposal = authority.proposal.payload;
+  const identity = mutationIdentity(authority.authorization.authorizationId);
+  if (p.operationId !== identity.operationId || p.idempotencyKey !== identity.idempotencyKey) {
+    throw new Error("Isolated routing mutation receipt operation/idempotency identity is not canonical for the exact promotion authorization");
+  }
   if (
     p.authorizationId !== authority.authorization.authorizationId || p.authorizationSha256 !== authority.authorization.authorizationSha256 ||
     p.proposalId !== authority.proposal.proposalId || p.proposalSha256 !== authority.proposal.proposalSha256 ||
