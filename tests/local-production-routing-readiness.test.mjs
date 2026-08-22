@@ -279,10 +279,21 @@ test("manual rollback rehearsal classification fails closed", async (t) => {
 test("stale local-production target snapshot rejects authorization after approval", async (t) => {
   const ready = await buildReadyContext(t, "target-drift");
   const proposal = await prepareLocalProductionRoutingReadinessProposal({ context: ready.context, proposal: proposalInput() });
+  const target = ready.targetSnapshot.payload;
   const drifted = await prepareLocalProductionRoutingTargetSnapshot({
-    ...ready.targetSnapshot.payload,
+    installationId: target.installationId,
+    projectId: target.projectId,
+    routeId: target.routeId,
+    capability: target.capability,
+    currentSubjectId: target.currentSubjectId,
     routeRevision: "route-revision:drifted-after-readiness",
+    canonicalStateOwner: target.canonicalStateOwner,
+    writeBoundary: target.writeBoundary,
+    persistenceCategory: target.persistenceCategory,
+    runtimeId: target.runtimeId,
+    restartPolicyReference: target.restartPolicyReference,
     capturedAt: "2026-08-21T03:14:30.000Z",
+    policyReferences: target.policyReferences,
   });
   const workflow = r4Workflow(ready.fixture.authorization.payload.projectId);
   await assert.rejects(
