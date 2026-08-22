@@ -238,6 +238,10 @@ export async function buildLocalProductionAdapterRehearsalFixture(t, suffix = "r
     descriptor: { targetKind: "local_production_router", targetId: productionTargetId, stateFilePath: productionPath },
     maxStateBytes: 128 * 1024,
   });
+
+  // One canonical immutable production pre-fingerprint is captured before the writable clone exists.
+  const productionPreFingerprint = await productionTarget.fingerprint("2026-08-21T03:16:45.000Z");
+
   const rehearsalDescriptor = {
     targetKind: "local_production_rehearsal_clone",
     targetId: `local-production-rehearsal:${readinessAuthorization.authorizationId}:${suffix}`,
@@ -265,6 +269,7 @@ export async function buildLocalProductionAdapterRehearsalFixture(t, suffix = "r
     productionPath,
     productionState,
     productionTarget,
+    productionPreFingerprint,
     rehearsalDescriptor,
     rehearsalTarget,
     rehearsalJournal,
