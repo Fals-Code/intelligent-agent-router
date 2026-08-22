@@ -205,6 +205,47 @@ test("NEGATIVE SCOPE: rehashed wrong project/route/capability/reference/candidat
   await assert.rejects(proposal(r, { candidateRouteRevision: r.productionPreFingerprint.payload.routeRevision }), /candidate.*differ/i);
 });
 
+test("NEGATIVE PROPOSAL VERIFIER: rehashed provider-specific fields, reference-collapsed candidate, and stale proposal timestamp remain invalid", async (t) => {
+  const r = await buildLocalProductionRoutingApplyFixture(t, "proposal-verifier-negative");
+  const p = await proposal(r);
+
+  const unknownField = await rehashEnvelope(
+    p,
+    { ...p.payload, providerRouteHint: "provider-specific-route" },
+    "m5localprodapplyproposal",
+    "proposalId",
+    "proposalSha256",
+  );
+  await assert.rejects(
+    verifyLocalProductionRoutingApplyProposal(unknownField, r.context),
+    /unknown|provider-specific|missing/i,
+  );
+
+  const collapsedCandidate = await rehashEnvelope(
+    p,
+    { ...p.payload, candidateSubjectId: r.productionPreFingerprint.payload.currentSubjectId },
+    "m5localprodapplyproposal",
+    "proposalId",
+    "proposalSha256",
+  );
+  await assert.rejects(
+    verifyLocalProductionRoutingApplyProposal(collapsedCandidate, r.context),
+    /candidate.*differ/i,
+  );
+
+  const staleTimestamp = await rehashEnvelope(
+    p,
+    { ...p.payload, proposedAt: r.backupEvidence.payload.capturedAt },
+    "m5localprodapplyproposal",
+    "proposalId",
+    "proposalSha256",
+  );
+  await assert.rejects(
+    verifyLocalProductionRoutingApplyProposal(staleTimestamp, r.context),
+    /follow final evidence snapshot|proposal.*evidence/i,
+  );
+});
+
 test("NEGATIVE HISTORICAL AUTHORITY: stale Issue #44 readiness authority and wrong Issue #46 rehearsal receipt fail closed", async (t) => {
   const r = await buildLocalProductionRoutingApplyFixture(t, "historical-negative");
   const staleReadiness = {
