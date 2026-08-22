@@ -37,9 +37,9 @@ The verifier accepts a verification root plus a JSON manifest using schema versi
 
 Schema v1 is intentionally closed-world: unknown fields, malformed identity values, duplicate artifact names, duplicate artifact paths, or an empty artifact set fail closed.
 
-Artifact paths are untrusted input and must be portable root-relative paths. Absolute paths, `..`, `.`, backslashes, drive-colon forms, empty path segments, control characters, trailing-space segments, and trailing-dot segments are rejected. Artifact paths are case-insensitively unique so the same manifest has unambiguous behavior on Windows and Ubuntu.
+Artifact paths are untrusted input and must be portable root-relative paths. Absolute paths, `..`, `.`, backslashes, drive-colon forms, empty path segments, control characters, trailing-space segments, trailing-dot segments, and Windows-invalid filename characters (`<`, `>`, `"`, `|`, `?`, `*`) are rejected. Each path segment also rejects the Windows reserved device basenames `CON`, `PRN`, `AUX`, `NUL`, `COM1` through `COM9`, and `LPT1` through `LPT9`, case-insensitively and including extension forms such as `CON.json` or `nested/LPT9.proof`. Ordinary names that only contain those strings, such as `console.json`, `auxiliary.txt`, or `company1.log`, remain valid. Artifact paths are case-insensitively unique so the same manifest has unambiguous behavior on Windows and Ubuntu.
 
-The verifier rejects symbolic-link artifacts and also resolves the real artifact path before reading bytes so a parent-directory symlink cannot escape the supplied verification root.
+The verifier rejects direct symbolic-link artifacts. It also resolves the real artifact path before reading bytes, so a parent-directory symlink or junction cannot make an outside-root artifact PASS even when the outside artifact's bytes and digest exactly match the manifest.
 
 ## Output contract
 
@@ -65,15 +65,29 @@ Build first, then invoke the offline wrapper with exactly two arguments:
 node scripts/verify-release-evidence-artifacts.mjs <verification-root> <manifest.json>
 ```
 
-The wrapper writes one JSON result to stdout. Exit code `0` means `PASS`; exit code `1` means fail-closed verification or invalid invocation/input.
+The wrapper writes exactly one JSON result line to stdout. Exit code `0` means `PASS`; exit code `1` means fail-closed verification or invalid invocation/input. Invalid CLI arguments, malformed manifest JSON, and unreadable manifest input each have stable machine-readable reason codes. Subprocess tests also verify that identical valid invocations produce byte-identical stdout and that raw artifact-content sentinels never appear in stdout or stderr.
 
-The wrapper uses only local filesystem reads plus the compiled core verifier. GitHub/API/network access is not part of the verification path.
+The wrapper uses only local filesystem reads plus the compiled core verifier. GitHub/API/network access is not part of the verification path. The offline acceptance test preloads fail-fast tripwires for global `fetch`, `node:http` / `node:https` request functions, `node:net` connections, and `node:tls` connections; a valid local fixture must still PASS with exit `0` and zero tripwire hits.
+
+## Filesystem containment evidence
+
+Behavioral tests cover the containment boundary directly:
+
+- a direct artifact symlink fails with `ARTIFACT_SYMLINK_FORBIDDEN`;
+- a parent-directory symlink or Windows junction resolving outside the verification root fails with `ARTIFACT_PATH_ESCAPES_ROOT`;
+- an outside-root artifact cannot PASS through path indirection even when its bytes and digest are exact;
+- an ordinary nested regular file inside the verification root PASSes.
+
+Symlink creation is treated as required test capability. If the execution environment cannot create the required link/junction, the test reports an explicit `SYMLINK_TEST_ENVIRONMENT_LIMITATION` failure rather than silently converting missing evidence into PASS.
 
 ## Failure semantics
 
 Representative reason codes include:
 
 ```text
+CLI_ARGUMENTS_INVALID
+MANIFEST_INPUT_UNREADABLE
+MANIFEST_JSON_INVALID
 INVALID_MANIFEST
 DUPLICATE_ARTIFACT_NAME
 DUPLICATE_ARTIFACT_PATH

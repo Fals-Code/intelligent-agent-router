@@ -332,11 +332,18 @@ function strictArtifactPath(value: unknown): string {
       || segment.endsWith(" ")
       || segment.endsWith(".")
       || /[\u0000-\u001f\u007f]/.test(segment)
+      || /[<>"|?*]/.test(segment)
+      || isWindowsReservedArtifactSegment(segment)
     )
   ) {
     throw new ManifestValidationError("INVALID_ARTIFACT_PATH");
   }
   return value;
+}
+
+function isWindowsReservedArtifactSegment(segment: string): boolean {
+  const baseName = segment.split(".", 1)[0].toUpperCase();
+  return /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(baseName);
 }
 
 function assertVerificationRoot(value: string): string {
