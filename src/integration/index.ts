@@ -9,3 +9,4 @@ export * from "./bounded-live-side-effect-journal.js";
 export * from "./runtime-backed-deferred-bounded-live-execution.js";
 export * from "./opencode-bounded-live-output-reader.js";
 export * from "./isolated-loopback-bounded-live-sink-client.js";
+export * from "./isolated-routing-mutation.js";
