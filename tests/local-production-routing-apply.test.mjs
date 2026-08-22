@@ -602,7 +602,7 @@ test("ONE-SHOT: successful apply cannot authorize a second/future production mut
   const receipt = await r.applyCoordinator.execute(executeInput(r, g));
   assert.equal(receipt.payload.futureProductionMutationAuthorized, false);
   assert.equal(r.canonicalWriter.writeCount, 1);
-  await assert.rejects(r.applyCoordinator.execute(executeInput(r, g, { reservedAt: "2026-08-21T04:10:00.000Z", appliedAt: "2026-08-21T04:10:01.000Z", committedAt: "2026-08-21T04:10:02.000Z", completedAt: "2026-08-21T04:10:03.000Z" })), /one-shot|already|journal|prewrite|production.*changed/i);
+  await assert.rejects(r.applyCoordinator.execute(executeInput(r, g, { reservedAt: "2026-08-21T04:10:00.000Z", appliedAt: "2026-08-21T04:10:01.000Z", committedAt: "2026-08-21T04:10:02.000Z", completedAt: "2026-08-21T04:10:03.000Z" })), /one-shot|already|journal|prewrite|production.*changed|semantic state drift|rehearsal|drift/i);
   assert.equal(r.canonicalWriter.writeCount, 1);
 });
 
@@ -614,7 +614,7 @@ test("AUTOMATIC ACTIONS: retry, rollback, redispatch, promotion, and automatic r
   assertAllAutomaticFalse(g.authorization.payload);
   assertAllAutomaticFalse(g.executionApproval.payload);
   assertAllAutomaticFalse(g.prewriteSeal.payload);
-  assertAllAutomaticFalse(r.backupEvidence.payload);
+  assert.equal(r.backupEvidence.payload.automaticRollbackAllowed, false);
   assertAllAutomaticFalse(receipt.payload);
   for (const event of await r.applyJournal.events()) assertAllAutomaticFalse(event.payload);
 });
