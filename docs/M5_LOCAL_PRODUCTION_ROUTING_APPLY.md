@@ -2,185 +2,266 @@
 
 ## Status
 
-This document starts the source-first implementation of Issue #48 after merged PR #47 / closed Issue #46.
+This document describes the Issue #48 implementation in Draft PR #49 after merged PR #47 / closed Issue #46.
 
-The current branch implements only the **authority + final pre-write seal boundary**. It does **not** execute a production write, does not register a production writer, and does not claim the full Issue #48 execution/recovery gate is complete yet.
+The implementation now contains the complete **isolated implementation mechanism** for one bounded local-production routing transition: exact authority, fresh backup capture, one canonical writer, fsync-backed reservation/commit evidence, interruption/restart reconciliation, and a context-bound final receipt.
 
-That sequencing is intentional: the first implementation step proves that an exact one-shot production mutation cannot even become write-eligible without a fresh evidence chain and a separate explicit execution approval.
+**This PR does not perform a real production apply.** All writer and recovery execution in this branch is exercised only against isolated temporary fixtures. Merging this implementation still does not authorize a later production write.
 
 ## Frozen architecture constraints
 
-The frozen Architecture Contract remains authoritative:
+The implementation keeps the frozen contract invariants unchanged:
 
 - no evidence, no success;
 - R4 activity requires explicit human approval plus backup/rollback evidence;
 - approvals are durable workflow state;
-- writes must be attributable to run/tool/approval evidence;
-- one canonical writer per state domain by default;
-- provider-specific failures remain at adapter boundaries;
-- long-lived unrestricted credentials do not reach autonomous workers;
-- M5 may adapt only inside fixed safety policy;
-- M6 remains deferred.
+- every production write must be attributable to exact run/tool/approval evidence;
+- exactly one canonical writer owns the production routing state domain;
+- provider-specific failure remains at the adapter boundary;
+- unrestricted long-lived credentials never enter autonomous worker/core state;
+- machine/restart recovery reconciles durable state instead of blindly replaying side effects;
+- M5 adaptation occurs only inside fixed safety policy;
+- M6 autonomous self-optimization remains deferred.
 
-## Source-first findings
+The following values remain hard-coded false across proposal, authorization, execution approval, pre-write seal, journal, and final receipt:
 
-The implementation reuses the already-merged contracts instead of duplicating them:
-
-1. `LocalProductionRoutingReadinessAuthorization` remains historical readiness evidence only. Its production mutation flag is still false.
-2. `LocalProductionAdapterRehearsalReceipt` remains rehearsal proof only. It is re-verified against its historical authority, journal, clone, and read-only production fingerprint.
-3. A fresh current target snapshot and fresh current adapter/main source snapshot are separate Issue #48 authorities.
-4. The production target remains represented by `JsonFileLocalProductionReadOnlyTarget` in this initial slice.
-5. The new Issue #48 boundary creates a separate one-shot R4 production-apply authorization and a later explicit `apply now` execution approval.
-6. The final artifact in this first slice is a content-addressed pre-write seal with `productionWritePerformed=false`.
-
-## Authority chain implemented in this first slice
-
-`verified historical rehearsal receipt -> fresh current target/source snapshot -> fresh immutable production pre-fingerprint -> fresh backup evidence -> exact production-apply proposal -> durable R4 authorization -> separate explicit apply-now approval -> fresh live production re-fingerprint -> pre-write seal`
-
-The pre-write seal is the stopping point in this branch stage.
-
-No file write to the production route is performed after the seal.
-
-## Backup evidence contract
-
-`LocalProductionRoutingApplyBackupEvidence` binds:
-
-- backup identity + SHA-256;
-- exact production target identity;
-- exact semantic state ID/SHA-256;
-- exact raw production file SHA-256;
-- retention policy reference;
-- restore procedure reference;
-- independent evidence references;
-- `backupIntegrityVerified=true`;
-- `restoreProcedureRehearsed=true`;
-- `retainedForManualRecovery=true`;
-- `automaticRollbackAllowed=false`.
-
-Unknown/provider-specific fields fail closed.
-
-This initial slice verifies backup evidence supplied by the trusted boundary. It does not yet add the later narrow backup writer/capture mechanism that the final Issue #48 implementation will require before execution.
-
-## Production-apply proposal
-
-`LocalProductionRoutingApplyProposal` binds one exact transition:
-
-- historical readiness authorization identity/SHA through the rehearsal receipt;
-- exact verified rehearsal receipt identity/SHA;
-- fresh current target snapshot;
-- fresh current adapter/main source snapshot;
-- exact current production pre-fingerprint;
-- exact reference subject + revision;
-- exact candidate subject + candidate revision;
-- exact fresh backup evidence;
-- Run Ledger references;
-- trace references;
-- policy references.
-
-The proposal hard-codes:
-
-- `productionRoutingMutationAuthorized=false`;
 - `automaticRoutingMutationAllowed=false`;
 - `automaticRetryAllowed=false`;
 - `automaticRollbackAllowed=false`;
 - `automaticRedispatchAllowed=false`;
 - `automaticPromotionAllowed=false`.
 
-The candidate must differ from the exact current reference state.
+## Source-first reuse
 
-## Fresh R4 production-apply authorization
+Issue #48 extends rather than replaces the merged evidence chain:
 
-`LocalProductionRoutingApplyAuthorization` is separate from both Issue #44 readiness authority and Issue #46 rehearsal evidence.
+1. `LocalProductionRoutingReadinessAuthorization` remains historical Issue #44 implementation-readiness authority only. It still cannot authorize production mutation.
+2. `LocalProductionAdapterRehearsalReceipt` remains Issue #46 rehearsal proof only.
+3. Fresh Issue #48 target/source snapshots, production pre-fingerprint, backup evidence, R4 authorization, and explicit execution approval are separate authorities.
+4. `LocalProductionRouterState` and `LocalProductionRouterFingerprint` remain the normalized provider-neutral canonical state/fingerprint formats.
+5. Recovery verifies historical rehearsal provenance without requiring the current production bytes to still equal the pre-apply bytes after a legitimate one-shot apply.
 
-For an `allow` decision it requires:
+## Implemented authority chain
 
-- exact proposal verification;
-- exact project-scoped R4 workflow;
-- workflow phase `approval` or `publish`;
-- active workflow status;
-- approval IDs equal to durable workflow approval IDs;
-- decision timestamp strictly after the final proposal snapshot.
+The implementation binds this exact chain:
 
-Only this exact one-shot authorization may set `productionRoutingMutationAuthorized=true`.
+`verified Issue #46 rehearsal receipt -> fresh current target/source -> immutable production pre-fingerprint -> fresh content-addressed backup -> exact proposal -> durable R4 authorization -> separate apply-now approval -> fresh target/source observations -> fresh pre-write seal -> durable reservation -> exactly one canonical write -> read-back/fingerprint verification -> durable commit -> context-bound final receipt`
 
-It still hard-codes every automatic mutation/retry/rollback/redispatch/promotion flag false.
+Any pre-write drift stops before a writer is reached. Any ambiguous state after reservation/write stops automatic activity and enters manual reconciliation.
 
-## Separate explicit execution approval
+## Fresh content-addressed backup
 
-Implementation approval is not execution approval.
+`JsonFileLocalProductionRoutingApplyBackupStore` is an exact-target backup boundary used by the implementation and isolated tests.
 
-`LocalProductionRoutingApplyExecutionApproval` is an additional one-shot content-addressed artifact. It requires:
+Before a reservation it:
 
-- an already-valid exact `allow` production-apply authorization;
-- `explicitApplyNow=true`;
-- a timestamp strictly later than the R4 production-apply authorization;
-- the exact operation/proposal/authorization/target/pre-fingerprint/candidate binding.
+- reads the exact production pre-state;
+- computes/verifies the exact semantic state and raw-file SHA-256;
+- stores the raw bytes under a content-addressed object key derived from the raw SHA-256;
+- fsyncs the backup file;
+- verifies the persisted backup bytes and normalized semantic state;
+- binds backup store ID, object key, byte length, semantic state ID/SHA, raw SHA, retention policy, restore procedure, and restore-rehearsal evidence;
+- retains the backup for explicit manual recovery;
+- grants no automatic rollback authority.
 
-This is the contract hook for the final operator confirmation required immediately before a future real apply.
+The backup store is physically distinct from the production target. Existing backup paths that physically alias the production file are rejected.
 
-No such live execution approval is created or used by this development task.
+## Narrow canonical writer and single-writer boundary
 
-## Fresh pre-write seal
+`CanonicalLocalProductionRoutingWriter` is intentionally not a generic filesystem writer.
 
-`prepareLocalProductionRoutingApplyPrewriteSeal()` verifies the complete chain again and then re-fingerprints the read-only production target.
+Its descriptor binds exactly:
 
-The fresh live fingerprint must still match the exact proposal/authorization production pre-fingerprint, including raw bytes.
+- one production target ID;
+- one project;
+- one route;
+- one capability;
+- one write-boundary ID;
+- one exact state file path;
+- `singleWriter=true`.
 
-The resulting seal binds:
+The writer captures physical target identity and checks it again at the final write boundary. Candidate state must pass the existing normalized `LocalProductionRouterState` schema and cannot contain provider-specific state, raw provider output, or secret material.
 
-- exact deterministic operation ID;
-- proposal + authorization;
-- explicit execution approval;
-- exact production target;
-- exact semantic and raw-file fingerprint;
-- exact current source snapshot;
-- exact backup evidence;
-- observation timestamp;
-- `productionWritePerformed=false`;
-- all automatic mutation flags false.
+The write sequence is:
 
-A stale or changed production file therefore fails before any future production writer could be reached.
+1. verify exact pre-fingerprint;
+2. build/verify exact normalized candidate;
+3. stage candidate bytes to a bounded sibling temporary file;
+4. fsync staged bytes;
+5. verify staged bytes + semantic state;
+6. re-check physical target identity and exact live pre-fingerprint;
+7. perform one atomic replacement of the exact target path;
+8. read back and verify exact candidate semantic state + raw bytes.
 
-## Initial negative-first coverage
+The writer instance is one-shot. `LocalProductionRoutingSingleWriterBoundary` rejects any second/co-primary writer registration.
 
-The new tests currently prove:
+## Durable fsync-backed apply journal
 
-- exact R4 authorization + explicit apply-now approval can produce a pre-write seal while production bytes remain unchanged;
-- deny authorization cannot produce execution approval;
-- R4 authorization predating the final proposal is rejected;
-- `explicitApplyNow=false` is rejected;
-- raw-byte production drift after authorization is rejected at the pre-write seal;
-- provider-specific/unknown backup fields are rejected;
-- automatic rollback authority in backup evidence is rejected;
-- unverified fresh source evidence is rejected;
-- a re-hashed attempt to forge automatic retry authority is rejected.
+`JsonlLocalProductionRoutingApplyJournal` stores append-only JSONL evidence.
 
-## Intended full Issue #48 scope
+Each persisted entry has:
 
-After source-first inspection, the intended branch scope is kept narrow around these files:
+- monotonic sequence;
+- previous-entry SHA-256;
+- content-addressed event;
+- entry SHA-256;
+- file fsync before append returns.
 
-- `docs/M5_LOCAL_PRODUCTION_ROUTING_APPLY.md`;
-- `src/evaluation/index.ts`;
-- `src/evaluation/local-production-routing-apply.ts`;
-- `tests/local-production-routing-apply-fixture.mjs`;
-- `tests/local-production-routing-apply.test.mjs`.
+A stale reader detects external/second-writer journal changes before any append/read operation. Reopen fails closed on partial/truncated JSON, sequence drift, broken hash chain, or event hash tamper.
 
-The same source/test files may grow to add the remaining journal/writer/recovery/receipt phases. Scope expansion requires explicit re-inspection and re-freeze.
+The canonical progression is bounded to:
 
-## Remaining implementation before Issue #48 can become Ready
+- `apply_reserved` first;
+- then exactly one of:
+  - `apply_committed`,
+  - `not_applied_safe`,
+  - `manual_reconciliation_required`;
+- a later manual event may follow an already committed apply only when later verification proves the production state is no longer exact/verifiable.
 
-This branch is **not Ready** yet. The following still must be implemented and reviewed before the PR may leave Draft:
+No commit or terminal event may exist without a reservation. No committed operation can be replayed as a second automatic write.
 
-1. a single narrow canonical production writer with physical target identity sealing;
-2. fresh backup capture/integrity mechanics against isolated fixtures;
-3. fsync-backed production apply reservation/commit journal;
-4. one-write interruption and restart reconciliation;
-5. fail-closed manual reconciliation on ambiguous/unreadable production after reservation/write;
-6. final context-bound `APPLIED_VERIFIED` receipt;
-7. the full Issue #48 mandatory negative-first matrix;
-8. exact-head Ubuntu + Windows CI;
-9. `npm run check` + `npm run eval`;
-10. independent exact-head review;
-11. zero unresolved threads and branch behind main = 0.
+## Reservation-before-side-effect
 
-Even after that implementation PR eventually merges, **no real production apply occurs automatically**. A later execution step still requires fresh exact evidence and explicit operator instruction for that exact apply.
+`LocalProductionRoutingApplyCoordinator.execute()` re-verifies the exact pre-write seal and checks that the operation has no existing durable journal state.
+
+It then:
+
+1. derives the exact candidate state and deterministic operation/idempotency ID;
+2. appends + fsyncs `apply_reserved` with `productionWriteObserved=NO`;
+3. only after durable reservation calls the canonical writer;
+4. reads back exact production candidate state/fingerprint;
+5. appends + fsyncs `apply_committed`;
+6. creates and verifies the final receipt.
+
+There is no retry loop and no automatic rollback path.
+
+## Interruption and restart reconciliation
+
+Two explicit interruption points are covered:
+
+- after durable reservation but before write;
+- after one production write but before durable commit.
+
+Recovery never invokes the writer.
+
+For the exact bound operation:
+
+- reservation + exact original production pre-state => append durable `NOT_APPLIED_SAFE`;
+- reservation + exact authorized candidate => append recovered commit and return `APPLIED_VERIFIED` without another write;
+- durable commit + exact candidate => remain `APPLIED_VERIFIED`;
+- unexpected, malformed, deleted, unreadable, or otherwise unverifiable production state => append/retain `MANUAL_RECONCILIATION_REQUIRED` where journal integrity permits;
+- later drift after a durable commit => `MANUAL_RECONCILIATION_REQUIRED`, with no automatic rollback.
+
+A corrupt apply journal itself fails closed and cannot be silently repaired/replayed.
+
+## Final receipt
+
+`LocalProductionRoutingApplyReceipt` has exactly one classification:
+
+- `NOT_APPLIED_SAFE`;
+- `APPLIED_VERIFIED`;
+- `MANUAL_RECONCILIATION_REQUIRED`.
+
+The receipt binds:
+
+- deterministic operation/idempotency identity;
+- production target/project/route/capability;
+- exact reference and candidate state IDs/SHA/revisions;
+- production pre/post semantic + raw-byte fingerprints;
+- reservation/commit/terminal event IDs + SHA-256;
+- journal progression SHA-256;
+- Issue #44 readiness authorization;
+- Issue #46 rehearsal receipt;
+- Issue #48 proposal, R4 authorization, explicit execution approval, and pre-write seal;
+- current adapter/main source identity;
+- fresh backup identity/integrity evidence;
+- workflow + human approval identities/timestamps;
+- Run Ledger + trace references;
+- recovery status.
+
+`productionRouteMutated=true` is valid only for `APPLIED_VERIFIED`.
+
+Every receipt sets:
+
+- `oneShotConsumed=true`;
+- `productionRoutingMutationAuthorizedForThisOperation=true`;
+- `futureProductionMutationAuthorized=false`;
+- all automatic authority flags false.
+
+Receipt verification is not a self-hash check. It rebinds the receipt to the current durable journal and, for safe/applied classifications, the current exact production state.
+
+## Negative-first matrix
+
+The Issue #48 tests exercise isolated fixtures for:
+
+- missing/deny/stale apply authorization;
+- R4 approval created before/equal to final proposal snapshot;
+- rehashed wrong project/route/capability/reference/target/backup/writer bindings;
+- stale/forged historical Issue #44 readiness authority;
+- invalid/wrong Issue #46 rehearsal receipt;
+- unverified or changed adapter/main source;
+- semantic production drift before pre-write;
+- raw-byte-only production drift;
+- drift between pre-write seal and reservation/write;
+- stale/mismatched/missing/tampered backup proof;
+- second/co-primary writer ambiguity;
+- broadened writer path/scope;
+- physical backup aliasing;
+- provider-specific extra fields;
+- secret-like material;
+- forged automatic authority flags;
+- forged operation transfer;
+- stale journal reader/second writer;
+- partial/truncated/tampered journal;
+- crash after reservation before write;
+- crash after write before commit;
+- stable restart from exact committed candidate;
+- unexpected/malformed/deleted production during recovery;
+- post-commit drift requiring manual reconciliation;
+- receipt context/provenance forgery;
+- attempted second/future application;
+- automatic retry/rollback/redispatch/promotion/routing mutation invariants.
+
+The tests also assert that production, backup, and apply-journal paths are rooted under temporary isolated fixture directories.
+
+## Development vs execution authority
+
+The fixture’s explicit `apply now` approval exists only to exercise the implementation mechanism against isolated temporary files.
+
+It is **not** an instruction to apply the user’s real production route.
+
+A real execution remains a separate post-merge gate and requires, at execution time:
+
+1. implementation merged to current `main`;
+2. exact approved implementation/source still current;
+3. exact target still equals the approved reference precondition;
+4. a newly captured fresh backup + integrity proof;
+5. verified Issue #46 rehearsal provenance;
+6. a newly prepared exact production-apply proposal;
+7. fresh durable R4 human approval created after final evidence;
+8. exact one-shot authorization;
+9. no conflicting writer;
+10. explicit operator instruction for **that exact apply now**;
+11. a final fresh pre-write seal immediately before reservation/write.
+
+If any one of those conditions fails, the production writer must not run.
+
+## PR #49 readiness gate
+
+PR #49 must remain Draft until all of the following are true on the same exact HEAD:
+
+- frozen changed-file scope remains exactly the five Issue #48 files;
+- `npm run check` passes;
+- `npm run eval` passes;
+- required Ubuntu and Windows CI pass;
+- the negative-first/interruption/recovery matrix actually executes;
+- no test touches the real production route;
+- independent exact-head review is `APPROVE`;
+- unresolved review threads = 0;
+- branch is behind current `main` by 0;
+- no provider credential persistence;
+- no second PRIMARY writer;
+- no automatic mutation/retry/rollback/redispatch/promotion;
+- no M6 behavior.
+
+Only after those implementation gates pass may the PR be considered for Ready status. Ready/merge still does not constitute a production execution instruction.
