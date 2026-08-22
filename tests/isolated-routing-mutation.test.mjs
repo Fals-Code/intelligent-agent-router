@@ -342,7 +342,7 @@ test("forged promotion authorization cannot disable explicit mutation authority 
       mutatedAt: "2026-08-21T03:07:00.000Z",
       committedAt: "2026-08-21T03:07:01.000Z",
     }),
-    /decision\/eligibility state is invalid|requires explicit allowed routing promotion authorization|scope drift/,
+    /authority flags are invalid|decision\/eligibility state is invalid|requires explicit allowed routing promotion authorization|scope drift/,
   );
   assert.equal(journal.inspect().eventCount, 0);
   assert.equal((await target.read()).payload.mutationCount, 0);
