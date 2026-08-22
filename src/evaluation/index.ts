@@ -15,3 +15,4 @@ export * from "./bounded-experiment-executor.js";
 export * from "./shadow-experiment-provenance.js";
 export * from "./bounded-live-sample-authorization.js";
 export * from "./routing-promotion.js";
+export * from "./local-production-routing-readiness.js";
