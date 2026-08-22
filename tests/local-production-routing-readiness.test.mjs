@@ -105,7 +105,7 @@ async function buildReadyContext(t, suffix = "readiness") {
     filesystemScopeId: "scope:local-routing-config-file",
     networkEgressScopeId: "scope:loopback-local-router-only",
     adapterWriteScopeId: "scope:exact-project-route-capability",
-    evidenceReferences: ["evidence:credential-scope-audit", "evidence:adapter-write-scope-audit"],
+    evidenceReferences: ["evidence:adapter-write-scope-audit", "evidence:credential-scope-audit"],
     credentialScopeVerified: true,
     autonomousWorkerLongLivedSecretAccess: false,
     exactTargetOnly: true,
