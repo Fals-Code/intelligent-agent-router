@@ -414,6 +414,102 @@ test("routing mutation journal partial write is detected on restart", async (t) 
   );
 });
 
+test("re-hashed receipt cannot forge durable committed journal provenance fields", async (t) => {
+  const fixture = await buildAuthorizedRoutingPromotionFixture(t);
+  const target = await initializedTarget(fixture.root, fixture.authority, "provenance-forgery");
+  const journal = await openJournal(fixture.root, "provenance-forgery");
+  const coordinator = new IsolatedRoutingMutationCoordinator(target, journal);
+  const receipt = await coordinator.apply({
+    authority: fixture.authority,
+    mutatedAt: "2026-08-21T03:07:00.000Z",
+    committedAt: "2026-08-21T03:07:01.000Z",
+  });
+
+  const forgeries = [
+    ["operationId", `${receipt.payload.operationId}:forged`],
+    ["idempotencyKey", `${receipt.payload.idempotencyKey}:forged`],
+    ["beforeStateId", `${receipt.payload.beforeStateId}:forged`],
+    ["beforeStateSha256", "0".repeat(64)],
+    ["beforeRouteRevision", `${receipt.payload.beforeRouteRevision}:forged`],
+    ["committedAt", "2026-08-21T03:07:02.000Z"],
+    ["recoveredAfterRestart", true],
+  ];
+
+  for (const [field, value] of forgeries) {
+    const forged = await rehashReceipt(receipt, { [field]: value });
+    await assert.rejects(
+      verifyIsolatedRoutingMutationReceipt(forged, fixture.authority, target, journal),
+      /lacks exact durable commit event|durable provenance does not exactly match committed journal event/,
+      `${field} forgery must reject`,
+    );
+  }
+});
+
+test("stale recovered-evidence reader fails closed after a second writer changes durable classification", async (t) => {
+  const fixture = await buildAuthorizedRoutingPromotionFixture(t);
+  const suffix = "stale-recovered-evidence";
+  const target = await initializedTarget(fixture.root, fixture.authority, suffix);
+  const journal = await openJournal(fixture.root, suffix);
+  const coordinator = new IsolatedRoutingMutationCoordinator(target, journal);
+
+  await assert.rejects(
+    coordinator.apply({
+      authority: fixture.authority,
+      mutatedAt: "2026-08-21T03:07:00.000Z",
+      committedAt: "2026-08-21T03:07:01.000Z",
+      faultInjector: { hit(point) { if (point === "after_apply_before_commit") throw new Error("INJECTED_CRASH_FOR_STALE_EVIDENCE"); } },
+    }),
+    /INJECTED_CRASH_FOR_STALE_EVIDENCE/,
+  );
+
+  const recoveryTarget = await reopenedTarget(fixture.root, fixture.authority, suffix);
+  const recoveryJournal = await openJournal(fixture.root, suffix);
+  const recoveryCoordinator = new IsolatedRoutingMutationCoordinator(recoveryTarget, recoveryJournal);
+  const report = await recoveryCoordinator.reconcile({
+    authority: fixture.authority,
+    observedAt: "2026-08-21T03:08:00.000Z",
+  });
+  assert.equal(report.payload.classification, "COMMITTED");
+
+  const evidenceTarget = await reopenedTarget(fixture.root, fixture.authority, suffix);
+  const staleJournal = await openJournal(fixture.root, suffix);
+  const recoveredReceipt = await recoverCommittedIsolatedRoutingMutationReceipt(
+    fixture.authority,
+    evidenceTarget,
+    staleJournal,
+  );
+
+  const secondWriter = await openJournal(fixture.root, suffix);
+  await secondWriter.recordManual({
+    operationId: recoveredReceipt.payload.operationId,
+    observedAt: "2026-08-21T03:09:00.000Z",
+    reason: "Independent durable classification changed after verifier opened.",
+  });
+
+  const stalePattern = /changed since this reader opened|reopen before evidence verification/;
+  await assert.rejects(
+    verifyIsolatedRoutingMutationReceipt(recoveredReceipt, fixture.authority, evidenceTarget, staleJournal),
+    stalePattern,
+  );
+  await assert.rejects(
+    recoverCommittedIsolatedRoutingMutationReceipt(fixture.authority, evidenceTarget, staleJournal),
+    stalePattern,
+  );
+  await assert.rejects(
+    recoveredIsolatedRoutingMutationToEvidence(
+      fixture.authority,
+      evidenceTarget,
+      staleJournal,
+      "2026-08-21T03:10:00.000Z",
+    ),
+    stalePattern,
+  );
+
+  const freshJournal = await openJournal(fixture.root, suffix);
+  assert.equal(freshJournal.inspect().manualReconciliationOperationIds.length, 1);
+  assert.equal((await evidenceTarget.read()).payload.mutationCount, 1);
+});
+
 test("receipt semantic re-hash cannot forge automatic retry authority", async (t) => {
   const fixture = await buildAuthorizedRoutingPromotionFixture(t);
   const target = await initializedTarget(fixture.root, fixture.authority, "forged-receipt");
@@ -485,6 +581,17 @@ async function rehashProposal(proposal, overrides) {
     ...proposal,
     proposalId: `m5routeproposal:${proposalSha256.slice(0, 32).toLowerCase()}`,
     proposalSha256,
+    payload,
+  };
+}
+
+async function rehashReceipt(receipt, overrides) {
+  const payload = { ...receipt.payload, ...overrides };
+  const receiptSha256 = await sha256Canonical(payload);
+  return {
+    ...receipt,
+    receiptId: `m5routemutation:${receiptSha256.slice(0, 32).toLowerCase()}`,
+    receiptSha256,
     payload,
   };
 }
