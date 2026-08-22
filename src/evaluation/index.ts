@@ -17,3 +17,4 @@ export * from "./bounded-live-sample-authorization.js";
 export * from "./routing-promotion.js";
 export * from "./local-production-routing-readiness.js";
 export * from "./local-production-adapter-rehearsal.js";
+export * from "./local-production-routing-apply.js";
