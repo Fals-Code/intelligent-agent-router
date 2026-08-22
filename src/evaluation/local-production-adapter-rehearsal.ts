@@ -5,10 +5,11 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import type { WorkflowRun } from "../control-plane/contracts.js";
 import type {
   LocalProductionRoutingReadinessAuthorization,
@@ -216,6 +217,11 @@ export interface LocalProductionRehearsalJournalVerificationContext {
   readonly productionPreFingerprint: LocalProductionRouterFingerprint;
   readonly productionTargetId: string;
   readonly rehearsalTargetId: string;
+}
+
+export interface LocalProductionRehearsalJournalReopenProof {
+  readonly productionTarget: JsonFileLocalProductionReadOnlyTarget;
+  readonly observedAt: string;
 }
 
 export interface LocalProductionAdapterRehearsalRecoveryReport {
@@ -491,7 +497,7 @@ export class JsonFileLocalProductionRehearsalTarget {
     readonly maxStateBytes: number;
   }): Promise<JsonFileLocalProductionRehearsalTarget> {
     const target = new JsonFileLocalProductionRehearsalTarget({ descriptor: input.descriptor, maxStateBytes: input.maxStateBytes });
-    if (target.descriptor.stateFilePath === input.productionTarget.descriptor.stateFilePath) throw new Error("Rehearsal clone path aliases production path");
+    assertDistinctPhysicalFiles(input.productionTarget.descriptor.stateFilePath, target.descriptor.stateFilePath);
     if (target.descriptor.targetId === input.productionTarget.descriptor.targetId) throw new Error("Rehearsal clone identity aliases production identity");
     if (target.descriptor.sourceProductionTargetId !== input.productionTarget.descriptor.targetId) throw new Error("Rehearsal clone sourceProductionTargetId mismatches production target");
     const production = await input.productionTarget.read();
@@ -574,9 +580,10 @@ export class JsonlLocalProductionRehearsalJournal {
   static async open(
     options: LocalProductionRehearsalJournalOptions,
     verificationContext?: LocalProductionRehearsalJournalVerificationContext,
+    reopenProof?: LocalProductionRehearsalJournalReopenProof,
   ): Promise<JsonlLocalProductionRehearsalJournal> {
     const journal = new JsonlLocalProductionRehearsalJournal(options);
-    await journal.load(verificationContext);
+    await journal.load(verificationContext, reopenProof);
     return journal;
   }
 
@@ -639,7 +646,10 @@ export class JsonlLocalProductionRehearsalJournal {
     return event;
   }
 
-  private async load(verificationContext?: LocalProductionRehearsalJournalVerificationContext): Promise<void> {
+  private async load(
+    verificationContext?: LocalProductionRehearsalJournalVerificationContext,
+    reopenProof?: LocalProductionRehearsalJournalReopenProof,
+  ): Promise<void> {
     if (!existsSync(this.options.filePath)) {
       this.entries = [];
       this.expectedFileSize = 0;
@@ -664,10 +674,28 @@ export class JsonlLocalProductionRehearsalJournal {
     this.entries = entries;
     this.expectedFileSize = utf8Bytes(raw);
     this.expectedFileSha256 = await sha256Text(raw);
-    if (entries.length > 0 && !verificationContext) throw new Error("Non-empty rehearsal journal reopen requires exact authority and production pre-fingerprint context");
+    if (entries.length > 0 && (!verificationContext || !reopenProof)) throw new Error("Non-empty rehearsal journal reopen requires exact authority, production pre-fingerprint, and live production proof");
     if (verificationContext) {
       await verifyCanonicalJournalProgression(entries, verificationContext);
       this.verificationContext = verificationContext;
+    }
+    if (entries.length > 0 && verificationContext && reopenProof) {
+      try {
+        await assertProductionStable(reopenProof.productionTarget, verificationContext.authority, verificationContext.productionPreFingerprint, reopenProof.observedAt);
+      } catch (error) {
+        if (!(error instanceof ProductionDriftError)) throw error;
+        const latest = this.entries[this.entries.length - 1]?.event;
+        if (latest && latest.payload.eventType !== "rehearsal_manual_reconciliation_required") {
+          await this.append({
+            ...latest.payload,
+            eventType: "rehearsal_manual_reconciliation_required",
+            observedAt: timestamp(reopenProof.observedAt, "journal reopen production proof observedAt"),
+            recoveredAfterRestart: false,
+            reason: "production target could not be proven unchanged during journal reopen",
+          }, verificationContext);
+        }
+        throw new ManualReconciliationRequiredError("Production target could not be proven unchanged during journal reopen");
+      }
     }
   }
 
@@ -698,6 +726,7 @@ export class LocalProductionAdapterRehearsalCoordinator {
     if (progression.candidateManual || progression.restoreManual) throw new ManualReconciliationRequiredError("Rehearsal journal is terminal manual reconciliation");
     const operation = operationIdentity(input.authority.readinessAuthorization.authorizationId, "candidate");
     if (this.journal.latest(operation.operationId)) throw new Error("Candidate rehearsal operation already exists; automatic retry is forbidden");
+    assertDistinctPhysicalFiles(this.productionTarget.descriptor.stateFilePath, this.rehearsalTarget.descriptor.stateFilePath);
     const before = await this.rehearsalTarget.read();
     assertCloneMatchesAuthority(before, input.authority);
     const after = await expectedCandidateState(before, input.authority, input.appliedAt);
@@ -721,6 +750,7 @@ export class LocalProductionAdapterRehearsalCoordinator {
       throw new ManualReconciliationRequiredError(error.message);
     }
 
+    assertDistinctPhysicalFiles(this.productionTarget.descriptor.stateFilePath, this.rehearsalTarget.descriptor.stateFilePath);
     const applied = await this.rehearsalTarget.writeCandidate(before, after.payload.currentSubjectId, after.payload.routeRevision, input.appliedAt);
     if (!sameState(applied, after)) throw new Error("Candidate rehearsal state does not equal reserved expected state");
     await this.faultInjector?.hit("after_candidate_apply_before_commit");
@@ -749,6 +779,7 @@ export class LocalProductionAdapterRehearsalCoordinator {
     if (!candidateCommit) throw new Error("Explicit restore requires a valid durable candidate commit");
     const operation = operationIdentity(input.authority.readinessAuthorization.authorizationId, "restore");
     if (this.journal.latest(operation.operationId)) throw new Error("Restore rehearsal operation already exists; automatic retry is forbidden");
+    assertDistinctPhysicalFiles(this.productionTarget.descriptor.stateFilePath, this.rehearsalTarget.descriptor.stateFilePath);
     const current = await this.rehearsalTarget.read();
 
     try {
@@ -776,6 +807,7 @@ export class LocalProductionAdapterRehearsalCoordinator {
       throw new ManualReconciliationRequiredError(error.message);
     }
 
+    assertDistinctPhysicalFiles(this.productionTarget.descriptor.stateFilePath, this.rehearsalTarget.descriptor.stateFilePath);
     const restored = await this.rehearsalTarget.restore(current, after.payload.currentSubjectId, after.payload.routeRevision, input.restoredAt);
     if (!sameState(restored, after)) throw new Error("Restored rehearsal state does not equal reserved expected state");
     await this.faultInjector?.hit("after_restore_apply_before_commit");
@@ -850,8 +882,9 @@ export class LocalProductionAdapterRehearsalCoordinator {
     if (!sameState(current, progression.restoreCommit.payload.afterState)) throw new Error("Rehearsal clone does not match durable restored state");
     assertRestoredReference(current, input.authority);
 
+    let post: LocalProductionRouterFingerprint;
     try {
-      await assertProductionStable(this.productionTarget, input.authority, this.productionPreFingerprint, input.completedAt);
+      post = await assertProductionStable(this.productionTarget, input.authority, this.productionPreFingerprint, input.completedAt);
     } catch (error) {
       if (!(error instanceof ProductionDriftError)) throw error;
       const manual = await this.appendManualFromEvent(input.authority, context, progression.restoreCommit, current, input.completedAt, "production drift at finalization");
@@ -859,8 +892,6 @@ export class LocalProductionAdapterRehearsalCoordinator {
       throw new ManualReconciliationRequiredError(`${error.message}; journal=${manual.eventId}; progression=${progression.progressionSha256}`);
     }
 
-    const post = await this.productionTarget.fingerprint(input.completedAt);
-    assertProductionFingerprintsStable(this.productionPreFingerprint, post);
     const cRes = progression.candidateReservation;
     const cCom = progression.candidateCommit;
     const rRes = progression.restoreReservation;
@@ -1040,9 +1071,7 @@ export async function verifyLocalProductionAdapterRehearsalReceipt(
   if (!sameState(current, rCom.payload.afterState)) throw new Error("Rehearsal receipt current clone state is not exact restored state");
   assertRestoredReference(current, authority);
 
-  await assertProductionStable(productionTarget, authority, productionPreFingerprint, p.completedAt);
-  const post = await productionTarget.fingerprint(p.completedAt);
-  assertProductionFingerprintsStable(productionPreFingerprint, post);
+  const post = await assertProductionStable(productionTarget, authority, productionPreFingerprint, p.completedAt);
   if (
     p.productionPreFingerprintId !== productionPreFingerprint.fingerprintId ||
     p.productionPreFingerprintSha256 !== productionPreFingerprint.fingerprintSha256 ||
@@ -1292,22 +1321,33 @@ async function assertProductionStable(
   authority: LocalProductionAdapterRehearsalAuthority,
   pre: LocalProductionRouterFingerprint,
   observedAt: string,
-): Promise<void> {
+): Promise<LocalProductionRouterFingerprint> {
   await verifyLocalProductionRouterFingerprint(pre);
   assertPreFingerprintMatchesAuthority(pre, authority, target.descriptor.targetId);
-  const state = await target.read();
+  let state: LocalProductionRouterState;
+  try {
+    state = await target.read();
+  } catch {
+    throw new ProductionDriftError("Production target is unreadable or unverifiable during rehearsal");
+  }
   const snapshot = authority.currentTargetSnapshot.payload;
   if (
     state.payload.targetId !== target.descriptor.targetId || state.payload.installationId !== snapshot.installationId ||
     state.payload.projectId !== snapshot.projectId || state.payload.routeId !== snapshot.routeId || state.payload.capability !== snapshot.capability ||
     state.payload.currentSubjectId !== snapshot.currentSubjectId || state.payload.routeRevision !== snapshot.routeRevision
   ) throw new ProductionDriftError("Production semantic state drift detected during rehearsal");
-  const current = await target.fingerprint(observedAt);
+  let current: LocalProductionRouterFingerprint;
+  try {
+    current = await target.fingerprint(observedAt);
+  } catch {
+    throw new ProductionDriftError("Production target fingerprint is unavailable during rehearsal");
+  }
   try {
     assertProductionFingerprintsStable(pre, current);
   } catch {
     throw new ProductionDriftError("Production target fingerprint drift detected during rehearsal");
   }
+  return current;
 }
 
 function assertPreFingerprintMatchesAuthority(
@@ -1578,6 +1618,33 @@ function recoveryReport(
 
 function sameState(left: LocalProductionRehearsalState, right: LocalProductionRehearsalState): boolean {
   return left.stateId === right.stateId && left.stateSha256 === right.stateSha256;
+}
+
+function assertDistinctPhysicalFiles(productionPath: string, rehearsalPath: string): void {
+  const productionResolved = resolve(productionPath);
+  const rehearsalResolved = resolve(rehearsalPath);
+  if (productionResolved === rehearsalResolved) throw new Error("Rehearsal clone path aliases production path");
+  const productionReal = realpathSync(productionResolved);
+  const rehearsalPhysical = physicalCandidatePath(rehearsalResolved);
+  if (productionReal === rehearsalPhysical) throw new Error("Rehearsal clone physical path aliases production path");
+  if (existsSync(rehearsalResolved)) {
+    const productionStats = statSync(productionResolved, { bigint: true });
+    const rehearsalStats = statSync(rehearsalResolved, { bigint: true });
+    if (productionStats.dev === rehearsalStats.dev && productionStats.ino === rehearsalStats.ino) throw new Error("Rehearsal clone file identity aliases production file");
+  }
+}
+
+function physicalCandidatePath(path: string): string {
+  if (existsSync(path)) return realpathSync(path);
+  let cursor = dirname(path);
+  const suffix = [basename(path)];
+  while (!existsSync(cursor)) {
+    const parent = dirname(cursor);
+    if (parent === cursor) throw new Error("Rehearsal clone parent path cannot be resolved safely");
+    suffix.unshift(basename(cursor));
+    cursor = parent;
+  }
+  return resolve(realpathSync(cursor), ...suffix);
 }
 
 function writeUtf8File(path: string, content: string): void {
