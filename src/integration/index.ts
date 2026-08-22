@@ -7,8 +7,8 @@ import type {
   RoutingMutationAuthoritySources,
 } from "./isolated-routing-mutation.js";
 import {
-  verifiedIsolatedRoutingMutationReceiptToEvidence,
-  verifyIsolatedRoutingMutationReceipt,
+  verifiedIsolatedRoutingMutationReceiptToEvidence as verifiedIsolatedRoutingMutationReceiptToEvidenceBase,
+  verifyIsolatedRoutingMutationReceipt as verifyIsolatedRoutingMutationReceiptBase,
 } from "./isolated-routing-mutation.js";
 
 export * from "./runtime-run-integration.js";
@@ -23,6 +23,49 @@ export * from "./runtime-backed-deferred-bounded-live-execution.js";
 export * from "./opencode-bounded-live-output-reader.js";
 export * from "./isolated-loopback-bounded-live-sink-client.js";
 export * from "./isolated-routing-mutation.js";
+
+/**
+ * Public receipt verification additionally derives the one canonical mutation
+ * operation/idempotency identity from the exact promotion authorization. A
+ * self-consistent rewritten journal + receipt pair cannot substitute another
+ * operation identity for the authorized one.
+ */
+export async function verifyIsolatedRoutingMutationReceipt(
+  receipt: IsolatedRoutingMutationReceipt,
+  authority: RoutingMutationAuthoritySources,
+  target: JsonFileIsolatedRoutingTarget,
+  journal: JsonlRoutingMutationJournal,
+): Promise<void> {
+  await verifyIsolatedRoutingMutationReceiptBase(receipt, authority, target, journal);
+  const canonicalOperationId = `routing-mutation:${authority.authorization.authorizationId}`;
+  if (
+    receipt.payload.operationId !== canonicalOperationId ||
+    receipt.payload.idempotencyKey !== canonicalOperationId
+  ) {
+    throw new Error("Isolated routing mutation receipt operation/idempotency identity is not canonical for the exact promotion authorization");
+  }
+}
+
+/**
+ * Evidence conversion is gated by the public canonical-identity verifier before
+ * delegating to the underlying receipt-to-evidence conversion.
+ */
+export async function verifiedIsolatedRoutingMutationReceiptToEvidence(
+  receipt: IsolatedRoutingMutationReceipt,
+  authority: RoutingMutationAuthoritySources,
+  target: JsonFileIsolatedRoutingTarget,
+  journal: JsonlRoutingMutationJournal,
+  collectedAt: string,
+): Promise<EvidenceRecord> {
+  await verifyIsolatedRoutingMutationReceipt(receipt, authority, target, journal);
+  return verifiedIsolatedRoutingMutationReceiptToEvidenceBase(
+    receipt,
+    authority,
+    target,
+    journal,
+    collectedAt,
+  );
+}
 
 /**
  * Reconstructs the exact mutation receipt only from a durable recovered commit.
