@@ -1,3 +1,5 @@
+import * as nodeFsRuntime from "node:fs";
+import * as nodePathRuntime from "node:path";
 import {
   closeSync,
   existsSync,
@@ -5,11 +7,10 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
-  realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import type { WorkflowRun } from "../control-plane/contracts.js";
 import type {
   LocalProductionRoutingReadinessAuthorization,
@@ -19,6 +20,15 @@ import type {
   LocalProductionRoutingTargetSnapshot,
 } from "./local-production-routing-readiness.js";
 import { verifyLocalProductionRoutingReadinessAuthorization } from "./local-production-routing-readiness.js";
+
+const runtimeFs = nodeFsRuntime as unknown as {
+  readonly realpathSync: (path: string) => string;
+  readonly statSync: (path: string, options: { readonly bigint: true }) => { readonly dev: bigint; readonly ino: bigint };
+};
+const runtimePath = nodePathRuntime as unknown as {
+  readonly basename: (path: string) => string;
+  readonly dirname: (path: string) => string;
+};
 
 export const LOCAL_PRODUCTION_ROUTER_STATE_SCHEMA_VERSION = 1 as const;
 export const LOCAL_PRODUCTION_ROUTER_FINGERPRINT_SCHEMA_VERSION = 1 as const;
@@ -1624,27 +1634,27 @@ function assertDistinctPhysicalFiles(productionPath: string, rehearsalPath: stri
   const productionResolved = resolve(productionPath);
   const rehearsalResolved = resolve(rehearsalPath);
   if (productionResolved === rehearsalResolved) throw new Error("Rehearsal clone path aliases production path");
-  const productionReal = realpathSync(productionResolved);
+  const productionReal = runtimeFs.realpathSync(productionResolved);
   const rehearsalPhysical = physicalCandidatePath(rehearsalResolved);
   if (productionReal === rehearsalPhysical) throw new Error("Rehearsal clone physical path aliases production path");
   if (existsSync(rehearsalResolved)) {
-    const productionStats = statSync(productionResolved, { bigint: true });
-    const rehearsalStats = statSync(rehearsalResolved, { bigint: true });
+    const productionStats = runtimeFs.statSync(productionResolved, { bigint: true });
+    const rehearsalStats = runtimeFs.statSync(rehearsalResolved, { bigint: true });
     if (productionStats.dev === rehearsalStats.dev && productionStats.ino === rehearsalStats.ino) throw new Error("Rehearsal clone file identity aliases production file");
   }
 }
 
 function physicalCandidatePath(path: string): string {
-  if (existsSync(path)) return realpathSync(path);
-  let cursor = dirname(path);
-  const suffix = [basename(path)];
+  if (existsSync(path)) return runtimeFs.realpathSync(path);
+  let cursor = runtimePath.dirname(path);
+  const suffix = [runtimePath.basename(path)];
   while (!existsSync(cursor)) {
-    const parent = dirname(cursor);
+    const parent = runtimePath.dirname(cursor);
     if (parent === cursor) throw new Error("Rehearsal clone parent path cannot be resolved safely");
-    suffix.unshift(basename(cursor));
+    suffix.unshift(runtimePath.basename(cursor));
     cursor = parent;
   }
-  return resolve(realpathSync(cursor), ...suffix);
+  return resolve(runtimeFs.realpathSync(cursor), ...suffix);
 }
 
 function writeUtf8File(path: string, content: string): void {
