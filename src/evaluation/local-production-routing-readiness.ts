@@ -1,12 +1,6 @@
 import type { CapabilityId, RunLedgerRecord, WorkflowRun } from "../control-plane/contracts.js";
 import { FROZEN_CAPABILITIES } from "../control-plane/contracts.js";
 import type {
-  RoutingPreconditionSnapshot,
-  RoutingPromotionAuthorization,
-  RoutingPromotionContext,
-  RoutingPromotionProposal,
-} from "./routing-promotion.js";
-import type {
   IsolatedRoutingMutationReceipt,
   JsonFileIsolatedRoutingTarget,
   JsonlRoutingMutationJournal,
@@ -15,6 +9,7 @@ import type {
 import { verifyIsolatedRoutingMutationReceipt } from "../integration/isolated-routing-mutation.js";
 
 export const LOCAL_PRODUCTION_ROUTING_TARGET_SNAPSHOT_SCHEMA_VERSION = 1 as const;
+export const LOCAL_PRODUCTION_ROUTING_READINESS_SOURCE_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 export const LOCAL_PRODUCTION_ROUTING_READINESS_EVIDENCE_SCHEMA_VERSION = 1 as const;
 export const LOCAL_PRODUCTION_ROUTING_READINESS_PROPOSAL_SCHEMA_VERSION = 1 as const;
 export const LOCAL_PRODUCTION_ROUTING_READINESS_AUTHORIZATION_SCHEMA_VERSION = 1 as const;
@@ -54,6 +49,31 @@ export interface LocalProductionRoutingTargetSnapshot {
   readonly snapshotId: string;
   readonly snapshotSha256: string;
   readonly payload: LocalProductionRoutingTargetSnapshotPayload;
+}
+
+export interface LocalProductionRoutingReadinessSourceSnapshotInput {
+  readonly adapterId: string;
+  readonly adapterVersion: string;
+  readonly adapterSourceSha256: string;
+  readonly mainSourceSha256: string;
+  readonly evidenceReferences: readonly string[];
+  readonly adapterSourceVerified: boolean;
+  readonly mainSourceVerified: boolean;
+  readonly observedAt: string;
+}
+
+export interface LocalProductionRoutingReadinessSourceSnapshotPayload extends LocalProductionRoutingReadinessSourceSnapshotInput {
+  readonly sourceKind: "verified_local_source";
+  readonly providerSpecificStatePersisted: false;
+  readonly secretMaterialPersisted: false;
+}
+
+export interface LocalProductionRoutingReadinessSourceSnapshot {
+  readonly schemaVersion: typeof LOCAL_PRODUCTION_ROUTING_READINESS_SOURCE_SNAPSHOT_SCHEMA_VERSION;
+  readonly algorithm: "sha256";
+  readonly snapshotId: string;
+  readonly snapshotSha256: string;
+  readonly payload: LocalProductionRoutingReadinessSourceSnapshotPayload;
 }
 
 export interface CredentialIsolationReadinessEvidenceInput {
@@ -235,14 +255,59 @@ const TARGET_PAYLOAD_FIELDS = new Set([
   ...TARGET_INPUT_FIELDS, "targetKind", "singleWriterRequired", "providerSpecificStatePersisted",
   "rawProviderOutputPersisted", "secretMaterialPersisted",
 ]);
+const SOURCE_INPUT_FIELDS = new Set([
+  "adapterId", "adapterVersion", "adapterSourceSha256", "mainSourceSha256", "evidenceReferences",
+  "adapterSourceVerified", "mainSourceVerified", "observedAt",
+]);
+const SOURCE_ENVELOPE_FIELDS = new Set(["schemaVersion", "algorithm", "snapshotId", "snapshotSha256", "payload"]);
+const SOURCE_PAYLOAD_FIELDS = new Set([
+  ...SOURCE_INPUT_FIELDS, "sourceKind", "providerSpecificStatePersisted", "secretMaterialPersisted",
+]);
 const EVIDENCE_ENVELOPE_FIELDS = new Set(["schemaVersion", "algorithm", "kind", "evidenceId", "evidenceSha256", "payload"]);
+const CREDENTIAL_EVIDENCE_PAYLOAD_FIELDS = new Set([
+  "credentialBrokerId", "credentialScopeId", "filesystemScopeId", "networkEgressScopeId", "adapterWriteScopeId",
+  "evidenceReferences", "credentialScopeVerified", "autonomousWorkerLongLivedSecretAccess", "exactTargetOnly",
+  "providerFailureContained", "singleWriterVerified", "observedAt",
+]);
+const BACKUP_EVIDENCE_PAYLOAD_FIELDS = new Set([
+  "backupId", "backupSha256", "referenceStateSha256", "restoredStateSha256", "retentionPolicyReference",
+  "evidenceReferences", "backupIntegrityVerified", "restoreVerified", "destructiveCleanupPerformed", "observedAt",
+]);
+const ROLLBACK_EVIDENCE_PAYLOAD_FIELDS = new Set([
+  "rehearsalId", "rehearsalResult", "restoredSubjectId", "restoredRouteRevision", "evidenceReferences",
+  "exactReferenceRestored", "duplicateSideEffectObserved", "automaticRollbackAllowed", "observedAt",
+]);
+const OBSERVABILITY_EVIDENCE_PAYLOAD_FIELDS = new Set([
+  "runLedgerReferences", "traceReferences", "approvalAttributionReady", "adapterAttributionReady",
+  "beforeAfterStateAttributionReady", "sanitizedOperationalResultReady", "observedAt",
+]);
+const PROPOSAL_INPUT_FIELDS = new Set([
+  "adapterId", "adapterVersion", "adapterSourceSha256", "mainSourceSha256", "proposedAt", "policyReferences",
+]);
 const PROPOSAL_ENVELOPE_FIELDS = new Set(["schemaVersion", "algorithm", "proposalId", "proposalSha256", "payload"]);
+const PROPOSAL_PAYLOAD_FIELDS = new Set([
+  ...PROPOSAL_INPUT_FIELDS,
+  "promotionAuthorizationId", "promotionAuthorizationSha256", "promotionProposalId", "promotionProposalSha256",
+  "promotionPreconditionSnapshotId", "promotionPreconditionSnapshotSha256", "isolatedMutationReceiptId",
+  "isolatedMutationReceiptSha256", "targetSnapshotId", "targetSnapshotSha256", "projectId", "routeId", "capability",
+  "referenceSubjectId", "candidateSubjectId", "routeRevision", "credentialEvidenceId", "credentialEvidenceSha256",
+  "backupEvidenceId", "backupEvidenceSha256", "rollbackEvidenceId", "rollbackEvidenceSha256", "observabilityEvidenceId",
+  "observabilityEvidenceSha256", "runLedgerReferences", "classification", "reasons", "productionRoutingMutationAuthorized",
+  "automaticRoutingMutationAllowed", "automaticRetryAllowed", "automaticRollbackAllowed", "automaticRedispatchAllowed",
+]);
+const AUTH_INPUT_FIELDS = new Set(["decision", "actor", "decidedAt", "approvalIds", "policyReferences"]);
 const AUTH_ENVELOPE_FIELDS = new Set(["schemaVersion", "algorithm", "authorizationId", "authorizationSha256", "payload"]);
+const AUTH_PAYLOAD_FIELDS = new Set([
+  ...AUTH_INPUT_FIELDS, "proposalId", "proposalSha256", "projectId", "routeId", "capability", "targetSnapshotId",
+  "targetSnapshotSha256", "adapterId", "adapterVersion", "adapterSourceSha256", "mainSourceSha256", "workflowRunId",
+  "riskClass", "implementationReadinessAuthorized", "productionRoutingMutationAuthorized", "automaticRoutingMutationAllowed",
+  "automaticRetryAllowed", "automaticRollbackAllowed", "automaticRedispatchAllowed",
+]);
 
 export async function prepareLocalProductionRoutingTargetSnapshot(
   input: LocalProductionRoutingTargetSnapshotInput,
 ): Promise<LocalProductionRoutingTargetSnapshot> {
-  assertExactFields(input as unknown as Record<string, unknown>, TARGET_INPUT_FIELDS, "Local production routing target input");
+  assertExactFields(requireRecord(input, "Local production routing target input"), TARGET_INPUT_FIELDS, "Local production routing target input");
   const payload: LocalProductionRoutingTargetSnapshotPayload = deepFreeze({
     installationId: prepareIdentity(input.installationId, "Local production installationId"),
     projectId: prepareIdentity(input.projectId, "Local production projectId"),
@@ -274,8 +339,8 @@ export async function prepareLocalProductionRoutingTargetSnapshot(
 }
 
 export async function verifyLocalProductionRoutingTargetSnapshot(snapshot: LocalProductionRoutingTargetSnapshot): Promise<void> {
-  if (!isRecord(snapshot)) throw new Error("Local production routing target snapshot must be an object");
-  assertExactFields(snapshot, TARGET_ENVELOPE_FIELDS, "Local production routing target snapshot");
+  const record = requireRecord(snapshot, "Local production routing target snapshot");
+  assertExactFields(record, TARGET_ENVELOPE_FIELDS, "Local production routing target snapshot");
   if (snapshot.schemaVersion !== 1 || snapshot.algorithm !== "sha256" || !isRecord(snapshot.payload)) throw new Error("Local production routing target snapshot envelope is invalid");
   assertExactFields(snapshot.payload, TARGET_PAYLOAD_FIELDS, "Local production routing target snapshot payload");
   const p = snapshot.payload as unknown as LocalProductionRoutingTargetSnapshotPayload;
@@ -291,6 +356,54 @@ export async function verifyLocalProductionRoutingTargetSnapshot(snapshot: Local
   if (p.targetKind !== "local_production_router" || p.singleWriterRequired !== true || p.providerSpecificStatePersisted !== false || p.rawProviderOutputPersisted !== false || p.secretMaterialPersisted !== false) throw new Error("Local production target safety boundary is invalid");
   const expected = await sha256Canonical(p);
   if (snapshot.snapshotSha256 !== expected || snapshot.snapshotId !== `m5localprodtarget:${expected.slice(0, 32).toLowerCase()}`) throw new Error("Local production target content address is invalid");
+}
+
+export async function prepareLocalProductionRoutingReadinessSourceSnapshot(
+  input: LocalProductionRoutingReadinessSourceSnapshotInput,
+): Promise<LocalProductionRoutingReadinessSourceSnapshot> {
+  assertExactFields(requireRecord(input, "Local production readiness source snapshot input"), SOURCE_INPUT_FIELDS, "Local production readiness source snapshot input");
+  const payload: LocalProductionRoutingReadinessSourceSnapshotPayload = deepFreeze({
+    adapterId: prepareIdentity(input.adapterId, "Local production readiness source adapterId"),
+    adapterVersion: prepareIdentity(input.adapterVersion, "Local production readiness source adapterVersion"),
+    adapterSourceSha256: prepareSha256(input.adapterSourceSha256, "Local production readiness source adapterSourceSha256"),
+    mainSourceSha256: prepareSha256(input.mainSourceSha256, "Local production readiness source mainSourceSha256"),
+    evidenceReferences: normalizeSet(input.evidenceReferences, "Local production readiness source evidence reference", true),
+    adapterSourceVerified: prepareBoolean(input.adapterSourceVerified, "Local production readiness source adapterSourceVerified"),
+    mainSourceVerified: prepareBoolean(input.mainSourceVerified, "Local production readiness source mainSourceVerified"),
+    observedAt: prepareTimestamp(input.observedAt, "Local production readiness source observedAt"),
+    sourceKind: "verified_local_source",
+    providerSpecificStatePersisted: false,
+    secretMaterialPersisted: false,
+  });
+  const snapshotSha256 = await sha256Canonical(payload);
+  return deepFreeze({
+    schemaVersion: LOCAL_PRODUCTION_ROUTING_READINESS_SOURCE_SNAPSHOT_SCHEMA_VERSION,
+    algorithm: "sha256" as const,
+    snapshotId: `m5localprodsource:${snapshotSha256.slice(0, 32).toLowerCase()}`,
+    snapshotSha256,
+    payload,
+  });
+}
+
+export async function verifyLocalProductionRoutingReadinessSourceSnapshot(
+  snapshot: LocalProductionRoutingReadinessSourceSnapshot,
+): Promise<void> {
+  const record = requireRecord(snapshot, "Local production readiness source snapshot");
+  assertExactFields(record, SOURCE_ENVELOPE_FIELDS, "Local production readiness source snapshot");
+  if (snapshot.schemaVersion !== 1 || snapshot.algorithm !== "sha256" || !isRecord(snapshot.payload)) throw new Error("Local production readiness source snapshot envelope is invalid");
+  assertExactFields(snapshot.payload, SOURCE_PAYLOAD_FIELDS, "Local production readiness source snapshot payload");
+  const p = snapshot.payload as unknown as LocalProductionRoutingReadinessSourceSnapshotPayload;
+  prepareIdentity(p.adapterId, "Local production readiness source adapterId");
+  prepareIdentity(p.adapterVersion, "Local production readiness source adapterVersion");
+  prepareSha256(p.adapterSourceSha256, "Local production readiness source adapterSourceSha256");
+  prepareSha256(p.mainSourceSha256, "Local production readiness source mainSourceSha256");
+  if (!sameArray(p.evidenceReferences, normalizeSet(p.evidenceReferences, "Local production readiness source evidence reference", true))) throw new Error("Local production readiness source evidenceReferences are not canonical");
+  prepareBoolean(p.adapterSourceVerified, "Local production readiness source adapterSourceVerified");
+  prepareBoolean(p.mainSourceVerified, "Local production readiness source mainSourceVerified");
+  prepareTimestamp(p.observedAt, "Local production readiness source observedAt");
+  if (p.sourceKind !== "verified_local_source" || p.providerSpecificStatePersisted !== false || p.secretMaterialPersisted !== false) throw new Error("Local production readiness source snapshot safety boundary is invalid");
+  const expected = await sha256Canonical(p);
+  if (snapshot.snapshotSha256 !== expected || snapshot.snapshotId !== `m5localprodsource:${expected.slice(0, 32).toLowerCase()}`) throw new Error("Local production readiness source snapshot content address is invalid");
 }
 
 export async function prepareCredentialIsolationReadinessEvidence(
@@ -326,8 +439,8 @@ export async function prepareObservabilityReadinessEvidence(
 }
 
 export async function verifyLocalProductionRoutingReadinessEvidence(evidence: LocalProductionRoutingReadinessEvidence): Promise<void> {
-  if (!isRecord(evidence)) throw new Error("Local production readiness evidence must be an object");
-  assertExactFields(evidence, EVIDENCE_ENVELOPE_FIELDS, "Local production readiness evidence");
+  const record = requireRecord(evidence, "Local production readiness evidence");
+  assertExactFields(record, EVIDENCE_ENVELOPE_FIELDS, "Local production readiness evidence");
   if (evidence.schemaVersion !== 1 || evidence.algorithm !== "sha256" || !isRecord(evidence.payload)) throw new Error("Local production readiness evidence envelope is invalid");
   if (!["credential_isolation", "backup_restore", "rollback_rehearsal", "observability"].includes(evidence.kind)) throw new Error("Local production readiness evidence kind is invalid");
   if (evidence.kind === "credential_isolation") validateCredentialEvidencePayload(evidence.payload as unknown as CredentialIsolationReadinessEvidenceInput);
@@ -342,6 +455,7 @@ export async function prepareLocalProductionRoutingReadinessProposal(input: {
   readonly context: LocalProductionRoutingReadinessContext;
   readonly proposal: LocalProductionRoutingReadinessProposalInput;
 }): Promise<LocalProductionRoutingReadinessProposal> {
+  assertExactFields(requireRecord(input.proposal, "Local production readiness proposal input"), PROPOSAL_INPUT_FIELDS, "Local production readiness proposal input");
   const derived = await verifyReadinessContext(input.context);
   const p = input.context.promotionAuthority;
   const proposedAt = prepareTimestamp(input.proposal.proposedAt, "Local production readiness proposedAt");
@@ -408,8 +522,8 @@ export async function verifyLocalProductionRoutingReadinessProposal(
   context: LocalProductionRoutingReadinessContext,
 ): Promise<void> {
   const derived = await verifyReadinessContext(context);
-  if (!isRecord(proposal)) throw new Error("Local production readiness proposal must be an object");
-  assertExactFields(proposal, PROPOSAL_ENVELOPE_FIELDS, "Local production readiness proposal");
+  const record = requireRecord(proposal, "Local production readiness proposal");
+  assertExactFields(record, PROPOSAL_ENVELOPE_FIELDS, "Local production readiness proposal");
   if (proposal.schemaVersion !== 1 || proposal.algorithm !== "sha256" || !isRecord(proposal.payload)) throw new Error("Local production readiness proposal envelope is invalid");
   const p = proposal.payload as unknown as LocalProductionRoutingReadinessProposalPayload;
   validateProposalPayload(p);
@@ -437,16 +551,20 @@ export async function prepareLocalProductionRoutingReadinessAuthorization(input:
   readonly proposal: LocalProductionRoutingReadinessProposal;
   readonly context: LocalProductionRoutingReadinessContext;
   readonly currentTargetSnapshot: LocalProductionRoutingTargetSnapshot;
+  readonly currentSourceSnapshot: LocalProductionRoutingReadinessSourceSnapshot;
   readonly workflow: WorkflowRun;
   readonly authorization: LocalProductionRoutingReadinessAuthorizationInput;
 }): Promise<LocalProductionRoutingReadinessAuthorization> {
+  assertExactFields(requireRecord(input.authorization, "Local production readiness authorization input"), AUTH_INPUT_FIELDS, "Local production readiness authorization input");
   await verifyLocalProductionRoutingReadinessProposal(input.proposal, input.context);
   await verifyLocalProductionRoutingTargetSnapshot(input.currentTargetSnapshot);
+  await verifyLocalProductionRoutingReadinessSourceSnapshot(input.currentSourceSnapshot);
   assertTargetFresh(input.proposal, input.currentTargetSnapshot);
+  assertSourceFresh(input.proposal, input.currentSourceSnapshot);
   assertR4Workflow(input.workflow, input.proposal.payload.projectId, input.authorization.approvalIds, input.authorization.decision === "allow");
   if (input.authorization.decision === "allow" && input.proposal.payload.classification !== "READY_FOR_LOCAL_PRODUCTION_ADAPTER_IMPLEMENTATION") throw new Error("Local production readiness allow requires READY classification");
   const decidedAt = prepareTimestamp(input.authorization.decidedAt, "Local production readiness authorization decidedAt");
-  assertAtOrAfter(decidedAt, [input.proposal.payload.proposedAt, input.workflow.updatedAt], "Local production readiness authorization predates proposal or workflow");
+  assertAtOrAfter(decidedAt, [input.proposal.payload.proposedAt, input.workflow.updatedAt, input.currentSourceSnapshot.payload.observedAt], "Local production readiness authorization predates proposal, workflow, or source evidence");
   const approvalIds = normalizeSet(input.authorization.approvalIds, "Local production readiness approvalId", input.authorization.decision === "allow");
   const payload: LocalProductionRoutingReadinessAuthorizationPayload = deepFreeze({
     decision: input.authorization.decision,
@@ -490,13 +608,16 @@ export async function verifyLocalProductionRoutingReadinessAuthorization(
   proposal: LocalProductionRoutingReadinessProposal,
   context: LocalProductionRoutingReadinessContext,
   currentTargetSnapshot: LocalProductionRoutingTargetSnapshot,
+  currentSourceSnapshot: LocalProductionRoutingReadinessSourceSnapshot,
   workflow: WorkflowRun,
 ): Promise<void> {
   await verifyLocalProductionRoutingReadinessProposal(proposal, context);
   await verifyLocalProductionRoutingTargetSnapshot(currentTargetSnapshot);
+  await verifyLocalProductionRoutingReadinessSourceSnapshot(currentSourceSnapshot);
   assertTargetFresh(proposal, currentTargetSnapshot);
-  if (!isRecord(authorization)) throw new Error("Local production readiness authorization must be an object");
-  assertExactFields(authorization, AUTH_ENVELOPE_FIELDS, "Local production readiness authorization");
+  assertSourceFresh(proposal, currentSourceSnapshot);
+  const record = requireRecord(authorization, "Local production readiness authorization");
+  assertExactFields(record, AUTH_ENVELOPE_FIELDS, "Local production readiness authorization");
   if (authorization.schemaVersion !== 1 || authorization.algorithm !== "sha256" || !isRecord(authorization.payload)) throw new Error("Local production readiness authorization envelope is invalid");
   const p = authorization.payload as unknown as LocalProductionRoutingReadinessAuthorizationPayload;
   validateAuthorizationPayload(p);
@@ -520,6 +641,10 @@ async function verifyReadinessContext(context: LocalProductionRoutingReadinessCo
   readonly reasons: readonly string[];
   readonly runLedgerReferences: readonly string[];
 }> {
+  const contextRecord = requireRecord(context, "Local production readiness context");
+  for (const field of ["promotionAuthority", "isolatedMutationReceipt", "isolatedTarget", "isolatedJournal", "targetSnapshot", "credentialEvidence", "backupEvidence", "rollbackEvidence", "observabilityEvidence", "runLedgerRecords"] as const) {
+    if (!(field in contextRecord) || contextRecord[field] === undefined || contextRecord[field] === null) throw new Error(`Local production readiness context.${field} evidence is required`);
+  }
   await verifyIsolatedRoutingMutationReceipt(context.isolatedMutationReceipt, context.promotionAuthority, context.isolatedTarget, context.isolatedJournal);
   await verifyLocalProductionRoutingTargetSnapshot(context.targetSnapshot);
   await verifyLocalProductionRoutingReadinessEvidence(context.credentialEvidence);
@@ -578,41 +703,46 @@ async function prepareEvidence<T extends object>(
 }
 
 function validateCredentialEvidencePayload(p: CredentialIsolationReadinessEvidenceInput): void {
+  assertExactFields(requireRecord(p, "Credential readiness payload"), CREDENTIAL_EVIDENCE_PAYLOAD_FIELDS, "Credential readiness payload");
   for (const [value, label] of [[p.credentialBrokerId, "credentialBrokerId"], [p.credentialScopeId, "credentialScopeId"], [p.filesystemScopeId, "filesystemScopeId"], [p.networkEgressScopeId, "networkEgressScopeId"], [p.adapterWriteScopeId, "adapterWriteScopeId"]] as const) prepareIdentity(value, `Credential readiness ${label}`);
-  normalizeSet(p.evidenceReferences, "Credential evidence reference", true);
-  for (const value of [p.credentialScopeVerified, p.autonomousWorkerLongLivedSecretAccess, p.exactTargetOnly, p.providerFailureContained, p.singleWriterVerified]) if (typeof value !== "boolean") throw new Error("Credential readiness booleans are invalid");
+  if (!sameArray(p.evidenceReferences, normalizeSet(p.evidenceReferences, "Credential evidence reference", true))) throw new Error("Credential readiness evidenceReferences are not canonical");
+  for (const value of [p.credentialScopeVerified, p.autonomousWorkerLongLivedSecretAccess, p.exactTargetOnly, p.providerFailureContained, p.singleWriterVerified]) prepareBoolean(value, "Credential readiness boolean");
   prepareTimestamp(p.observedAt, "Credential readiness observedAt");
 }
 
 function validateBackupEvidencePayload(p: BackupRestoreReadinessEvidenceInput): void {
+  assertExactFields(requireRecord(p, "Backup readiness payload"), BACKUP_EVIDENCE_PAYLOAD_FIELDS, "Backup readiness payload");
   prepareIdentity(p.backupId, "Backup readiness backupId");
   prepareSha256(p.backupSha256, "Backup readiness backupSha256");
   prepareSha256(p.referenceStateSha256, "Backup readiness referenceStateSha256");
   prepareSha256(p.restoredStateSha256, "Backup readiness restoredStateSha256");
   prepareIdentity(p.retentionPolicyReference, "Backup readiness retentionPolicyReference");
-  normalizeSet(p.evidenceReferences, "Backup evidence reference", true);
-  for (const value of [p.backupIntegrityVerified, p.restoreVerified, p.destructiveCleanupPerformed]) if (typeof value !== "boolean") throw new Error("Backup readiness booleans are invalid");
+  if (!sameArray(p.evidenceReferences, normalizeSet(p.evidenceReferences, "Backup evidence reference", true))) throw new Error("Backup readiness evidenceReferences are not canonical");
+  for (const value of [p.backupIntegrityVerified, p.restoreVerified, p.destructiveCleanupPerformed]) prepareBoolean(value, "Backup readiness boolean");
   prepareTimestamp(p.observedAt, "Backup readiness observedAt");
 }
 
 function validateRollbackEvidencePayload(p: RollbackRehearsalReadinessEvidenceInput): void {
+  assertExactFields(requireRecord(p, "Rollback readiness payload"), ROLLBACK_EVIDENCE_PAYLOAD_FIELDS, "Rollback readiness payload");
   prepareIdentity(p.rehearsalId, "Rollback readiness rehearsalId");
   if (!["PASSED", "FAILED", "MANUAL_RECONCILIATION_REQUIRED"].includes(p.rehearsalResult)) throw new Error("Rollback readiness result is invalid");
   prepareIdentity(p.restoredSubjectId, "Rollback readiness restoredSubjectId");
   prepareIdentity(p.restoredRouteRevision, "Rollback readiness restoredRouteRevision");
-  normalizeSet(p.evidenceReferences, "Rollback evidence reference", true);
-  for (const value of [p.exactReferenceRestored, p.duplicateSideEffectObserved, p.automaticRollbackAllowed]) if (typeof value !== "boolean") throw new Error("Rollback readiness booleans are invalid");
+  if (!sameArray(p.evidenceReferences, normalizeSet(p.evidenceReferences, "Rollback evidence reference", true))) throw new Error("Rollback readiness evidenceReferences are not canonical");
+  for (const value of [p.exactReferenceRestored, p.duplicateSideEffectObserved, p.automaticRollbackAllowed]) prepareBoolean(value, "Rollback readiness boolean");
   prepareTimestamp(p.observedAt, "Rollback readiness observedAt");
 }
 
 function validateObservabilityEvidencePayload(p: ObservabilityReadinessEvidenceInput): void {
-  normalizeSet(p.runLedgerReferences, "Observability Run Ledger reference", true);
-  normalizeSet(p.traceReferences, "Observability trace reference", true);
-  for (const value of [p.approvalAttributionReady, p.adapterAttributionReady, p.beforeAfterStateAttributionReady, p.sanitizedOperationalResultReady]) if (typeof value !== "boolean") throw new Error("Observability readiness booleans are invalid");
+  assertExactFields(requireRecord(p, "Observability readiness payload"), OBSERVABILITY_EVIDENCE_PAYLOAD_FIELDS, "Observability readiness payload");
+  if (!sameArray(p.runLedgerReferences, normalizeSet(p.runLedgerReferences, "Observability Run Ledger reference", true))) throw new Error("Observability readiness runLedgerReferences are not canonical");
+  if (!sameArray(p.traceReferences, normalizeSet(p.traceReferences, "Observability trace reference", true))) throw new Error("Observability readiness traceReferences are not canonical");
+  for (const value of [p.approvalAttributionReady, p.adapterAttributionReady, p.beforeAfterStateAttributionReady, p.sanitizedOperationalResultReady]) prepareBoolean(value, "Observability readiness boolean");
   prepareTimestamp(p.observedAt, "Observability readiness observedAt");
 }
 
 function validateProposalPayload(p: LocalProductionRoutingReadinessProposalPayload): void {
+  assertExactFields(requireRecord(p, "Local production readiness proposal payload"), PROPOSAL_PAYLOAD_FIELDS, "Local production readiness proposal payload");
   for (const [value, label] of [
     [p.adapterId, "adapterId"], [p.adapterVersion, "adapterVersion"], [p.promotionAuthorizationId, "promotionAuthorizationId"],
     [p.promotionProposalId, "promotionProposalId"], [p.promotionPreconditionSnapshotId, "promotionPreconditionSnapshotId"],
@@ -628,21 +758,22 @@ function validateProposalPayload(p: LocalProductionRoutingReadinessProposalPaylo
     [p.credentialEvidenceSha256, "credentialEvidenceSha256"], [p.backupEvidenceSha256, "backupEvidenceSha256"], [p.rollbackEvidenceSha256, "rollbackEvidenceSha256"], [p.observabilityEvidenceSha256, "observabilityEvidenceSha256"],
   ] as const) prepareSha256(value, `Local production readiness proposal ${label}`);
   prepareTimestamp(p.proposedAt, "Local production readiness proposedAt");
-  normalizeSet(p.policyReferences, "Local production readiness policy reference", true);
-  normalizeSet(p.runLedgerReferences, "Local production readiness Run Ledger reference", true);
+  if (!sameArray(p.policyReferences, normalizeSet(p.policyReferences, "Local production readiness policy reference", true))) throw new Error("Local production readiness proposal policyReferences are not canonical");
+  if (!sameArray(p.runLedgerReferences, normalizeSet(p.runLedgerReferences, "Local production readiness Run Ledger reference", true))) throw new Error("Local production readiness proposal runLedgerReferences are not canonical");
   if (!["NOT_READY", "READY_FOR_LOCAL_PRODUCTION_ADAPTER_IMPLEMENTATION", "MANUAL_RECONCILIATION_REQUIRED"].includes(p.classification)) throw new Error("Local production readiness classification is invalid");
   if (!Array.isArray(p.reasons) || p.reasons.some((reason) => typeof reason !== "string" || !reason.trim())) throw new Error("Local production readiness reasons are invalid");
   if (p.productionRoutingMutationAuthorized !== false || p.automaticRoutingMutationAllowed !== false || p.automaticRetryAllowed !== false || p.automaticRollbackAllowed !== false || p.automaticRedispatchAllowed !== false) throw new Error("Local production readiness proposal cannot grant production or automatic mutation authority");
 }
 
 function validateAuthorizationPayload(p: LocalProductionRoutingReadinessAuthorizationPayload): void {
+  assertExactFields(requireRecord(p, "Local production readiness authorization payload"), AUTH_PAYLOAD_FIELDS, "Local production readiness authorization payload");
   if (p.decision !== "allow" && p.decision !== "deny") throw new Error("Local production readiness authorization decision is invalid");
   for (const [value, label] of [[p.actor, "actor"], [p.proposalId, "proposalId"], [p.projectId, "projectId"], [p.routeId, "routeId"], [p.targetSnapshotId, "targetSnapshotId"], [p.adapterId, "adapterId"], [p.adapterVersion, "adapterVersion"], [p.workflowRunId, "workflowRunId"]] as const) prepareIdentity(value, `Local production readiness authorization ${label}`);
   prepareCapability(p.capability);
   for (const [value, label] of [[p.proposalSha256, "proposalSha256"], [p.targetSnapshotSha256, "targetSnapshotSha256"], [p.adapterSourceSha256, "adapterSourceSha256"], [p.mainSourceSha256, "mainSourceSha256"]] as const) prepareSha256(value, `Local production readiness authorization ${label}`);
   prepareTimestamp(p.decidedAt, "Local production readiness authorization decidedAt");
-  normalizeSet(p.approvalIds, "Local production readiness authorization approvalId", p.decision === "allow");
-  normalizeSet(p.policyReferences, "Local production readiness authorization policy reference", true);
+  if (!sameArray(p.approvalIds, normalizeSet(p.approvalIds, "Local production readiness authorization approvalId", p.decision === "allow"))) throw new Error("Local production readiness authorization approvalIds are not canonical");
+  if (!sameArray(p.policyReferences, normalizeSet(p.policyReferences, "Local production readiness authorization policy reference", true))) throw new Error("Local production readiness authorization policyReferences are not canonical");
   if (p.riskClass !== "R4") throw new Error("Local production readiness authorization must be R4");
   if (p.implementationReadinessAuthorized !== (p.decision === "allow")) throw new Error("Local production readiness implementation authority flag is invalid");
   if (p.productionRoutingMutationAuthorized !== false || p.automaticRoutingMutationAllowed !== false || p.automaticRetryAllowed !== false || p.automaticRollbackAllowed !== false || p.automaticRedispatchAllowed !== false) throw new Error("Local production readiness authorization cannot grant production or automatic mutation authority");
@@ -652,7 +783,18 @@ function assertTargetFresh(proposal: LocalProductionRoutingReadinessProposal, cu
   if (proposal.payload.targetSnapshotId !== current.snapshotId || proposal.payload.targetSnapshotSha256 !== current.snapshotSha256 || proposal.payload.projectId !== current.payload.projectId || proposal.payload.routeId !== current.payload.routeId || proposal.payload.capability !== current.payload.capability || proposal.payload.referenceSubjectId !== current.payload.currentSubjectId || proposal.payload.routeRevision !== current.payload.routeRevision) throw new Error("Local production readiness target snapshot is stale or drifted");
 }
 
+function assertSourceFresh(proposal: LocalProductionRoutingReadinessProposal, current: LocalProductionRoutingReadinessSourceSnapshot): void {
+  const p = current.payload;
+  if (
+    p.adapterId !== proposal.payload.adapterId || p.adapterVersion !== proposal.payload.adapterVersion ||
+    p.adapterSourceSha256 !== proposal.payload.adapterSourceSha256 || p.mainSourceSha256 !== proposal.payload.mainSourceSha256 ||
+    p.adapterSourceVerified !== true || p.mainSourceVerified !== true ||
+    Date.parse(p.observedAt) < Date.parse(proposal.payload.proposedAt)
+  ) throw new Error("Local production readiness adapter/main source is stale, drifted, or unverified");
+}
+
 function assertR4Workflow(workflow: WorkflowRun, projectId: string, approvalIdsInput: readonly string[], requireApproval: boolean): void {
+  requireRecord(workflow, "Local production readiness workflow");
   if (workflow.projectId !== projectId || workflow.riskClass !== "R4") throw new Error("Local production readiness requires exact R4 workflow scope");
   if (workflow.phase !== "approval" && workflow.phase !== "publish") throw new Error("Local production readiness workflow must be at approval/publish boundary");
   if (requireApproval && workflow.status !== "running") throw new Error("Local production readiness allow requires active workflow");
@@ -691,6 +833,11 @@ function prepareSha256(value: unknown, label: string): string {
   return prepared;
 }
 
+function prepareBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${label} must be boolean`);
+  return value;
+}
+
 function prepareTimestamp(value: unknown, label: string): string {
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) throw new Error(`${label} must be a valid timestamp`);
   const normalized = new Date(value).toISOString();
@@ -727,6 +874,11 @@ function containsSecretLikeMaterial(value: string): boolean {
     || /\bghp_[A-Za-z0-9]{20,}\b/.test(value)
     || /\bgithub_pat_[A-Za-z0-9_]{20,}\b/.test(value)
     || /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/.test(value);
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`${label} must be an object`);
+  return value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
