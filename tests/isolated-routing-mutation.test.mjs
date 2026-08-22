@@ -7,6 +7,8 @@ import {
   JsonFileIsolatedRoutingTarget,
   JsonlRoutingMutationJournal,
   prepareIsolatedRoutingTargetState,
+  recoverCommittedIsolatedRoutingMutationReceipt,
+  recoveredIsolatedRoutingMutationToEvidence,
   verifiedIsolatedRoutingMutationReceiptToEvidence,
   verifyIsolatedRoutingMutationReceipt,
   verifyRoutingMutationRecoveryReport,
@@ -111,6 +113,94 @@ test("stale route precondition rejects before durable reservation or mutation", 
   );
   assert.equal(journal.inspect().eventCount, 0);
   assert.equal((await target.read()).payload.mutationCount, 0);
+});
+
+test("authorization/proposal/project/route/capability/reference/candidate drift fails closed before reservation or mutation", async (t) => {
+  const fixture = await buildAuthorizedRoutingPromotionFixture(t);
+  const proposalPolicyReferences = [...fixture.proposal.payload.policyReferences, "policy:drift-proof"].sort();
+  const cases = [
+    {
+      name: "authorization",
+      authority: {
+        ...fixture.authority,
+        authorization: await rehashAuthorization(fixture.authorization, {
+          proposalSha256: "D".repeat(64),
+        }),
+      },
+    },
+    {
+      name: "proposal",
+      authority: {
+        ...fixture.authority,
+        proposal: await rehashProposal(fixture.proposal, {
+          policyReferences: proposalPolicyReferences,
+        }),
+      },
+    },
+    {
+      name: "project",
+      authority: {
+        ...fixture.authority,
+        proposal: await rehashProposal(fixture.proposal, {
+          projectId: `${fixture.proposal.payload.projectId}:drift`,
+        }),
+      },
+    },
+    {
+      name: "route",
+      authority: {
+        ...fixture.authority,
+        proposal: await rehashProposal(fixture.proposal, {
+          routeId: `${fixture.proposal.payload.routeId}:drift`,
+        }),
+      },
+    },
+    {
+      name: "capability",
+      authority: {
+        ...fixture.authority,
+        proposal: await rehashProposal(fixture.proposal, {
+          capability: `${fixture.proposal.payload.capability}.drift`,
+        }),
+      },
+    },
+    {
+      name: "reference",
+      authority: {
+        ...fixture.authority,
+        proposal: await rehashProposal(fixture.proposal, {
+          referenceSubjectId: `${fixture.proposal.payload.referenceSubjectId}:drift`,
+        }),
+      },
+    },
+    {
+      name: "candidate",
+      authority: {
+        ...fixture.authority,
+        proposal: await rehashProposal(fixture.proposal, {
+          candidateSubjectId: `${fixture.proposal.payload.candidateSubjectId}:drift`,
+        }),
+      },
+    },
+  ];
+
+  for (const entry of cases) {
+    const suffix = `scope-drift-${entry.name}`;
+    const target = await initializedTarget(fixture.root, fixture.authority, suffix);
+    const journal = await openJournal(fixture.root, suffix);
+    const coordinator = new IsolatedRoutingMutationCoordinator(target, journal);
+    await assert.rejects(
+      coordinator.apply({
+        authority: entry.authority,
+        mutatedAt: "2026-08-21T03:07:00.000Z",
+        committedAt: "2026-08-21T03:07:01.000Z",
+      }),
+      undefined,
+      `${entry.name} drift must reject`,
+    );
+    assert.equal(journal.inspect().eventCount, 0, `${entry.name} drift must not reserve`);
+    assert.equal((await target.read()).payload.mutationCount, 0, `${entry.name} drift must not mutate`);
+  }
 });
 
 test("production/live routing target descriptor is rejected before state creation", async (t) => {
@@ -229,6 +319,35 @@ test("restart after apply but before durable commit reconciles COMMITTED without
   });
   assert.equal(secondReport.payload.classification, "COMMITTED");
   assert.equal((await restartedTarget.read()).payload.mutationCount, 1);
+
+  const evidenceTarget = await reopenedTarget(fixture.root, fixture.authority, "apply-crash");
+  const evidenceJournal = await openJournal(fixture.root, "apply-crash");
+  const recoveredReceipt = await recoverCommittedIsolatedRoutingMutationReceipt(
+    fixture.authority,
+    evidenceTarget,
+    evidenceJournal,
+  );
+  assert.equal(recoveredReceipt.payload.recoveredAfterRestart, true);
+  assert.equal(recoveredReceipt.payload.authorizationId, fixture.authorization.authorizationId);
+  assert.equal(recoveredReceipt.payload.proposalId, fixture.proposal.proposalId);
+  assert.equal(recoveredReceipt.payload.preconditionSnapshotId, fixture.snapshot.snapshotId);
+  assert.equal(recoveredReceipt.payload.beforeSubjectId, fixture.authorization.payload.referenceSubjectId);
+  assert.equal(recoveredReceipt.payload.afterSubjectId, fixture.authorization.payload.candidateSubjectId);
+  await verifyIsolatedRoutingMutationReceipt(
+    recoveredReceipt,
+    fixture.authority,
+    evidenceTarget,
+    evidenceJournal,
+  );
+  const evidence = await recoveredIsolatedRoutingMutationToEvidence(
+    fixture.authority,
+    evidenceTarget,
+    evidenceJournal,
+    "2026-08-21T03:10:00.000Z",
+  );
+  assert.equal(evidence.status, "passed");
+  assert.equal(evidence.metadata.recoveredAfterRestart, "true");
+  assert.equal((await evidenceTarget.read()).payload.mutationCount, 1);
 });
 
 test("restart with unexpected route state fails closed to manual reconciliation", async (t) => {
@@ -347,6 +466,28 @@ test("forged promotion authorization cannot disable explicit mutation authority 
   assert.equal(journal.inspect().eventCount, 0);
   assert.equal((await target.read()).payload.mutationCount, 0);
 });
+
+async function rehashAuthorization(authorization, overrides) {
+  const payload = { ...authorization.payload, ...overrides };
+  const authorizationSha256 = await sha256Canonical(payload);
+  return {
+    ...authorization,
+    authorizationId: `m5routeauth:${authorizationSha256.slice(0, 32).toLowerCase()}`,
+    authorizationSha256,
+    payload,
+  };
+}
+
+async function rehashProposal(proposal, overrides) {
+  const payload = { ...proposal.payload, ...overrides };
+  const proposalSha256 = await sha256Canonical(payload);
+  return {
+    ...proposal,
+    proposalId: `m5routeproposal:${proposalSha256.slice(0, 32).toLowerCase()}`,
+    proposalSha256,
+    payload,
+  };
+}
 
 async function sha256Canonical(value) {
   const digest = await globalThis.crypto.subtle.digest(
