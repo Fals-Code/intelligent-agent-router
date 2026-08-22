@@ -176,9 +176,16 @@ test("truncated journal fails closed on reopen", async (t) => {
 
 test("stale adapter or main source authority rejects before rehearsal write", async (t) => {
   const ready = await buildLocalProductionAdapterRehearsalFixture(t, "source-drift");
+  const source = ready.sourceSnapshot.payload;
   const driftedSource = await prepareLocalProductionRoutingReadinessSourceSnapshot({
-    ...ready.sourceSnapshot.payload,
+    adapterId: source.adapterId,
+    adapterVersion: source.adapterVersion,
     adapterSourceSha256: "D".repeat(64),
+    mainSourceSha256: source.mainSourceSha256,
+    evidenceReferences: source.evidenceReferences,
+    adapterSourceVerified: source.adapterSourceVerified,
+    mainSourceVerified: source.mainSourceVerified,
+    observedAt: source.observedAt,
   });
   const driftedAuthority = { ...ready.authority, currentSourceSnapshot: driftedSource };
   await assert.rejects(coordinator(ready).applyCandidate({ authority: driftedAuthority, ...candidateTimes() }), /source|drift/i);
